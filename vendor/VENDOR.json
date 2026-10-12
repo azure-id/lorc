@@ -1,0 +1,159 @@
+{
+  "orc_commit": "ae47a4aed7256009b61ad2c5afadbc9dd8c29e74",
+  "orc_version": "2.3.0",
+  "orc_dirty": [
+    "bin/wiki-core.js",
+    "bin/pattern-core.js",
+    "bin/rules-core.js"
+  ],
+  "copied_at": "2026-10-11T12:02:51.611Z",
+  "files": {
+    "vendor/graph/graph.js": {
+      "from": "bin/graph.js",
+      "sha256": "344719969a9ff6ee3f425af455285ffebaf81c11e01cb775edd9e5aa1dbb1519"
+    },
+    "vendor/graph/graph-extract.js": {
+      "from": "bin/graph-extract.js",
+      "sha256": "186e2878e9b0a17abbb7ad772c6dbb107b0346965564693a52f77a2ed0dfaec9"
+    },
+    "vendor/graph/graph-query.js": {
+      "from": "bin/graph-query.js",
+      "sha256": "bb039ca75fd5c7cb44735f6de3d19835ddbb362e57166a471ab8c8b6ea0e5623"
+    },
+    "vendor/graph/graph-resolve.js": {
+      "from": "bin/graph-resolve.js",
+      "sha256": "bb3830e6e26027a66cc4303c91ae086b804f4428d587fe896a94bffd6420d49e"
+    },
+    "vendor/graph/graph-signals.js": {
+      "from": "bin/graph-signals.js",
+      "sha256": "c6166b452f86c9f62cd52fc9f2a29e54a61d49bc411090a90343afafce3adc4f"
+    },
+    "vendor/graph/graph-notes.js": {
+      "from": "bin/graph-notes.js",
+      "sha256": "5dff321fb1f22f33a4b869a8534ee57643918c054f024ffe678573526f5ad641"
+    },
+    "vendor/graph/graph-map.js": {
+      "from": "bin/graph-map.js",
+      "sha256": "5306440b857874cb4b4838971b709cc4a673ad353dc5a596b140e295e3a39e3c"
+    },
+    "vendor/graph/graph-shard.js": {
+      "from": "bin/graph-shard.js",
+      "sha256": "203153dc60112ec195f3aa96fa56af014cf24820ee83ce053dc412becd81e932"
+    },
+    "vendor/pricing.json": {
+      "from": "bin/pricing.json",
+      "sha256": "603d00eb80733c17b7c44a5efb0e184d5eacedf539de03d1eb858fc00f9fc660"
+    },
+    "vendor/core/wiki-core.js": {
+      "from": "bin/wiki-core.js",
+      "sha256": "4a35e0d62caf6645f1e3928437e57a0d57af702f580c279c2deaf9f652f825ce"
+    },
+    "vendor/core/pattern-core.js": {
+      "from": "bin/pattern-core.js",
+      "sha256": "4eaf37477e8231c283980a41ff3cdcf4fec7fedb2f8d279c2e3b347849656bfe"
+    },
+    "vendor/core/rules-core.js": {
+      "from": "bin/rules-core.js",
+      "sha256": "70caf5b4d2a9ea9a17e6f2ce7074eeb4a79092ba82545934c68bef242d7c649b"
+    },
+    "vendor/skills/_shared/rules/code.md": {
+      "from": "templates/skills/_shared/rules/code.md",
+      "sha256": "206dc49c307db84367a3f89bf7de640a0df10035383101e54b698496f8d50fc2"
+    },
+    "vendor/skills/_shared/rules/delivery.md": {
+      "from": "templates/skills/_shared/rules/delivery.md",
+      "sha256": "dcc7e7aeaad30cdc627bebc1cf51a2e6a2482e2c83ef0707c84eb42eb71f5430"
+    },
+    "vendor/skills/_shared/rules/ui.md": {
+      "from": "templates/skills/_shared/rules/ui.md",
+      "sha256": "35a1378290dc1c3f28a4b8029157df0a790151f9c977be276203c5de20c4fc69"
+    },
+    "vendor/skills/_shared/rules/writing.md": {
+      "from": "templates/skills/_shared/rules/writing.md",
+      "sha256": "05b9a66a7e5ed6c7084cf886a80400c385e38a6fa5c3ec4575ba502c22961a67"
+    },
+    "vendor/skills/_shared/rules/INDEX.md": {
+      "from": "templates/skills/_shared/rules/INDEX.md",
+      "sha256": "5429be356d64f31647d99edd67afc86560203d1e311a5c05ecc7e0841671ff89"
+    },
+    "vendor/skills/_shared/rules/CREDITS.md": {
+      "from": "templates/skills/_shared/rules/CREDITS.md",
+      "sha256": "ec95e58d85aaa56e01d359e0603d74eb1d23f44b65d4ed6f170429308479f398"
+    },
+    "vendor/skills/_shared/phases/house-rules.md": {
+      "from": "templates/skills/_shared/phases/house-rules.md",
+      "sha256": "5493e9720431d207f09ed136a94ffd033ecfb484559dfb71c44df7fd4d86cf15"
+    },
+    "vendor/skills/orc-pattern/references/INDEX.md": {
+      "from": "templates/skills/orc-pattern/references/INDEX.md",
+      "sha256": "f22daa78756354023ac222b8124786b4e366493b0ead1eb2c17783f9276a0ad3"
+    },
+    "templates/skills/lorc-wiki/references/wiki-doc.md": {
+      "from": "templates/skills/orc-wiki/schemas/wiki-doc.md",
+      "sha256": "d8f47ebd86988cf0134add43c96547d861bf6d94968869b88d8db49015349a12"
+    },
+    "templates/skills/lorc-wiki/references/claude-md-injection.md": {
+      "from": "templates/skills/orc-wiki/references/claude-md-injection.md",
+      "sha256": "676f80dded266e18f0b8164a7f1a4c38c81deff627d5997fe16b94f1d5dd0197"
+    },
+    "templates/skills/lorc-pattern/references/pattern-doc.md": {
+      "from": "templates/skills/orc-pattern/schemas/pattern-doc.md",
+      "sha256": "af7883738da88cfed38036502c6ecce1b3f3657486a57f04b5aa55993fe877b8"
+    },
+    "templates/skills/lorc-pattern/references/INDEX.md": {
+      "from": "templates/skills/orc-pattern/references/INDEX.md",
+      "sha256": "f22daa78756354023ac222b8124786b4e366493b0ead1eb2c17783f9276a0ad3"
+    },
+    "templates/skills/lorc-pattern/references/be-django.md": {
+      "from": "templates/skills/orc-pattern/references/be-django.md",
+      "sha256": "3425ee617548e271c9e4411603ac261a1a83a380a1d709646d119f94c892f79e"
+    },
+    "templates/skills/lorc-pattern/references/be-express.md": {
+      "from": "templates/skills/orc-pattern/references/be-express.md",
+      "sha256": "40fadb2c3a03bed48753b9efd7ca7ea7544779206073ca1e1d7366a26dff9b8d"
+    },
+    "templates/skills/lorc-pattern/references/be-fastapi.md": {
+      "from": "templates/skills/orc-pattern/references/be-fastapi.md",
+      "sha256": "3161d802e2b2e58f09428e739fe32d36f1ef404ee458958e9d31db932f05e0af"
+    },
+    "templates/skills/lorc-pattern/references/be-go.md": {
+      "from": "templates/skills/orc-pattern/references/be-go.md",
+      "sha256": "e5b6c2f793404dffbb8e3524fb5a2b615a7b34a9fbb9204c81c8dd2c7f40cc3e"
+    },
+    "templates/skills/lorc-pattern/references/be-nestjs.md": {
+      "from": "templates/skills/orc-pattern/references/be-nestjs.md",
+      "sha256": "c11f2d9ee33f59109a00c743c08dc41386d552177929afb54dc1dbebed221e53"
+    },
+    "templates/skills/lorc-pattern/references/be-postgres.md": {
+      "from": "templates/skills/orc-pattern/references/be-postgres.md",
+      "sha256": "56927d5b2a21546b973136c4a7d929409cc03ad85de0b25fd129645b6790aa88"
+    },
+    "templates/skills/lorc-pattern/references/fe-a11y.md": {
+      "from": "templates/skills/orc-pattern/references/fe-a11y.md",
+      "sha256": "0e962829da438e830c2ba1a9aa9c17ddddefc74d173dcbe067bf29ccaba94733"
+    },
+    "templates/skills/lorc-pattern/references/fe-angular.md": {
+      "from": "templates/skills/orc-pattern/references/fe-angular.md",
+      "sha256": "3248740ef5fc227a7b5bcae7c9790a223fe70d71b5734b3c118bcc9ec6c87b9c"
+    },
+    "templates/skills/lorc-pattern/references/fe-nextjs.md": {
+      "from": "templates/skills/orc-pattern/references/fe-nextjs.md",
+      "sha256": "745b58c761d2d9deaa67d9775684a7e234a890c63734f99d58dee41ae6905aa3"
+    },
+    "templates/skills/lorc-pattern/references/fe-perf.md": {
+      "from": "templates/skills/orc-pattern/references/fe-perf.md",
+      "sha256": "811a15a3e9e18a5fdb505d6bd7c72ad2374c6ee527f8f50f52f46a88f8e4c256"
+    },
+    "templates/skills/lorc-pattern/references/fe-react.md": {
+      "from": "templates/skills/orc-pattern/references/fe-react.md",
+      "sha256": "0d5d8df380d8f2c610e9e1fd36b6574c3fd676edb53b943ecb0417a32da93bd0"
+    },
+    "templates/skills/lorc-pattern/references/fe-vue.md": {
+      "from": "templates/skills/orc-pattern/references/fe-vue.md",
+      "sha256": "89d13656b367b42202008874ea9309aae44265896f4312186c3671bea705eed3"
+    }
+  },
+  "local": [
+    "vendor/graph/graph-gain.js"
+  ]
+}

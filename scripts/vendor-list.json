@@ -1,0 +1,151 @@
+{
+  "copy": [
+    {
+      "from": "bin/graph.js",
+      "to": "vendor/graph/graph.js"
+    },
+    {
+      "from": "bin/graph-extract.js",
+      "to": "vendor/graph/graph-extract.js"
+    },
+    {
+      "from": "bin/graph-query.js",
+      "to": "vendor/graph/graph-query.js"
+    },
+    {
+      "from": "bin/graph-resolve.js",
+      "to": "vendor/graph/graph-resolve.js"
+    },
+    {
+      "from": "bin/graph-signals.js",
+      "to": "vendor/graph/graph-signals.js"
+    },
+    {
+      "from": "bin/graph-notes.js",
+      "to": "vendor/graph/graph-notes.js"
+    },
+    {
+      "from": "bin/graph-map.js",
+      "to": "vendor/graph/graph-map.js"
+    },
+    {
+      "from": "bin/graph-shard.js",
+      "to": "vendor/graph/graph-shard.js"
+    },
+    {
+      "from": "bin/pricing.json",
+      "to": "vendor/pricing.json"
+    },
+    {
+      "from": "bin/wiki-core.js",
+      "to": "vendor/core/wiki-core.js"
+    },
+    {
+      "from": "bin/pattern-core.js",
+      "to": "vendor/core/pattern-core.js"
+    },
+    {
+      "from": "bin/rules-core.js",
+      "to": "vendor/core/rules-core.js"
+    },
+    {
+      "from": "templates/skills/_shared/rules/code.md",
+      "to": "vendor/skills/_shared/rules/code.md"
+    },
+    {
+      "from": "templates/skills/_shared/rules/delivery.md",
+      "to": "vendor/skills/_shared/rules/delivery.md"
+    },
+    {
+      "from": "templates/skills/_shared/rules/ui.md",
+      "to": "vendor/skills/_shared/rules/ui.md"
+    },
+    {
+      "from": "templates/skills/_shared/rules/writing.md",
+      "to": "vendor/skills/_shared/rules/writing.md"
+    },
+    {
+      "from": "templates/skills/_shared/rules/INDEX.md",
+      "to": "vendor/skills/_shared/rules/INDEX.md"
+    },
+    {
+      "from": "templates/skills/_shared/rules/CREDITS.md",
+      "to": "vendor/skills/_shared/rules/CREDITS.md"
+    },
+    {
+      "from": "templates/skills/_shared/phases/house-rules.md",
+      "to": "vendor/skills/_shared/phases/house-rules.md"
+    },
+    {
+      "from": "templates/skills/orc-pattern/references/INDEX.md",
+      "to": "vendor/skills/orc-pattern/references/INDEX.md"
+    },
+    {
+      "from": "templates/skills/orc-wiki/schemas/wiki-doc.md",
+      "to": "templates/skills/lorc-wiki/references/wiki-doc.md"
+    },
+    {
+      "from": "templates/skills/orc-wiki/references/claude-md-injection.md",
+      "to": "templates/skills/lorc-wiki/references/claude-md-injection.md"
+    },
+    {
+      "from": "templates/skills/orc-pattern/schemas/pattern-doc.md",
+      "to": "templates/skills/lorc-pattern/references/pattern-doc.md"
+    },
+    {
+      "from": "templates/skills/orc-pattern/references/INDEX.md",
+      "to": "templates/skills/lorc-pattern/references/INDEX.md"
+    },
+    {
+      "from": "templates/skills/orc-pattern/references/be-django.md",
+      "to": "templates/skills/lorc-pattern/references/be-django.md"
+    },
+    {
+      "from": "templates/skills/orc-pattern/references/be-express.md",
+      "to": "templates/skills/lorc-pattern/references/be-express.md"
+    },
+    {
+      "from": "templates/skills/orc-pattern/references/be-fastapi.md",
+      "to": "templates/skills/lorc-pattern/references/be-fastapi.md"
+    },
+    {
+      "from": "templates/skills/orc-pattern/references/be-go.md",
+      "to": "templates/skills/lorc-pattern/references/be-go.md"
+    },
+    {
+      "from": "templates/skills/orc-pattern/references/be-nestjs.md",
+      "to": "templates/skills/lorc-pattern/references/be-nestjs.md"
+    },
+    {
+      "from": "templates/skills/orc-pattern/references/be-postgres.md",
+      "to": "templates/skills/lorc-pattern/references/be-postgres.md"
+    },
+    {
+      "from": "templates/skills/orc-pattern/references/fe-a11y.md",
+      "to": "templates/skills/lorc-pattern/references/fe-a11y.md"
+    },
+    {
+      "from": "templates/skills/orc-pattern/references/fe-angular.md",
+      "to": "templates/skills/lorc-pattern/references/fe-angular.md"
+    },
+    {
+      "from": "templates/skills/orc-pattern/references/fe-nextjs.md",
+      "to": "templates/skills/lorc-pattern/references/fe-nextjs.md"
+    },
+    {
+      "from": "templates/skills/orc-pattern/references/fe-perf.md",
+      "to": "templates/skills/lorc-pattern/references/fe-perf.md"
+    },
+    {
+      "from": "templates/skills/orc-pattern/references/fe-react.md",
+      "to": "templates/skills/lorc-pattern/references/fe-react.md"
+    },
+    {
+      "from": "templates/skills/orc-pattern/references/fe-vue.md",
+      "to": "templates/skills/lorc-pattern/references/fe-vue.md"
+    }
+  ],
+  "local": [
+    "vendor/graph/graph-gain.js"
+  ]
+}

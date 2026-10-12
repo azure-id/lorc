@@ -1,0 +1,37 @@
+{
+  "name": "@azure-id/lorc",
+  "version": "0.1.11",
+  "description": "Light ORC — one lean coding skill (/lorc) for Claude Code: code graph, house rules, wiki, code pattern, cheapest-capable executors, review, wait on limit. Works alone or on top of ORC.",
+  "bin": {
+    "lorc": "bin/lorc.js"
+  },
+  "files": [
+    "README.md",
+    "CHANGELOG.md",
+    "bin/",
+    "templates/",
+    "vendor/"
+  ],
+  "scripts": {
+    "test": "node --test test/",
+    "verify": "node scripts/verify.js",
+    "vendor": "node scripts/vendor.js --from ../orc",
+    "build:agents": "node scripts/build-agents.js"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "skills",
+    "agents",
+    "code-graph",
+    "ai"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "github:azure-id/lorc"
+  }
+}
