@@ -3,9 +3,9 @@ name: lorc
 description: >
   Light ORC — the lean coding lane for one request (a fix, a feature, a refactor). Use for
   "/lorc <request>". One prep call loads the code graph, house rules, wiki, code pattern,
-  extra and usage. It digs only anchored code, picks a tier itself (low: does it inline ·
-  mid ≤1 · high ≤3 · complex ≤5 subagents), asks until nothing is assumed, builds with the
-  cheapest capable executor, checks, reviews, and learns your choices.
+  extra and usage. It digs only anchored code, picks a tier (jev or its own engine; low:
+  inline · mid ≤1 · high ≤3 · complex ≤5 subagents), asks until nothing is assumed, builds
+  with the cheapest capable executor, checks, reviews, and learns your choices.
 ---
 
 # /lorc — Light ORC
@@ -26,10 +26,10 @@ fewer calls win. Run L0 → L6 in order. Do not add steps. Run every `lorc` comm
 6. `HOUSE-RULES.md` beats every other rule. Then the rules card.
 
 ## L0 PREP — one call
-`lorc prep "<the request, ≤ 25 words>" --json`
+`lorc prep "<the request in English, ≤ 25 words>" [--doc <path>] --json`
 It starts the run and returns `slug`, `usage`, `graph` (store + `focus[]` rows with file:line),
 `rules.card` (a path), `wiki` (tier, ≤ 3 page paths, build/test/lint commands), `pattern`
-(langs + path), `extra.slots[]`, `settings`, `tier_hint`, and `resume` (an unfinished run).
+(langs + path), `extra.slots[]`, `settings`, `tier_engine`, `tier_judge`, `ask_judge`, `resume` (+ `tier_hint` when `by = table`).
 `resume` set → ask in L3 whether to continue it (yes → read its RESUME.md and follow it).
 
 ## L1 DIG — at most 4 tool calls
@@ -39,6 +39,10 @@ It starts the run and returns `slug`, `usage`, `graph` (store + `focus[]` rows w
   when the work is in its language.
 
 ## L2 TIER
+The tier is `tier_judge.tier` (`by`: jev or engine). Raise it one row only when L1 found a fact
+of a higher row it did not see; name the fact. Never lower it. `by = table` → pick it from the
+table with `tier_hint` and L1. Files = source files (not tests, locale files, docs).
+
 | tier | signals | subagents (auto) |
 |---|---|---|
 | low | ≤ 2 files, 1 area, no new module | 0 — you edit |
@@ -46,20 +50,22 @@ It starts the run and returns `slug`, `usage`, `graph` (store + `focus[]` rows w
 | high | 6–20 files, ≥ 2 new components, or 2–3 independent areas | ≤ 3 |
 | complex | > 20 files, > 3 areas, ordered steps, a migration | ≤ 5 + checkpoint |
 
-`settings.dispatch = manual` → the cap is `settings.dispatch_max` (`off` = 0). Work with ≥ 6 files or
-≥ 2 new components: split it into 2–3 DISJOINT groups (no file in two groups) that can be built
-at the same time, and dispatch them in ONE message — parallel executors finish sooner. Never
-more groups than the cap. Print ONE line: `Tier: <t> — <evidence> · cap <n> · groups <g>`.
+`settings.dispatch = manual` → the cap is `settings.dispatch_max` (`off` = 0). Tier high or complex:
+split into 2–3 DISJOINT groups (no file in two groups; start from `tier_engine.split`), run at
+the same time, all in ONE message. Never more groups than the cap. Print ONE line:
+`Tier: <t> — <jev|engine NN % | table> · <evidence> · cap <n> · groups <g>`.
 
 ## L3 ASK — the hard gate (one message)
 1. **Intent lock** — what you will build, the files, 3–6 acceptance bullets.
 2. **Every open question at once.** Each: `❓ <question> (<file:line>)`, options `a)` `b)` …,
-   and `➡️ <recommended> — <reason>`.
+   and `➡️ <recommended> — <reason>`. `ask_judge.how` set → do it first; show each `p` as
+   `(NN %)`; ➡️ on `rec` (`rec` null or `by = self` → your pick).
+   prep `must_ask[]` → one ❓ each, never your own pick: ➡️ on its first `seen` path, cite `at`.
 3. **Executor menu** — only when you will dispatch AND `settings.executor = ask`:
    `1 lorc-executor-haiku-5-high · 2 lorc-executor-sonnet-5-med · 3 lorc-executor-opus-5-low ·
    4 lorc-executor-opus-5-med` (+ `5 extra:<slot>` for each `extra.slots[]`). Put ONE `➡️` on
-   the CHEAPEST that can do it: haiku = mechanical · sonnet = normal feature work · opus low =
-   cross-module or tricky state · opus med = hard logic, security. `settings.executor` set →
+   `tier_engine.executor`; L1 shows it cannot do it → the CHEAPEST that can: haiku = mechanical ·
+   sonnet = normal feature work · opus low = cross-module or tricky state · opus med = hard logic, security. `settings.executor` set →
    use it, no menu.
 4. **Pattern miss** — `pattern` shows a miss for the work's language and
    `settings.pattern_miss = ask` → one yes/no line: learn the pattern first?
@@ -77,8 +83,8 @@ A new unknown in the answer → one more round. Otherwise go to L4.
   refs = the 2–4 existing files (with line ranges) you found in L1 that the new code should
   copy its structure and style from. facts = every fact from L1 the executor needs (file paths,
   function and key names, API shapes, i18n keys, decisions). The executor must not re-read what
-  you already read. Put the requirement doc in refs. Write the JSON to a file with the Write tool if it is
-  long, then pipe it: `lorc slice --run <slug> --task <n> - < <file>`.
+  you already read. Put the requirement doc in refs. Long JSON → Write it to a file, then
+  `lorc slice --run <slug> --task <n> - < <file>`.
   It prints the slice path. Dispatch the chosen `lorc-executor-*` with exactly:
   `Read <slice path>. Do exactly that task. Return the JSON at its end.`
   Disjoint tasks → all dispatches in ONE message. Never paste file content into a prompt.
@@ -109,9 +115,10 @@ dispatch a new executor for a fix; tiny fixes (≤ 10 lines) you make inline), t
 ## L6 FINISH
 ```
 lorc run end --run <slug> - <<'EOF'
-{"outcome":"done","tier":"mid","executor":"…","asks":[{"q":"…","rec":"…","chosen":"…"}],"findings":[{"sev":"P2","cat":"…","outcome":"fixed|listed|rejected"}]}
+{"outcome":"done","tier":"mid","tier_by":"jev|engine|table","executor":"…","asks":[{"q":"…","rec":"…","chosen":"…"}],"findings":[{"sev":"P2","cat":"…","outcome":"fixed|listed|rejected"}]}
 EOF
 ```
 It updates the graph, writes the run record, and may return one `habit` proposal.
 Reply in at most 12 lines — count them; one short line per item: **Changed** · **Verified** (only what ran) · **Findings** · **Not done** ·
 the habit line if there is one. No offers, no questions — the user types the next request.
+A later "fix it" → the L5 fix path, then `lorc check --run <slug> --review --json` once. No jest.

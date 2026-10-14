@@ -109,6 +109,25 @@ function lastLintLines(root, slug) {
   return [];
 }
 
+// From lorc's coverage dirs (lorc check or the executor's coverage command); no test run.
+function coverageLines(root, files) {
+  const check = require("./check.js");
+  const cov = require("./coverage.js");
+  const src = files.filter((f) => !check.isTest(f) && /\.(m?[jt]sx?|cjs|vue|svelte)$/i.test(f));
+  const groups = check.groupByProject(root, src);
+  let data = {};
+  try { data = cov.collect(root, groups); } catch (_) { data = {}; }
+  const rows = Object.entries(data);
+  if (!rows.length) return [src.length ? "- not measured (no coverage data for the changed source files)" : "- no changed source files"];
+  // 0.3.2: a tool limit is shown apart, as a fact, so it is not read as a gap in the change.
+  const limits = rows.filter(([, v]) => v.tool_limit).map(([f, v]) => `${f} (${v.tool_limit})`);
+  return [
+    `Measured ${cov.measuredAt(root, groups) || "-"}. Judge a coverage rule on lines and source branches (a file that existed: its changed lines); \`generated\` arms come from a transform, not from the changed code.`,
+    ...rows.slice(0, 20).map(([f, v]) => `- ${cov.line(f, Object.assign({}, v, { tool_limit: undefined }))}`),
+    ...(limits.length ? [`Tool limit — NOT a finding (do not raise it, do not ask for a fix, do not measure again): ${limits.slice(0, 5).join("; ")}.`] : []),
+  ];
+}
+
 function dispatchOf(mode, { changedLines, minLines, risky, tier }) {
   if (mode === "agent") return { dispatch: true, reason: "settings.review = agent" };
   if (mode === "inline") return { dispatch: false, reason: "settings.review = inline" };
@@ -197,6 +216,8 @@ function reviewPrep(root, slug, { tier } = {}) {
     L.push("");
   }
   L.push("## Lint", ...(lintLines.length || checkLint.length ? [...lintLines, ...checkLint.map((x) => `- check lint: ${x}`)] : ["- none"]), "");
+  // 0.3.1: coverage of the changed source files, so the reviewer can judge a coverage house rule.
+  L.push("## Coverage", ...coverageLines(root, files), "");
   L.push("## Changed symbols", ...(symbols.length ? symbols.slice(0, 40).map((x) => `- ${x.risk} ${x.qname} ${x.file}:${x.lines[0]}-${x.lines[1]} (${(x.why || []).join(" · ")})`) : ["- none in the graph"]), "");
   const g = gotchas(root, files);
   if (g) L.push("## Gotchas", g, "");

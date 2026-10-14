@@ -81,3 +81,23 @@ test("atomic write leaves no tmp file", () => {
   S.set("project", t.root, "dispatch", "manual", { home: t.home });
   assert.deepStrictEqual(fs.readdirSync(path.join(t.root, ".claude", "lorc")), ["settings.json"]);
 });
+
+test("tier_judge keys", () => {
+  assert.strictEqual(S.DEFAULTS.tier_judge, "auto");
+  assert.strictEqual(S.DEFAULTS.tier_judge_min_conf, 60);
+  assert.strictEqual(S.validate("tier_judge", "on").ok, false);
+  assert.strictEqual(S.validate("tier_judge_min_conf", 100).ok, false);
+  assert.strictEqual(S.validate("tier_judge_min_conf", 0).ok, true);
+});
+
+test("ask_judge key", () => {
+  assert.strictEqual(S.DEFAULTS.ask_judge, "auto");
+  assert.strictEqual(S.validate("ask_judge", "on").ok, false);
+  assert.strictEqual(S.validate("ask_judge", "off").ok, true);
+});
+
+test("tier_engine key", () => {
+  assert.strictEqual(S.DEFAULTS.tier_engine, "auto");
+  assert.strictEqual(S.validate("tier_engine", "on").ok, false);
+  assert.strictEqual(S.validate("tier_engine", "off").ok, true);
+});

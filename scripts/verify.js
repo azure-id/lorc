@@ -18,7 +18,7 @@ const CHECKS = [
   function coreFiles() {
     const need = ["bin/lorc.js", "bin/lib/paths.js", "bin/lib/json.js",
       "bin/lib/settings.js", "bin/lib/install.js", "bin/lib/doctor.js", "bin/lib/changelog.js", "bin/lib/graph-router.js", "bin/lib/graph-shape.js",
-      "bin/lib/core.js", "bin/lib/wiki.js", "bin/lib/pattern.js", "bin/lib/rules.js", "bin/lib/extra.js", "bin/lib/prep.js", "bin/lib/slice.js", "bin/lib/check.js", "bin/lib/review.js", "templates/HOUSE-RULES.template.md",
+      "bin/lib/core.js", "bin/lib/wiki.js", "bin/lib/pattern.js", "bin/lib/rules.js", "bin/lib/extra.js", "bin/lib/prep.js", "bin/lib/jev.js", "bin/lib/tier.js", "bin/lib/tier-text.js", "bin/lib/tier-history.js", "bin/lib/slice.js", "bin/lib/check.js", "bin/lib/coverage.js", "bin/lib/ask-facts.js", "bin/lib/review.js", "templates/HOUSE-RULES.template.md",
       "vendor/core/wiki-core.js", "vendor/core/pattern-core.js", "vendor/core/rules-core.js",
       "templates/hooks/lorc-graph-hook.js", "package.json", "README.md", "CHANGELOG.md"];
     return need.filter((f) => !fs.existsSync(path.join(ROOT, f))).map((f) => `missing: ${f}`);

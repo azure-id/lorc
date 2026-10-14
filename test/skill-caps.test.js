@@ -11,7 +11,7 @@ const T = (...p) => path.join(ROOT, "templates", ...p);
 const SKILL = T("skills", "lorc", "SKILL.md");
 const REFS = T("skills", "lorc", "references");
 const REVIEWER = T("agents", "lorc-reviewer-opus-5-low.md");
-const SKILL_COMMANDS = ["prep", "graph", "slice", "check", "review", "run", "usage", "wait"];
+const SKILL_COMMANDS = ["prep", "graph", "slice", "check", "review", "run", "usage", "wait", "jev"];
 
 const read = (f) => fs.readFileSync(f, "utf8").replace(/\r\n/g, "\n");
 const size = (f) => Buffer.byteLength(read(f));
@@ -112,4 +112,17 @@ test("W9 skills name only lorc commands that exist, and agents that exist", () =
       assert.ok(fs.existsSync(T("agents", `${n}.md`)), `${n} missing`);
     }
   }
+});
+
+test("0.3.2: executor, reviewer and SKILL texts", () => {
+  const ex = read(path.join(ROOT, "agents-src", "executor.template.md")).replace(/\s+/g, " ");
+  assert.ok(ex.includes("Never delete, skip or weaken a failing test"));
+  assert.ok(ex.includes("tool_limit"));
+  assert.ok(read(REVIEWER).replace(/\s+/g, " ").includes("acceptance item that the code does not meet is P1"));
+  assert.ok(read(SKILL).includes('A later "fix it"'));
+});
+
+test("0.3.3: SKILL asks must_ask items", () => {
+  const s = fs.readFileSync(SKILL, "utf8");
+  assert.ok(s.includes("must_ask[]") && s.includes("never your own pick"));
 });

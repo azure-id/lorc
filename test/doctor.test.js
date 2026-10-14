@@ -25,6 +25,10 @@ test("healthy → ok; missing file → ✗; --fix restores", () => {
   install({ claudeDir, pkgRoot });
   let r = doctor.run({ claudeDir, pkgRoot, home });
   assert.ok(r.ok, doctor.format(r.checks));
+  const j = r.checks.find((c) => c.id === "jev");
+  assert.ok(j && j.ok === true, JSON.stringify(r.checks));
+  const te = r.checks.find((c) => c.id === "tier-engine");
+  assert.ok(te && te.ok === true, JSON.stringify(r.checks));
   fs.unlinkSync(path.join(claudeDir, "skills", "lorc", "SKILL.md"));
   r = doctor.run({ claudeDir, pkgRoot, home });
   assert.strictEqual(r.ok, false);

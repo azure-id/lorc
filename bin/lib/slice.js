@@ -15,7 +15,7 @@ const RETURN_SHAPE = [
   '{"status":"done|partial|blocked",',
   ' "files_changed":[{"path":"…","why":"…"}],',
   ' "tests":{"run":"<command or \'not run\'>","passed":true,"note":"…"},',
-  ' "coverage":{"<file>":{"lines":n,"branches":n}},',
+  ' "coverage":{"<file>":{"lines":n,"branches":n,"src_branches":n,"uncovered":[<source lines>]}},',
   ' "self_check":{"acceptance":[{"item":"…","met":true}],"house_rules_p0p1":"ok|<rule broken>","coverage_bar_met":true|false},',
   ' "needs":"<what blocks you, only when blocked>"}',
   "```",
@@ -89,8 +89,10 @@ function commandsPart(root, files, graphTests = []) {
       if (l) lints.push(cd(d, l));
       // 0.1.5: the coverage bar is a project P0 rule: the executor meets it before it returns.
       const run = check.runner(ad(d));
+      // 0.3.1: the data goes to lorc's coverage dir; `lorc cov` splits source from generated branches.
       if (run && check.coverageOn(ad(d))) {
-        covs.push(`- coverage: ${cd(d, run.cmd([]).trim())} --coverage ${ff.map((f) => `--collectCoverageFrom=${f}`).join(" ")} — reach the project bar (see Rules → Project P0) for EVERY new or changed source file BEFORE you return.`);
+        const rel = path.relative(ad(d), check.covDir(root, d)).replace(/\\/g, "/");
+        covs.push(`- coverage: ${cd(d, run.cmd([]).trim())}${check.coverageArgs(ff, rel)} then \`lorc cov --bar <project bar> --json\` (not a test run) — reach the project bar (see Rules → Project P0) on lines and SOURCE branches for EVERY new or changed source file BEFORE you return.`);
       }
     }
   } catch (_) { /* none */ }

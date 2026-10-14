@@ -99,3 +99,39 @@ test("endRun starts the graph update detached and does not wait", () => {
   assert.deepStrictEqual([r.graph.ok, r.graph.mode], [true, "detached"]);
   assert.ok(Date.now() - t < 5000);
 });
+
+test("endRun stores tier_by", () => {
+  const root = tmp();
+  const { slug, dir } = runs.startRun(root, { request: "add export", now: NOW });
+  runs.endRun(root, slug, { outcome: "done", tier: "mid", tier_by: "jev" }, { now: NOW + 1000, home: tmp(), graph: false });
+  const line = JSON.parse(fs.readFileSync(path.join(root, ".claude", "lorc", "runs.jsonl"), "utf8").trim());
+  assert.strictEqual(line.tier_by, "jev");
+  assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, "run.json"), "utf8")).tier_by, "jev");
+});
+
+test("endRun counts only files changed in the run; src_files skips tests", () => {
+  const { repo } = require("./prep-fixture.js");
+  const e = repo({ "src/old.js": "module.exports = 1;\n" });
+  e.write("src/old.js", "module.exports = 2;\n");
+  const { slug, dir } = runs.startRun(e.root, { request: "add new", now: NOW });
+  assert.ok(JSON.parse(fs.readFileSync(path.join(dir, "run.json"), "utf8")).dirty_start.includes("src/old.js"));
+  e.write("src/new.js", "module.exports = 3;\n");
+  e.write("test/new.test.js", "// t\n");
+  const r = runs.endRun(e.root, slug, { outcome: "done", tier: "low" }, { now: NOW + 1000, home: tmp(), graph: false });
+  assert.strictEqual(r.record.files_changed, 2, JSON.stringify(r.record));
+  assert.strictEqual(r.record.src_files, 1);
+});
+
+test("endRun reads prep.json: engine_tier, est_files, est_raw, jev_tier", () => {
+  const root = tmp();
+  const { slug, dir } = runs.startRun(root, { request: "add export", now: NOW });
+  fs.writeFileSync(path.join(dir, "prep.json"), JSON.stringify({ tier_engine: { tier: "high", est_files: 7, detail: { estimate: { raw: 5.5 } } }, tier_judge: { by: "jev", tier: "mid" } }));
+  runs.endRun(root, slug, { outcome: "done", tier: "mid" }, { now: NOW + 1000, home: tmp(), graph: false });
+  const line = JSON.parse(fs.readFileSync(path.join(root, ".claude", "lorc", "runs.jsonl"), "utf8").trim());
+  assert.deepStrictEqual([line.engine_tier, line.est_files, line.est_raw, line.jev_tier], ["high", 7, 5.5, "mid"]);
+  const root2 = tmp();
+  const b = runs.startRun(root2, { request: "add export", now: NOW });
+  runs.endRun(root2, b.slug, { outcome: "done", tier: "mid" }, { now: NOW + 1000, home: tmp(), graph: false });
+  const l2 = JSON.parse(fs.readFileSync(path.join(root2, ".claude", "lorc", "runs.jsonl"), "utf8").trim());
+  assert.deepStrictEqual([l2.engine_tier, l2.est_files, l2.est_raw, l2.jev_tier], [null, null, null, null]);
+});
