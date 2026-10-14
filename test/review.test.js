@@ -84,3 +84,30 @@ test("a big diff shows only flagged hunks and lists the rest", () => {
   assert.ok(md.includes("(not shown)"));
   assert.ok(Buffer.byteLength(md) < 40 * 1024);
 });
+
+test("0.3.1: ## Coverage says not measured without data, a source branches line with lcov data", () => {
+  const { e, slug } = setup();
+  e.write("src/math.js", "function add(a, b) {\n  return b + a;\n}\nmodule.exports = { add };\n");
+  let { md } = review(e, slug);
+  assert.ok(md.includes("## Coverage\n- not measured"), md);
+  const cov = require("../bin/lib/coverage.js");
+  fs.mkdirSync(cov.covDir(e.root, "."), { recursive: true });
+  fs.writeFileSync(path.join(cov.covDir(e.root, "."), "lcov.info"), "SF:src/math.js\nDA:2,1\nBRDA:2,0,0,1\nLF:1\nLH:1\nend_of_record\n");
+  ({ md } = review(e, slug));
+  assert.ok(/## Coverage\n[^#]*- src\/math\.js: .*source branches 100/.test(md), md);
+});
+
+test("0.3.2: an SFC tool limit is not on the file line; one 'Tool limit — NOT a finding' line names the file", () => {
+  const { e, slug } = setup();
+  const body = Array.from({ length: 80 }, (_, i) => `const v${i} = ${i};`);
+  e.write("src/Comp.vue", ["<template>", "</template>", "<script>", ...body, "</script>", ""].join("\n"));
+  const cov = require("../bin/lib/coverage.js");
+  fs.mkdirSync(cov.covDir(e.root, "."), { recursive: true });
+  const da = [4, 5, 6, 7, 8].map((n) => `DA:${n},1`).join("\n");
+  fs.writeFileSync(path.join(cov.covDir(e.root, "."), "lcov.info"), `SF:src/Comp.vue\n${da}\nLF:5\nLH:5\nend_of_record\n`);
+  const { md } = review(e, slug);
+  const fileLine = md.split("\n").find((l) => l.startsWith("- src/Comp.vue"));
+  assert.ok(fileLine, md);
+  assert.ok(!/tool limit/i.test(fileLine), fileLine);
+  assert.ok(/\nTool limit — NOT a finding [^\n]*src\/Comp\.vue \(source map has 5 of ~80 script lines/.test(md), md);
+});

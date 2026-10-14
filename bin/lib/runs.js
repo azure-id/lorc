@@ -47,6 +47,11 @@ function usageNow(root) {
 const pct = (o) => (o && typeof o.used_percentage === "number" ? o.used_percentage : null);
 const sessionOf = (u) => (u && (u.session_id || u.sessionId)) || null;
 
+// The files git sees as changed now (tracked + untracked), or null outside git.
+function changedNow(root) {
+  try { return require("./check.js").changedFiles(root); } catch (_) { return null; }
+}
+
 function startRun(root, { request, store, settings, now } = {}) {
   const t = nowMs(now);
   const base = makeSlug(request, t);
@@ -61,6 +66,8 @@ function startRun(root, { request, store, settings, now } = {}) {
     settings: { dispatch: s.dispatch ?? null, dispatch_max: s.dispatch_max ?? null, executor: s.executor ?? null, review: s.review ?? null },
     tasks: [], checks: [],
     usage_start: { five_hour: pct(u && u.five_hour), seven_day: pct(u && u.seven_day) },
+    // Files already changed before the run: run end does not count them (the tier eval's size).
+    dirty_start: (changedNow(root) || []).slice(0, 500),
   };
   writeJson(runFile(root, slug), run);
   writeJson(currentFile(root), { slug, store_dir: run.store.dir, mode: run.store.mode, at: run.started_at });
@@ -144,17 +151,35 @@ function endRun(root, slug, body, { now, home, graph } = {}) {
   for (const f of Array.isArray(b.findings) ? b.findings : []) if (f && f.sev in findings) findings[f.sev]++;
   const asks = Array.isArray(b.asks) ? b.asks : [];
   const tasks = Array.isArray(r.tasks) ? r.tasks : [];
+  // The size of the change: files changed during the run; source files = not tests, locale
+  // files, docs or lock files (the tier table counts these).
+  // The engine's answer at prep time (prep.json): its tier, its estimate and the RAW estimate
+  // (before self-calibration), so `lorc tier` can learn its size error from finished runs.
+  const pj = paths.readJson(path.join(runDir(root, slug), "prep.json"), {}) || {};
+  const te = pj.tier_engine && pj.tier_engine.tier ? pj.tier_engine : null;
+  const tj = pj.tier_judge || {};
+  const after = changedNow(root);
+  const before = new Set(Array.isArray(r.dirty_start) ? r.dirty_start : []);
+  const mine = after ? after.filter((f) => !before.has(f)) : null;
   Object.assign(r, {
     ended_at: iso(t), duration_s: Math.max(0, Math.round((t - Date.parse(r.started_at)) / 1000)),
-    outcome: b.outcome || null, tier: b.tier || null, executor: b.executor || null,
+    outcome: b.outcome || null, tier: b.tier || null, tier_by: b.tier_by || null, executor: b.executor || null,
     counts: { dispatches: tasks.length, checks: (r.checks || []).length, asks: asks.length, findings },
+    files_changed: mine ? mine.length : null,
+    src_files: mine ? mine.filter(require("./tier-history.js").isSrc).length : null,
+    engine_tier: te ? te.tier : null,
+    est_files: te ? te.est_files : null,
+    est_raw: te && te.detail && te.detail.estimate && Number.isFinite(te.detail.estimate.raw) ? te.detail.estimate.raw : null,
+    jev_tier: tj.by === "jev" ? tj.tier : null,
     graph: g,
   });
   writeJson(runFile(root, slug), r);
   const u = usageNow(root);
   const record = {
     slug, request: String(r.request || "").slice(0, 120), started_at: r.started_at, ended_at: r.ended_at,
-    duration_s: r.duration_s, outcome: r.outcome, tier: r.tier, executor: r.executor,
+    duration_s: r.duration_s, outcome: r.outcome, tier: r.tier, tier_by: r.tier_by, executor: r.executor,
+    files_changed: r.files_changed, src_files: r.src_files,
+    engine_tier: r.engine_tier, est_files: r.est_files, est_raw: r.est_raw, jev_tier: r.jev_tier,
     dispatches: tasks.length, asks: asks.length, findings, store_mode: (r.store && r.store.mode) || null,
     session_id: r.session_id || sessionOf(u),
     usage_start: r.usage_start || null,

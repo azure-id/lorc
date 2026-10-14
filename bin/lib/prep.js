@@ -17,9 +17,9 @@ const STOP = new Set(("the and for with from into onto this that these those are
 const LORC = path.join(__dirname, "..", "lorc.js");
 
 // Run `lorc <args> --json --dir <root>` in a child and parse its JSON.
-function lorcJson(root, args, timeout = 60000) {
+function lorcJson(root, args, timeout = 60000, input) {
   const r = spawnSync(process.execPath, [LORC, ...args, "--json", "--dir", root], {
-    cwd: root, encoding: "utf8", timeout, windowsHide: true, maxBuffer: 64 * 1024 * 1024,
+    cwd: root, encoding: "utf8", timeout, windowsHide: true, maxBuffer: 64 * 1024 * 1024, input,
   });
   if (r.error) return { error: r.error.code === "ETIMEDOUT" ? "timeout" : r.error.message };
   try { return JSON.parse(String(r.stdout || "").trim().split(/\r?\n/).pop()); } catch (_) {
@@ -74,13 +74,19 @@ function focusRows(map) {
   return rows;
 }
 
-function graphPart(root, words) {
-  const sel = require("./graph-router.js").selectStore(root);
-  const out = { mode: sel.mode, reason: sel.reason, state: null, focus: [] };
+// Build the graph when there is none, else update the changed files (and copy ORC's
+// store when it is older than 24 h). `lorc tier` calls this too.
+function healGraph(root) {
   if (fs.existsSync(path.join(root, ".claude", "orc", "graph", "meta.json"))) {
     lorcJson(root, ["graph", "sync", "--if-older", "24"], 60000);
   }
-  const st = lorcJson(root, ["graph", "status", "--heal"], 120000);
+  return lorcJson(root, ["graph", "status", "--heal"], 120000);
+}
+
+function graphPart(root, words) {
+  const sel = require("./graph-router.js").selectStore(root);
+  const out = { mode: sel.mode, reason: sel.reason, state: null, focus: [] };
+  const st = healGraph(root);
   out.state = st.error ? "unknown" : st.state || null;
   if (st.error) out.error = st.error;
   if (words.length) {
@@ -115,6 +121,68 @@ function tierHint(request, focus) {
   };
 }
 
+// lorc's own tier engine (`lorc tier`, a child). `tier_engine: off` → null, no child.
+function enginePart(root, request, sv, doc) {
+  if (sv.tier_engine === "off") return null;
+  // prep healed the graph already: the engine child must not do it again.
+  const r = lorcJson(root, ["tier", request, "--no-heal", ...(doc ? ["--doc", doc] : [])], 30000);
+  if (r && r.tier && r.detail) return r;
+  return { error: (r && r.error) || "no answer" };
+}
+
+// What jev may see from the engine: its evidence, never its tier.
+function evidenceOf(e) {
+  if (!e || !e.detail) return null;
+  const d = e.detail;
+  return {
+    est_files: e.est_files, creates: (d.text.creates || []).map((c) => c.text || c.noun).slice(0, 6),
+    areas: d.areas ? d.areas.n : null, blast: d.estimate ? d.estimate.blast : 0,
+    similar: d.history && d.history.similar && d.history.similar.n ? { n: d.history.similar.n, median: d.history.similar.median_src } : null,
+    mechanical: Boolean(d.mechanical),
+  };
+}
+
+// L2 tier judge: jev when a TypeSafe key is connected, else the engine (or the table).
+// No key or `tier_judge: off` → no child, no network. The full answer goes to prep.json.
+function judgePart(root, request, hint, files, sv, engine) {
+  if (sv.tier_judge === "off") return { by: "table", reason: "off" };
+  const jev = require("./jev.js");
+  if (!jev.resolve().key) return { by: "table", reason: "no key" };
+  const input = { request, tier_hint: hint, files, engine: evidenceOf(engine) };
+  const r = lorcJson(root, ["jev", "tier"], jev.TIMEOUT_MS + 4000, JSON.stringify(input));
+  if (r.error) return { by: "table", reason: r.error === "timeout" ? "timeout" : "judge failed" };
+  return r && (r.by === "jev" || r.by === "table") ? r : { by: "table", reason: "judge failed" };
+}
+
+// jev decides when it answered with confidence; else the engine; else the table.
+function decideTier(judge, engine) {
+  const e = engine && engine.tier ? engine : null;
+  if (!judge.error && judge.by === "jev") return { ...judgeOut(judge), ...(e ? { engine: e.tier } : {}) };
+  const reason = judge.error ? "judge failed" : judge.reason;
+  if (e) return { by: "engine", tier: e.tier, conf: e.conf, reason, ...(judge.jev ? { jev: judge.jev } : {}) };
+  return judge.error ? { by: "table", reason } : judgeOut(judge);
+}
+
+// True when the skill should send its L3 options to `lorc jev ask`.
+function askHow(slug) {
+  return `Before the L3 message: lorc jev ask --run ${slug} --json - <<'EOF'\n` +
+    '{"intent":"…","questions":[{"id":"q1","q":"…","facts":"<file:line — fact>","options":{"a":"…","b":"…"}}]}\nEOF';
+}
+
+function askOn(sv) {
+  if (sv.ask_judge === "off") return false;
+  const jev = require("./jev.js");
+  const c = jev.resolve();
+  return Boolean(c.key) && !jev.checkBase(c.base);
+}
+
+// The skill needs the verdict, not the distribution.
+function judgeOut(j) {
+  const o = { by: j.by };
+  for (const k of ["tier", "conf", "consistent", "reason", "jev", "signals", "model"]) if (j[k] !== undefined && j[k] !== null) o[k] = j[k];
+  return o;
+}
+
 function bytes(o) { return Buffer.byteLength(JSON.stringify(o), "utf8"); }
 
 // Drop `role`, then focus rows, then wiki pages, until the JSON fits.
@@ -128,10 +196,15 @@ function fit(out) {
   while (bytes(out) > MAX_BYTES && pages && pages.length) pages.pop();
   if (bytes(out) > MAX_BYTES && out.graph) delete out.graph.reason;
   if (bytes(out) > MAX_BYTES && out.extra && Array.isArray(out.extra.slots)) out.extra.slots = out.extra.slots.slice(0, 3);
+  if (bytes(out) > MAX_BYTES && out.tier_judge) delete out.tier_judge.signals;
+  if (bytes(out) > MAX_BYTES && out.tier_engine) delete out.tier_engine.split;
+  if (bytes(out) > MAX_BYTES && out.tier_engine && out.tier_engine.why) out.tier_engine.why = out.tier_engine.why.slice(0, 1);
+  // must_ask stays (it is a gate); only its evidence lists get shorter.
+  if (bytes(out) > MAX_BYTES && Array.isArray(out.must_ask)) for (const m of out.must_ask) for (const s of m.seen || []) s.at = s.at.slice(0, 1);
   return out;
 }
 
-function prep(root, request, { start = true } = {}) {
+function prep(root, request, { start = true, doc } = {}) {
   const s = part(() => require("./settings.js").load(root).values);
   const sv = s && !s.error ? s : require("./settings.js").DEFAULTS;
   const words = keywords(request);
@@ -158,7 +231,17 @@ function prep(root, request, { start = true } = {}) {
     dispatch: sv.dispatch, dispatch_max: sv.dispatch_max, executor: sv.executor,
     review: sv.review, pattern_miss: sv.pattern_miss, limit_pct: sv.limit_pct,
   };
-  out.tier_hint = tierHint(request, g.focus);
+  const hint = tierHint(request, g.focus);
+  const engine = part(() => enginePart(root, request, sv, doc));
+  if (engine) out.tier_engine = engine.tier ? require("./tier.js").brief(engine) : { error: String(engine.error).slice(0, 80) };
+  const judge = part(() => judgePart(root, request, hint, focusFiles, sv, engine));
+  out.tier_judge = decideTier(judge, engine);
+  // The old hint is for the table only (engine off or failed): the engine replaces it.
+  if (out.tier_judge.by === "table") out.tier_hint = hint;
+  // 0.3.3: facts the lane must ask (a new page's route path), with the repo's own hints.
+  const must = part(() => require("./ask-facts.js").mustAsk(root, request, { doc, engine: engine && engine.tier ? engine : null }));
+  if (Array.isArray(must) && must.length) out.must_ask = must;
+  const ask = part(() => askOn(sv)) === true;
   out.resume = part(() => require("./runs.js").latestResume(root));
   let runDir = null;
   if (start) {
@@ -168,6 +251,8 @@ function prep(root, request, { start = true } = {}) {
     if (r.error) out.slug = r;
     else { out.slug = r.slug; out.run_dir = r.dir; runDir = r.dir; }
   }
+  // jev rates the L3 options: prep says HOW, so the skill does not carry the format.
+  out.ask_judge = ask ? { how: askHow(typeof out.slug === "string" ? out.slug : "<slug>") } : false;
   if (!out.rules.error) {
     const card = part(() => require("./rules.js").buildCard(root, {
       files: focusFiles, out: runDir ? path.join(runDir, "rules-card.md") : undefined,
@@ -177,9 +262,23 @@ function prep(root, request, { start = true } = {}) {
   }
   if (runDir) {
     const pages = out.wiki && Array.isArray(out.wiki.pages) ? out.wiki.pages : [];
-    part(() => paths.atomicWrite(path.join(runDir, "prep.json"), JSON.stringify({ wiki_pages: pages, focus_files: focusFiles }) + "\n"));
+    part(() => paths.atomicWrite(path.join(runDir, "prep.json"), JSON.stringify({ wiki_pages: pages, focus_files: focusFiles, tier_judge: judge, tier_engine: engine && engine.tier ? engine : null }) + "\n"));
   }
   return fit(out);
+}
+
+function judgeLine(j) {
+  if (!j) return "?";
+  if (j.by === "jev") return `jev ${j.tier} ${Math.round(j.conf * 100)} %${j.engine ? ` (engine ${j.engine})` : ""}`;
+  const hint = j.jev ? `; jev ${j.jev.tier} ${Math.round(j.jev.conf * 100)} %` : "";
+  if (j.by === "engine") return `engine ${j.tier} ${Math.round(j.conf * 100)} % (jev: ${j.reason || "?"}${hint})`;
+  return `table (${j.reason || "?"}${hint})`;
+}
+
+function engineLine(e) {
+  if (!e) return "off";
+  if (e.error) return `failed (${e.error})`;
+  return `${e.tier} ${Math.round(e.conf * 100)} % · ~${e.est_files} files · cap ${e.cap} · groups ${e.groups} · ${e.cap === 0 ? "inline" : e.executor}`;
 }
 
 function summary(o) {
@@ -192,7 +291,10 @@ function summary(o) {
     `rules: house ${o.rules && o.rules.house ? "yes" : "no"} · card ${o.rules && o.rules.card || "-"}`,
     `wiki: ${o.wiki && (o.wiki.state || o.wiki.error) || "?"} · ${(o.wiki && o.wiki.pages || []).length} pages`,
     `pattern: ${Array.isArray(o.pattern) ? o.pattern.map((p) => `${p.lang} ${p.cached ? "cached" : "missing"}`).join(", ") || "none" : "?"} · extra: ${o.extra && o.extra.source || "?"}`,
-    `tier hint: ${o.tier_hint.files_likely} files · ${o.tier_hint.areas} areas${o.tier_hint.risky_paths.length ? " · risky" : ""}${o.resume ? ` · resume ${o.resume.slug}` : ""}`,
+    ...(o.tier_hint ? [`tier hint: ${o.tier_hint.files_likely} files · ${o.tier_hint.areas} areas${o.tier_hint.risky_paths.length ? " · risky" : ""}`] : []),
+    ...(o.resume ? [`resume: ${o.resume.slug}`] : []),
+    `tier engine: ${engineLine(o.tier_engine)}`,
+    `tier judge: ${judgeLine(o.tier_judge)} · ask judge ${o.ask_judge ? "on" : "off"}`,
   ];
   return L.join("\n") + "\n";
 }
@@ -200,16 +302,17 @@ function summary(o) {
 function cmd(argv = []) {
   const pos = [];
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--dir") { i++; continue; }
+    if (argv[i] === "--dir" || argv[i] === "--doc") { i++; continue; }
     if (argv[i].startsWith("--")) continue;
     pos.push(argv[i]);
   }
   const di = argv.indexOf("--dir");
   const root = di >= 0 && argv[di + 1] ? path.resolve(argv[di + 1]) : paths.repoRoot();
-  const o = prep(root, pos.join(" "), { start: !argv.includes("--no-start") });
+  const ci = argv.indexOf("--doc");
+  const o = prep(root, pos.join(" "), { start: !argv.includes("--no-start"), doc: ci >= 0 ? argv[ci + 1] : undefined });
   if (wantsJson(argv)) emit(o);
   else process.stdout.write(summary(o));
   return 0;
 }
 
-module.exports = { prep, fit, keywords, focusRows, tierHint, lorcJson, RISKY, MAX_BYTES, cmd };
+module.exports = { prep, fit, keywords, focusRows, tierHint, healGraph, enginePart, evidenceOf, judgePart, decideTier, judgeOut, askOn, askHow, lorcJson, RISKY, MAX_BYTES, cmd };

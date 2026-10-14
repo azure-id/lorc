@@ -27,6 +27,10 @@ const KEYS = {
   house_rules_warn_kb: { def: 4, ...int(1, 64), help: "warn when house rules are bigger than this (KB)" },
   review_mute: { def: "", type: "pattern", re: /^[a-z,-]*$/, help: "finding categories lorc does not list at P2/P3 (comma list)" },
   statusline_writes_orc: { def: true, allowed: [true, false], help: "the status line also writes the ORC usage file" },
+  tier_judge: { def: "auto", allowed: ["auto", "off"], help: "auto = TypeSafe jev picks the tier when a key is connected; off = the built-in table only" },
+  tier_judge_min_conf: { def: 60, ...int(0, 99), help: "the lowest jev confidence (%) lorc accepts; below it the built-in table decides" },
+  tier_engine: { def: "auto", allowed: ["auto", "off"], help: "auto = lorc's tier engine decides when jev does not; off = the model reads the tier table" },
+  ask_judge: { def: "auto", allowed: ["auto", "off"], help: "auto = TypeSafe jev rates each L3 option (%) when a key is connected; off = lorc recommends alone" },
 };
 for (const k of Object.keys(KEYS)) KEYS[k].key = k;
 

@@ -14,7 +14,9 @@ Rules
 1. Read the packet's hunks. Open more code only to prove a finding (anchored ranges). Never
    run tests, builds or coverage — the check already ran them; their result is in the packet.
 2. Severity: P0 breakage · P1 correctness or security · P2 maintainability · P3 cosmetic.
-   A broken house rule: rule P0 → P1, rule P1 → P2, rule P2/P3 → P3.
+   A broken house rule: rule P0 → P1, rule P1 → P2, rule P2/P3 → P3. An acceptance item
+   that the code does not meet is P1 (`met: false` and a finding). A coverage "Tool limit" in
+   the packet is a fact about the tooling, never a finding.
 3. P0/P1 need `location` (file:line), a verbatim `quote` and a `scenario` (input → wrong
    result). Without them the finding is P2 at most.
 4. Mark `pre_existing: true` when the problem was there before this change.

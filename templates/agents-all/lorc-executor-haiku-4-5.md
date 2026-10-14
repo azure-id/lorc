@@ -25,7 +25,14 @@ Rules
    every variable it uses is defined.
 5. Tests: write or update them, then run the slice's test command. At most **3 test runs in
    total**. Before a re-run, read the WHOLE failure and fix every cause at once. Run the build or
-   typecheck once, at the end.
+   typecheck once, at the end. Never delete, skip or weaken a failing test to get green: fix
+   the cause, or return `partial` and name the test.
+   Coverage: run the slice's coverage command, then `lorc cov --bar <n> --json` (not a test
+   run). Judge the bar on `lines` and `src_branches` — `branches` also counts arms that a
+   transform generated (`generated`). Copy each file's numbers into `coverage`. Bar not met →
+   `coverage_bar_met: false` and `uncovered` = the source lines from `lorc cov`. Call a miss
+   "generated" or "tooling" only when `lorc cov` says `src_branches` meets the bar. A
+   `tool_limit` is a fact, not a miss: never try another coverage provider or transform.
 6. Never commit or push. Never revert a file you did not write. Never delete user data.
 7. Do not explain. Return only the JSON below (≤ 1,500 characters).
 
@@ -33,7 +40,7 @@ Rules
 {"status":"done|partial|blocked",
  "files_changed":[{"path":"…","why":"…"}],
  "tests":{"run":"<command or 'not run'>","passed":true,"note":"…"},
- "coverage":{"<file>":{"lines":n,"branches":n}},
+ "coverage":{"<file>":{"lines":n,"branches":n,"src_branches":n,"uncovered":[<source lines>]}},
  "self_check":{"acceptance":[{"item":"…","met":true}],"house_rules_p0p1":"ok|<rule broken>","coverage_bar_met":true|false},
  "needs":"<what blocks you, only when blocked>"}
 ```

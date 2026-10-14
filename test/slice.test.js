@@ -118,8 +118,10 @@ test("0.1.5: coverage on (jest --coverage) → a coverage line per task file; of
   const d = fs.mkdtempSync(path.join(os.tmpdir(), "lorc-cov-"));
   fs.writeFileSync(path.join(d, "package.json"), JSON.stringify({ scripts: { test: "jest --coverage" }, devDependencies: { jest: "1" } }));
   const on = slice.commandsPart(d, ["src/a.js", "src/b.js"]);
-  assert.match(on, /- coverage: npx jest --silent --coverage --collectCoverageFrom=src\/a\.js --collectCoverageFrom=src\/b\.js — reach the project bar/);
+  assert.match(on, /- coverage: npx jest --silent --coverage --coverageReporters=json-summary --coverageReporters=lcovonly "?--coverageDirectory=[^ ]+ "?--collectCoverageFrom=src\/a\.js"? "?--collectCoverageFrom=src\/b\.js"? then \x60lorc cov --bar /);
+  assert.ok(on.includes("SOURCE branches"), on);
   fs.writeFileSync(path.join(d, "package.json"), JSON.stringify({ scripts: { test: "jest" }, devDependencies: { jest: "1" } }));
   assert.ok(!slice.commandsPart(d, ["src/a.js"]).includes("- coverage:"));
   assert.ok(slice.RETURN_SHAPE.includes('"coverage":{"<file>"') && slice.RETURN_SHAPE.includes('"coverage_bar_met"'));
+  assert.ok(slice.RETURN_SHAPE.includes('"src_branches"'));
 });

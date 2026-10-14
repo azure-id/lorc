@@ -94,7 +94,7 @@ function buildCmd(root, commands) {
 // --coverage, or collectCoverage: true in jest config / package.json). Then the check
 // reports it, so nobody runs the tests again for coverage.
 const COV_DIR = ".claude/lorc/coverage";
-const COV_MAX = 600;
+const COV_MAX = 1200;
 
 function coverageOn(root) {
   const p = paths.readJson(path.join(root, "package.json"), null);
@@ -109,12 +109,11 @@ function coverageOn(root) {
 
 // Coverage output always lives under the REPO root's .claude/lorc/ — never inside a
 // sub-project folder (0.1.6 wrote client/.claude/lorc/coverage, which is the user's tree).
-function covDir(root, d) {
-  return path.join(root, ...COV_DIR.split("/"), !d || d === "." ? "root" : d.replace(/[\\/]/g, "_"));
-}
+const covDir = (root, d) => require("./coverage.js").covDir(root, d);
 
+// 0.3.1: lcovonly too — its branch lines let lorc cov tell source from generated branches.
 function coverageArgs(src, dir) {
-  return " --coverage --coverageReporters=json-summary " + q("--coverageDirectory=" + (dir || COV_DIR).replace(/\\/g, "/"))
+  return " --coverage --coverageReporters=json-summary --coverageReporters=lcovonly " + q("--coverageDirectory=" + (dir || COV_DIR).replace(/\\/g, "/"))
     + src.map((f) => " " + q("--collectCoverageFrom=" + f)).join("");
 }
 
@@ -122,18 +121,17 @@ function clearCoverage(root, dir) {
   try { fs.rmSync(dir || path.join(root, ...COV_DIR.split("/")), { recursive: true, force: true }); } catch (_) { /* none */ }
 }
 
-function readCoverage(root, src, dir) {
-  const sum = paths.readJson(path.join(dir || path.join(root, ...COV_DIR.split("/")), "coverage-summary.json"), null);
-  if (!sum) return null;
+// 0.3.1: per changed source file { lines, branches, src_branches, generated?, uncovered?, note? }
+// from lorc's coverage dirs (written by lorc check or by the slice's coverage command).
+// `groups` = { projectDir: [path relative to it] }.
+function readCoverage(root, groups) {
+  const all = require("./coverage.js").collect(root, groups);
   const out = {};
-  for (const [k, v] of Object.entries(sum)) {
-    if (k === "total" || !v) continue;
-    const rel = path.relative(root, k).replace(/\\/g, "/");
-    if (!src.includes(rel)) continue;
-    out[rel] = { lines: v.lines ? v.lines.pct : null, branches: v.branches ? v.branches.pct : null };
-    if (Buffer.byteLength(JSON.stringify(out), "utf8") > COV_MAX) { delete out[rel]; break; }
+  for (const [k, v] of Object.entries(all)) {
+    out[k] = v;
+    if (Buffer.byteLength(JSON.stringify(out), "utf8") > COV_MAX) { delete out[k]; out.more = Object.keys(all).length - Object.keys(out).length; break; }
   }
-  return out;
+  return Object.keys(out).length ? out : null;
 }
 
 // 0.1.6: the PROJECT DIR of a file = the nearest ancestor folder (up to the repo root)
@@ -246,12 +244,11 @@ function check(root, { build = false, full = false, lintOnly = false } = {}) {
       const cd = covDir(root, d);
       if (cov) clearCoverage(ad, cd);
       steps.push(runStep(root, "tests", run.cmd(tf) + (cov ? coverageArgs(src, cd) : ""), d));
-      if (cov) {
-        const c = readCoverage(ad, src, cd);
-        if (c) { coverage = coverage || {}; for (const [k, v] of Object.entries(c)) coverage[d === "." ? k : d + "/" + k] = v; }
-      }
     }
   }
+  // Tests ran here, or (--lint-only) the executor's coverage command wrote the data.
+  const srcFiles = files.filter((f) => !isTest(f) && /\.(m?[jt]sx?|cjs|vue)$/i.test(f));
+  if (srcFiles.length) coverage = readCoverage(root, groupByProject(root, srcFiles));
   const fileG = files.length ? groupByProject(root, files) : {};
   let anyLint = false;
   for (const [d, ff] of Object.entries(fileG)) {

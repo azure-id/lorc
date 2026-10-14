@@ -104,6 +104,22 @@ test("0.1.3: coverageOn reads the test script, package.json jest and jest.config
   fs.writeFileSync(path.join(d, "jest.config.js"), "module.exports = { collectCoverage: true };");
   assert.strictEqual(coverageOn(d), true);
   assert.match(coverageArgs(["src/a.js"]), /--coverage .*--collectCoverageFrom=src\/a\.js/);
+  assert.ok(coverageArgs(["src/a.js"]).includes("--coverageReporters=lcovonly"));
+});
+
+test("0.3.1: readCoverage reads lcov data → src_branches; no data → null", () => {
+  const { readCoverage, covDir } = require("../bin/lib/check.js");
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "lorc-rcov-"));
+  try {
+    fs.mkdirSync(path.join(d, "src"));
+    fs.writeFileSync(path.join(d, "src/a.js"), "module.exports = (x) => (x ? 1 : 2);\n");
+    const groups = { ".": ["src/a.js"] };
+    assert.strictEqual(readCoverage(d, groups), null);
+    fs.mkdirSync(covDir(d, "."), { recursive: true });
+    fs.writeFileSync(path.join(covDir(d, "."), "lcov.info"), "SF:src/a.js\nDA:1,1\nBRDA:1,0,0,1\nBRDA:1,0,1,0\nLF:1\nLH:1\nend_of_record\n");
+    const out = readCoverage(d, groups);
+    assert.strictEqual(out["src/a.js"].src_branches, 50);
+  } finally { fs.rmSync(d, { recursive: true, force: true }); }
 });
 
 test("0.1.6: tests in a sub-project folder run there (client/)", () => {

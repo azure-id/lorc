@@ -74,6 +74,23 @@ function checks({ claudeDir, pkgRoot = inst.PKG_ROOT, home } = {}) {
     out.push({ id: "usage", ok: true, detail: "not checked" });
   }
 
+  try {
+    const j = require("./jev.js").status(root, { home });
+    out.push({ id: "jev", ok: true, detail: j.tier_judge === "off" ? "tier_judge off — the built-in tier table decides"
+      : j.connected ? `connected (${j.source}) · ${j.model} · ask_judge ${j.ask_judge}${j.base_ok ? "" : " · base URL refused (not https)"}` : "not connected — the built-in tier table decides" });
+  } catch (_) {
+    out.push({ id: "jev", ok: true, detail: "not checked" });
+  }
+
+  try {
+    const sv = require("./settings.js").load(root, { home }).values;
+    const c = paths.readJson(require("./tier-history.js").cacheFile(root), null);
+    out.push({ id: "tier-engine", ok: true, detail: sv.tier_engine === "off" ? "off — the model reads the tier table"
+      : `on · git history ${c ? `${c.commits.length} commits cached at ${String(c.head).slice(0, 7)}` : "not cached yet (the first lorc tier builds it)"}` });
+  } catch (_) {
+    out.push({ id: "tier-engine", ok: true, detail: "not checked" });
+  }
+
   const orc = paths.findOrc(root, home);
   out.push({ id: "orc", ok: true, detail: `delegate ${orc.delegate ? "yes" : "no"}${orc.reason ? " (" + orc.reason + ")" : ""}` });
 
