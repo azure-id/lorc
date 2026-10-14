@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.3.5 — 14-10-2026
+Docs only. README: short sections with links to new pages under `docs/` (how-it-works, tiers, executors, orc, features, settings, commands, benchmark); live npm version badge. No fact was removed: the README text moved into the `docs/` pages. No code change.
+
 ## 0.3.4 — 14-10-2026
 Docs only. README benchmark: step 1 (RMT1) results of lorc 0.3.0–0.3.3 against `/orc-quick` and plain Claude Code (no skill, wiki and bare), as a table and as 4 Mermaid bar charts (cost, tokens, lane time, score). lorc 0.3.3 passes the step-1 gate: 746 s, $2.82, 4.31M tokens, score 86, e2e 3 of 3 (Q: 785 s, $3.95, 5.90M, 84). README install: from npm (`npm i -g @azure-id/lorc`); GitHub is the other way. No code change.
 
