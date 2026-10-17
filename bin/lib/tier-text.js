@@ -234,6 +234,92 @@ function readDoc(root, rel) {
   return { path: path.relative(root || process.cwd(), file).replace(/\\/g, "/"), lines: lines.length, items, apis: apis.size, ui_states: states.size, text };
 }
 
+// Names in a requirement doc: file names with a source extension and identifiers that look like
+// code (PascalCase or camelCase with a second hump). Only names this repo knows are kept (max 8).
+const SRC_EXT = "js|jsx|ts|tsx|mjs|cjs|vue|svelte|py|go|rs|java|rb|php|cs|kt|kts|swift|dart|scala|ex|exs|c|h|cc|cpp|hpp|sql|proto";
+const FILE_RE = new RegExp(String.raw`(?:^|[\s\x60("'])((?:[\w.-]+/)*[\w-]+(?:\.[\w-]+)*\.(?:` + SRC_EXT + String.raw`))(?=$|[\s\x60)"',.;:])`, "gm");
+// A doc name is a CHANGE target only when a change verb stands before it in the same line or
+// sentence, within 6 words ("register into remittance.api.js"). Else it is a reference ("same as X").
+const CHANGE_VERB = /\b(register|registers|add to|add into|put into|update|updates|change|changes|modify|modifies|extend|extends|wire into|edit|edits|rename|renames|move|moves|delete|deletes|remove|removes|tambahkan ke|ubah|perbarui|daftarkan)\b/i;
+function docChanged(text, name) {
+  const s = String(text || "");
+  const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  for (const m of s.matchAll(new RegExp(`(?<![\\w./-])${esc}(?![\\w-])`, "g"))) {
+    const before = s.slice(0, m.index).split(/[\n.!?;](?:\s|$)|\n/).pop();
+    const words = before.trim().split(/\s+/).filter(Boolean).slice(-6).join(" ");
+    if (CHANGE_VERB.test(words)) return true;
+  }
+  return false;
+}
+
+function docNames(text, known) {
+  if (typeof known !== "function") return [];
+  const s = String(text || "");
+  const cand = [];
+  for (const m of s.matchAll(FILE_RE)) cand.push(m[1]);
+  for (const m of s.matchAll(/\b([a-z]+[A-Z][A-Za-z0-9]*|[A-Z][a-z0-9]+[A-Z][A-Za-z0-9]*)\b/g)) cand.push(m[1]);
+  const out = [];
+  for (const c of cand) {
+    if (out.length >= 8) break;
+    if (!out.includes(c) && known(c)) out.push(c);
+  }
+  return out;
+}
+
+// `METHOD /a/b` in a doc: the endpoints the work calls or serves.
+function endpointsOf(text) {
+  const out = new Set();
+  for (const m of String(text || "").matchAll(/\b(GET|POST|PUT|PATCH|DELETE)\s+(\/[\w\/{}:.-]*[\w}])/g)) out.add(`${m[1]} ${m[2]}`);
+  return [...out].slice(0, 8);
+}
+
+// Basenames and stems of the tracked files: a cheap "this repo knows the name" check.
+const knownCache = new Map();
+function knownFromGit(root) {
+  if (!root) return null;
+  if (!knownCache.has(root)) {
+    const r = require("child_process").spawnSync("git", ["ls-files", "-z"], { cwd: root, encoding: "utf8", timeout: 20000, windowsHide: true, maxBuffer: 256 * 1024 * 1024 });
+    const set = new Set();
+    if (r.status === 0) {
+      for (const f of String(r.stdout || "").split("\0")) {
+        if (!f) continue;
+        const b = f.split("/").pop();
+        set.add(b);
+        set.add(b.replace(/\..*$/, ""));
+        set.add(f);
+      }
+    }
+    knownCache.set(root, set);
+  }
+  const set = knownCache.get(root);
+  return set.size ? (n) => set.has(n) || set.has(String(n).split("/").pop()) : null;
+}
+
+// The leading cue of a request or a commit subject: fix · add · refactor · bump · remove · update · other.
+const LEAD = {
+  fix: "fix fixes fixed fixing bug bugfix hotfix patch resolve resolves perbaiki memperbaiki",
+  add: "add adds added adding create creates created new feat feature implement implements implemented introduce introduces build builds support supports tambah tambahkan menambahkan buat membuat",
+  refactor: "refactor refactors refactored refactoring restructure extract cleanup clean simplify refaktor rapikan",
+  bump: "bump bumps bumped upgrade upgrades upgraded release version",
+  remove: "remove removes removed delete deletes deleted drop drops revert reverts hapus menghapus",
+  update: "update updates updated change changes changed modify modifies improve improves adjust adjusts enhance enhances rename renames move moves replace replaces ubah mengubah ganti",
+};
+const LEAD_OF = new Map();
+for (const [k, ws] of Object.entries(LEAD)) for (const w of ws.split(" ")) LEAD_OF.set(w, k);
+function leadCue(subject) {
+  let t = String(subject || "").trim().toLowerCase()
+    .replace(/^merge pull request #\d+ from \S+\s*/, "")
+    .replace(/^(\[[^\]]*\]\s*)+/, "").replace(/^[a-z][a-z0-9]*-\d+\s*[-:]?\s*/, "");
+  const cc = /^([a-z]+)(\([^)]*\))?!?:\s*/.exec(t);
+  if (cc) {
+    if (/\bbump/.test(t)) return "bump";
+    if (LEAD_OF.has(cc[1]) && cc[1] !== "build") return LEAD_OF.get(cc[1]);
+    t = t.slice(cc[0].length);
+  }
+  const w = (t.match(/[a-z]+/) || [""])[0];
+  return LEAD_OF.get(w) || "other";
+}
+
 // Project instruction files are not a requirement doc.
 const NOT_DOC = /(^|\/)(CLAUDE|AGENTS|README|CHANGELOG|HOUSE-RULES|CONTRIBUTING|LICENSE|SECURITY|CODE_OF_CONDUCT|GEMINI)\.(md|txt)$/i;
 
@@ -247,9 +333,11 @@ function docPath(root, request, explicit) {
   return null;
 }
 
-function parse(request, { root, doc } = {}) {
+// opts.known(name) → true when the graph or the tracked files know the name (default: git ls-files).
+function parse(request, { root, doc, known } = {}) {
   const text = String(request || "");
   const d = readDoc(root, docPath(root, text, doc));
+  const fromDoc = d ? docNames(d.text, known || (root ? knownFromGit(root) : null)) : [];
   // Layers, areas and the data / server context come from the REQUEST only: a doc uses
   // loose words ("a two-column layout"). The doc adds items, API calls and explicit cues.
   const all = text;
@@ -297,12 +385,12 @@ function parse(request, { root, doc } = {}) {
     words: (text.match(/[A-Za-z0-9]+/g) || []).length,
     clauses: clauses(text).length,
     creates, elements, modifies, wires,
-    names: namesOf(text),
+    names: [...new Set([...namesOf(text), ...fromDoc])],
     layers, server: ctx.server, data: ctx.data, data_strong: either(DATA_STRONG, /\b(basis data|tabel|kolom|skema|kueri)\b/i)(text),
     cues: cues(text),
     risk,
     ui_states: states.size + (d ? d.ui_states : 0),
-    doc: d ? { path: d.path, lines: d.lines, items: d.items, apis: d.apis } : null,
+    doc: d ? { path: d.path, lines: d.lines, items: d.items, apis: d.apis, endpoints: endpointsOf(d.text), names: fromDoc, changes: fromDoc.filter((n) => docChanged(d.text, n)) } : null,
   };
   // A doc can name a migration or API calls the short request left out.
   if (d) {
@@ -314,4 +402,4 @@ function parse(request, { root, doc } = {}) {
   return out;
 }
 
-module.exports = { parse, tokens, clauses, namesOf, readDoc, docPath, FILE_NOUNS, ELEMENT_NOUNS };
+module.exports = { docChanged, parse, tokens, clauses, namesOf, docNames, endpointsOf, knownFromGit, leadCue, readDoc, docPath, FILE_NOUNS, ELEMENT_NOUNS };

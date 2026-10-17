@@ -9,12 +9,13 @@ lorc checks each result. When a call fails, lorc uses its own path.
 
 | What | Path |
 |---|---|
-| Code graph store | `.claude/orc/graph/` |
 | Wiki | `wiki/` |
 | Code patterns | `.claude/orc/patterns/` |
 
-**The daily graph copy.** `lorc prep` runs `lorc graph sync --if-older 24`. This copies ORC's graph store to `.claude/lorc/copy/` when the copy is older than 24 hours.
-lorc reads the copy when ORC's store has a different engine version.
+**Store modes.** Since 0.4.0, lorc owns its graph engine (`bin/lib/graph/`, engine `lgraph@1`) and its store `.claude/lorc/orc/graph/` (format 2, see [graph.md](graph.md)).
+- Delegate mode stays: with ORC 2.2.0 or newer and `code_graph` on or semi, lorc calls `orc graph`.
+- The `orc-store` and `copy` modes are removed: the engine id of ORC no longer matches the engine of lorc.
+- `lorc graph sync` (the old daily copy) is now a no-op.
 
 **ORC 2.3.0** shows lorc in `orc ui` (the Light ORC panel) and has the `orc lorc …` commands.
 

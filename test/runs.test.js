@@ -29,6 +29,13 @@ test("startRun writes run.json and .current", () => {
   const cur = JSON.parse(fs.readFileSync(path.join(root, ".claude", "lorc", "run", ".current"), "utf8"));
   assert.strictEqual(cur.slug, slug);
   assert.strictEqual(cur.mode, "own");
+  assert.strictEqual(r.doc, null);
+});
+
+test("startRun keeps doc in run.json", () => {
+  const root = tmp();
+  const { dir } = runs.startRun(root, { request: "build page", doc: "docs/req.md", now: NOW });
+  assert.strictEqual(JSON.parse(fs.readFileSync(path.join(dir, "run.json"), "utf8")).doc, "docs/req.md");
 });
 
 test("checkpoint writes checkpoint.json and a paste-ready RESUME.md", () => {

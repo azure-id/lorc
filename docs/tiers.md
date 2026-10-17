@@ -27,6 +27,17 @@
 - Git history (cached by HEAD in `.claude/lorc/tier/git.json`): the units that landed on the main line (`git log --first-parent -m`): a squash or direct commit, or a whole merged PR (all its files). Commits inside a PR branch are not units. A merge's subject is the PR title plus the branch words. Dashboard repo: 1,003 units (242 merged PRs) instead of 2,921 commits, read in 0.26 s. Signals: co-change partners (conf ≥ 0.6, support ≥ 3, at most +3), similar past changes (median source files), and the wiring ratio (existing files changed per new file, learned; default 2).
 - lorc's finished runs: the final tiers of similar requests (Wilson lower bound ≥ 0.55, in practice 5 of 5 agreeing runs → move one band) and their source-file counts.
 
+**New signals (0.4.0).**
+- A client router is UI wiring, not "api".
+- The API module comes from the doc endpoint or a doc file name. It counts as changed only when the endpoint is new.
+- Doc names count as changed only after a change verb. The feature folder is where new files go.
+- Split groups list real files: the UI group with router, keys and locale; the API group with the module and its spec. Placeholders go into real files.
+- Structural analog: the closest existing flow and its 1-hop footprint. It works with no git history.
+- Git analogs are IDF-weighted, with a dynamic k (Kocaguneli et al., TSE 2012). A cue prior comes from the history of the repo.
+- Confidence comes from the agreement of the signals.
+
+RMT1: high with the correct split (0.3.3: router in the "api" group). RMT3: mid, est 3 (0.3.3: high, est 6). Backtest on 40 dashboard commits (`bench-tier`): seed 1 median absolute error 2 → 1, within ±1 file 48 → 53 %, within ×1.5 25 → 33 %; seed 2 level.
+
 **Self-calibration.** `lorc run end` copies the engine's answer from `prep.json` into the run record: `engine_tier`, `est_files`, `est_raw` (the estimate before calibration) and `jev_tier` (when jev decided). After 5 finished runs with a real size (`src_files`) and `est_raw`, the engine multiplies its estimate by the median of real ÷ raw over the last 30 runs (clamped 0.5–2; used only when it differs from 1 by 0.1 or more). The evidence says `calibrated ×<f> from <n> runs`. The engine learns from the raw estimate, never from its own calibrated output. `lorc tier eval` shows the factor (`calibration:` line; `calibration` in `--json`).
 
 **Files and guards.** The engine counts SOURCE files. Tests, locale files, docs and lock files do not count (tests and 2 locale files are 2–4 of every UI change). The table rows do not change. The highest row that a signal reaches wins. A migration or ordered steps with no data-layer evidence → high, not complex. With data-layer evidence, a migration is complex only for a DATA migration (backfill, split, merge, rename, drop, convert a format) or a big change; a small schema migration (add a column, an index) → high. A mechanical change (rename, signature) with no new file → mid at most (one executor). Types (class, struct, interface, trait, enum, protocol) often share one file: two count as one new component.

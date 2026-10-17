@@ -7,7 +7,7 @@
  *
  *   PreToolUse   Grep|Glob   a pattern that names a symbol the graph knows →
  *                            one line saying where that name is defined
- *                            (ORC R12/R12b; names.json only, no subprocess).
+ *                            (ORC R12/R12b; one names bucket, no subprocess).
  *   SubagentStop             a lorc executor finished → `lorc graph update`,
  *                            DETACHED; the hook never waits for it.
  *
@@ -21,6 +21,7 @@
  * STANDALONE: it is copied to <claudeDir>/hooks/ and requires no package file.
  */
 
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -166,6 +167,38 @@ function onExecutorStop(data, project) {
   } catch (_) {}
 }
 
+// ── the names table ────────────────────────────────────────────────────────
+// Format 2 (lorc 0.4.0): derived.json (its generation must equal meta's) lists
+// one names bucket per bucket id; a word is in bucket `bucketOf(word)`, the
+// same sha1 rule as bin/lib/graph/graph.js. Format 1: names.json.
+function bucketOf(s) {
+  const h = crypto.createHash("sha1").update(String(s)).digest("hex");
+  return String(parseInt(h.slice(0, 4), 16) % 64).padStart(2, "0");
+}
+
+// → a function word → rows (or null), or null when no table is usable.
+function namesTable(gdir, meta) {
+  const format1 = !meta.format || String(meta.engine || "").startsWith("graph@");
+  if (format1) {
+    const names = readJson(path.join(gdir, "names.json"));
+    if (!names || !names.names || names.generation !== meta.generation) return null;
+    return (w) => (Object.prototype.hasOwnProperty.call(names.names, w) ? names.names[w] : null);
+  }
+  const derived = readJson(path.join(gdir, "derived.json"));
+  if (!derived || derived.generation !== meta.generation || !derived.names) return null;
+  const cache = new Map();
+  return (w) => {
+    const bb = bucketOf(w);
+    if (!cache.has(bb)) {
+      const name = Object.prototype.hasOwnProperty.call(derived.names, bb) ? String(derived.names[bb]) : null;
+      const b = name && /^\d{2}-[0-9a-f]{8}\.json$/.test(name) ? readJson(path.join(gdir, "names", name)) : null;
+      cache.set(bb, b && b.names ? b.names : null);
+    }
+    const table = cache.get(bb);
+    return table && Object.prototype.hasOwnProperty.call(table, w) ? table[w] : null;
+  };
+}
+
 // ── PreToolUse Grep|Glob — a search for a name the graph knows ────────────
 function searchHit(data, gdir, meta, main) {
   const tool = String(data.tool_name || "");
@@ -174,15 +207,13 @@ function searchHit(data, gdir, meta, main) {
   if (!pattern) return null;
   const words = (pattern.match(/[A-Za-z_][A-Za-z0-9_]*/g) || []).filter((w) => w.length >= MIN_TOKEN);
   if (!words.length) return null;
-  const names = readJson(path.join(gdir, "names.json"));
-  if (!names || !names.names || names.generation !== meta.generation) return null;
-  const table = names.names;
+  const lookup = namesTable(gdir, meta);
+  if (!lookup) return null;
   if (main) {
     // R12b: the word with the HIGHEST fan-in wins; fan-in 0 never spends a slot.
     let best = null;
     for (const w of words) {
-      if (!Object.prototype.hasOwnProperty.call(table, w)) continue;
-      const rows = table[w];
+      const rows = lookup(w);
       if (!Array.isArray(rows) || !rows.length) continue;
       const fan = Math.max(...rows.map((x) => Number(x[5]) || 0));
       if (fan > 0 && (!best || fan > best.fan)) best = { word: w, rows, fan };
@@ -190,7 +221,8 @@ function searchHit(data, gdir, meta, main) {
     return best;
   }
   for (const w of words.sort((a, b) => b.length - a.length)) {
-    if (Object.prototype.hasOwnProperty.call(table, w) && Array.isArray(table[w]) && table[w].length) return { word: w, rows: table[w] };
+    const rows = lookup(w);
+    if (Array.isArray(rows) && rows.length) return { word: w, rows };
   }
   return null;
 }

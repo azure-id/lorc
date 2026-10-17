@@ -17,7 +17,7 @@ const { wantsJson, emit } = require("./json.js");
 const TT = require("./tier-text.js");
 const TH = require("./tier-history.js");
 
-const VENDOR = path.join(__dirname, "..", "..", "vendor", "graph");
+const VENDOR = path.join(__dirname, "graph");
 const TIERS = ["low", "mid", "high", "complex"];
 const CAP = { low: 0, mid: 1, high: 3, complex: 5 };
 const RISKY = /auth|secur|payment|billing|refund|migrat|secret|token|crypto|permission|wallet|ledger/i;
@@ -45,9 +45,30 @@ function fileScore(n) {
 
 // Layers by path, for every language: Django (models.py, views.py), Rails (app/controllers,
 // db/migrate), Spring (controller/, entity/, repository/), Go / Rust handlers, Android and iOS UI.
-function layerOf(f) {
+// A JS / TS router file: a client router (vue-router, react-router) or an express router.
+const JS_ROUTER = /(^|\/)(router|routes)(\/index)?\.[cm]?[jt]sx?$|(^|\/)(routers?|routes)\/[^/]+\.[cm]?[jt]sx?$|(^|\/)app-routing\.module\.ts$/i;
+const UI_FILE = /\.(vue|jsx|tsx|svelte)$/i;
+
+// ctx (optional): { root, rels, model }. With it, a JS / TS router decides by its project: a
+// router in a project with UI files, or one that imports a views / pages / screens / components
+// path, is "ui". A router under server/ or backend/ stays "api" (also urls.py, routes.rb).
+function routerLayer(f, ctx) {
+  if (!ctx || !JS_ROUTER.test(f)) return null;
+  if (/(^|\/)(server|backend)\//i.test(f)) return "api";
+  const fb = ctx.model && ctx.model.byFile && ctx.model.byFile[f];
+  if (fb && (fb.imports || []).some((i) => /(^|\/)(views|pages|screens|components)(\/|$)/i.test(String(i.from || "")))) return "ui";
+  if (!ctx.rels || !ctx.rels.length) return null;
+  const proj = projectOf(ctx.root || ".", f);
+  const memo = ctx.uiProjects || (ctx.uiProjects = new Map());
+  if (!memo.has(proj)) memo.set(proj, ctx.rels.some((r) => UI_FILE.test(r) && (proj === "." || r.startsWith(proj + "/")) && !/(^|\/)(server|backend)\//i.test(r)));
+  return memo.get(proj) ? "ui" : null;
+}
+
+function layerOf(f, ctx) {
   const k = TH.kindOf(f);
   if (k !== "src") return k;
+  const r = routerLayer(f, ctx);
+  if (r) return r;
   if (/(^|\/)(migrations?|migrate|models?|entit(y|ies)|schemas?|repositor(y|ies)|dao|persistence|db|database|prisma)\/|(^|\/)models\.py$|\.(sql|prisma)$|(^|\/)schema\.(rb|graphql|gql)$/i.test(f)) return "data";
   if (/\.(vue|[jt]sx|svelte|css|scss|sass|less|html|erb|haml|slim|cshtml|razor|xaml|storyboard|xib)$/i.test(f)
     || /(^|\/)(components?|views?|pages?|screens?|layouts?|styles?|templates?|widgets?|ui)\//i.test(f)
@@ -151,16 +172,31 @@ function focusTokens(request, text) {
 
 // Graph facts: core files (where the work is), named targets and their callers, the
 // router and API-client files for wiring, locale and test files, layers and projects.
-function graphPart(root, request, text) {
+// The layer of a file with the graph's context (the router rule needs the project's files).
+function layerAt(g, f) {
+  if (!g._lctx) g._lctx = { root: g.root || ".", rels: g.rels || null, model: g.model || null };
+  return layerOf(f, g._lctx);
+}
+
+// The graph once per compute: opts.loaded (the caller's graph), else loadGraph. { error } on a throw.
+function getLoaded(root, opts) {
+  if (opts.loaded) return opts.loaded;
+  try { return module.exports.loadGraph(root); } catch (e) { return { error: String(e.message || e).slice(0, 80) }; }
+}
+
+function graphPart(root, request, text, loaded) {
   const out = { ok: false, core: [], named: {}, blast: [], hosts: [], feature: null, tests: 0, locales: 0, router: null, api: null, layers: [], projects: [], risky: [] };
-  let g;
-  try { g = loadGraph(root); } catch (e) { out.reason = String(e.message || e).slice(0, 80); return out; }
-  if (!g) { out.reason = "no graph index"; return out; }
+  const g = loaded === undefined ? getLoaded(root, {}) : loaded;
+  if (g && g.error) { out.reason = g.error; return out; }
+  if (!g || !g.model) { out.reason = "no graph index"; return out; }
   const { Q, model, claudeDir } = g;
   out.ok = true;
   out.files = model.fileSet.size;
   if (g.older) out.store = "orc store, older engine";
   const rels = [...model.fileSet];
+  out.rels = rels;
+  out.model = model;
+  out.Q = Q;
   // Named targets: a path in the graph, or a symbol name with ≤ 3 definitions.
   for (const n of text.names) {
     if (/\.(md|txt|rst)$/i.test(n)) continue;
@@ -215,29 +251,185 @@ function graphPart(root, request, text) {
 // core, reused components, the feature folder and its host files, router, API client, locale
 // and test files, layers, project folders, risky paths.
 function fillCommon(out, root, text, rels, ranked, namedFiles, hasWord) {
+  out.root = root;
+  out.rels = rels;
   const core = [...namedFiles];
   for (const f of ranked.slice(0, 15)) if (core.length < 8 && !core.includes(f) && TH.isSrc(f) && hasWord(f)) core.push(f);
   out.core = core;
   out.reuse = reuseOf(text, rels);
-  // The feature folder: the deepest folder that holds most core files. Its files host a
-  // new piece (the entry that renders it, a sibling, its constants).
-  out.feature = featureOf(core);
+  // The feature folder. Its files host a new piece (the entry that renders it, a sibling, its constants).
+  out.feature = featureFolder(core, text.raw || "");
   if (out.feature) {
     const inDir = (f) => f.startsWith(out.feature + "/") && TH.isSrc(f);
-    const constants = rels.filter((f) => inDir(f) && /(^|\/)(constants?|keys|routes?|config|types?|enums?|settings)(\/|[^/]*\.\w+$)/i.test(f));
+    const constants = rels.filter((f) => inDir(f) && CONSTANTS.test(f));
     out.hosts = [...new Set([...core.filter(inDir), ...constants])].slice(0, 5);
-  } else out.hosts = [];
-  const uiWork = text.layers.includes("ui") || core.some((f) => layerOf(f) === "ui");
+    // The feature constants a new UI piece registers in: most request words first, keys / constants files first.
+    const want = TH.bag(text.raw || "");
+    const wordsIn = (f) => { let n = 0; for (const w of TH.bag(path.posix.basename(f).replace(/\.[^.]+$/, ""))) if (want.has(w)) n++; return n; };
+    const keyish = (f) => (/(keys?|constants?)\.\w+$/i.test(f) ? 1 : 0);
+    out.constants = constants.filter((f) => /(^|\/)(constants?|keys)\//i.test(f) || /(constants?|keys)\.\w+$/i.test(f))
+      .map((f) => ({ f, n: wordsIn(f), k: keyish(f) })).filter((x) => x.n || x.k)
+      .sort((a, b) => b.k - a.k || b.n - a.n || a.f.localeCompare(b.f)).slice(0, 1).map((x) => x.f);
+  } else { out.hosts = []; out.constants = []; }
+  const uiWork = text.layers.includes("ui") || core.some((f) => layerAt(out, f) === "ui");
   if (uiWork) out.router = rels.find((f) => ROUTER.test(f) && TH.isSrc(f)) || null;
-  out.api = core.find((f) => API_CLIENT.test(f)) || ranked.slice(0, 30).find((f) => API_CLIENT.test(f) && hasWord(f)) || null;
-  out.locales = rels.filter((f) => TH.kindOf(f) === "locale" && !/\/(en|id)?[^/]*\.(js|ts)$/.test(f)).length;
+  out.api = apiModule(root, out, text, namedFiles, ranked, hasWord);
+  out.apiRef = out.api ? endpointIn(root, out, out.api, (text.doc && text.doc.endpoints) || []) : null;
+  const localeFiles = rels.filter((f) => TH.kindOf(f) === "locale" && !/\/(en|id)?[^/]*\.(js|ts)$/.test(f));
+  out.locales = localeFiles.length;
+  out.localeFiles = localeFiles.slice(0, 4);
   // Tests by name: a test file whose name holds a core file's name (any language).
   const stems = core.slice(0, 5).map((f) => path.posix.basename(f).replace(/\.[^.]+$/, "").toLowerCase()).filter((s) => s.length >= 3);
   out.tests = stems.length ? rels.filter((f) => TH.kindOf(f) === "test" && stems.some((s) => path.posix.basename(f).toLowerCase().includes(s))).length : 0;
-  out.layers = [...new Set(core.map(layerOf).filter((l) => !["test", "locale", "doc", "noise"].includes(l)))];
+  out.layers = [...new Set(core.map((f) => layerAt(out, f)).filter((l) => !["test", "locale", "doc", "noise"].includes(l)))];
   out.projects = [...new Set(core.map((f) => projectOf(root, f)))];
   out.risky = [...new Set([...core, ...out.blast].filter((f) => RISKY.test(f)))].slice(0, 4);
+  out.analog = structuralAnalog(text, out);
   return out;
+}
+
+const CONSTANTS = /(^|\/)(constants?|keys|routes?|config|types?|enums?|settings)(\/|[^/]*\.\w+$)/i;
+
+// The feature folder: (1) the parent of a constants / keys / routes folder that holds a core
+// file; (2) the folder of the core file with the most request words; (3) the deepest folder
+// that holds most core files.
+function featureFolder(core, request) {
+  const src = core.filter(TH.isSrc);
+  if (src.length < 2) return null;
+  for (const f of src) { const m = /^(.+)\/(constants?|keys|routes)\/[^/]+$/i.exec(f); if (m) return m[1]; }
+  const want = TH.bag(request);
+  let best = null;
+  let bestN = 0;
+  for (const f of src) {
+    const d = path.posix.dirname(f);
+    if (d === ".") continue;
+    let n = 0;
+    for (const w of TH.bag(d)) if (want.has(w)) n++;
+    if (n > bestN) { best = d; bestN = n; }
+  }
+  return best || featureOf(core);
+}
+
+const urlPath = (u) => String((u && typeof u === "object" ? u.url || u.path : u) || "").replace(/^\w+:\/\/[^/]+/, "").split("?")[0];
+const segs = (p) => String(p || "").split("/").filter(Boolean);
+
+// The API module the work changes: (a) a named file that is an API client; (b) the API file
+// whose URLs share ≥ 2 leading path segments with a doc endpoint (graph `urls`, else
+// `git grep` of the endpoint's last 2 segments, then of its parent path); (c) a ranked API
+// file with a request word.
+function apiModule(root, out, text, namedFiles, ranked, hasWord) {
+  const named = namedFiles.find((f) => API_CLIENT.test(f));
+  if (named) return named;
+  const eps = ((text.doc && text.doc.endpoints) || []).map((e) => segs(e.replace(/^\w+\s+/, ""))).filter((s) => s.length >= 2);
+  if (eps.length) {
+    const apiFiles = (out.rels || []).filter((f) => API_CLIENT.test(f) && TH.isSrc(f));
+    const model = out.model;
+    if (model && model.byFile) {
+      let best = null;
+      let bestN = 1;
+      for (const f of apiFiles) {
+        const fb = model.byFile[f] || {};
+        const urls = [...(fb.urls || []), ...(fb.symbols || []).flatMap((s) => s.urls || [])].filter((u) => !(u && u.suffix));
+        for (const u of urls) {
+          const us = segs(urlPath(u));
+          for (const ep of eps) {
+            let n = 0;
+            while (n < us.length && n < ep.length && us[n] === ep[n]) n++;
+            if (n > bestN) { best = f; bestN = n; }
+          }
+        }
+      }
+      if (best) return best;
+    }
+    const isApi = new Set(apiFiles);
+    const grep = (needle) => {
+      const o = gitOut(root, ["grep", "-c", "-F", needle]);
+      const hits = (o || "").split(/\r?\n/).map((l) => /^(.*):(\d+)$/.exec(l)).filter((m) => m && (isApi.has(m[1]) || (!isApi.size && API_CLIENT.test(m[1]))));
+      hits.sort((a, b) => Number(b[2]) - Number(a[2]) || a[1].localeCompare(b[1]));
+      return hits.length ? hits[0][1] : null;
+    };
+    for (const ep of eps) { const f = grep(ep.slice(-2).join("/")); if (f) return f; }
+    for (const ep of eps) if (ep.length >= 3) { const f = grep("/" + ep.slice(0, -1).join("/")); if (f) return f; }
+  }
+  return out.core.find((f) => API_CLIENT.test(f)) || ranked.slice(0, 30).find((f) => API_CLIENT.test(f) && hasWord(f)) || null;
+}
+
+// Rule: the API module is CHANGED only when a doc endpoint is NEW. A function of the module that
+// already calls the endpoint (method + path; {p} / :p / ${…} segments match anything) makes it a
+// reference: { fn }. Fallback: `git grep -n -F` of the path in the module ({ fn: "?" }).
+const isParam = (x) => /^(\{.*\}|:.+|\$\{.*\}|\*)$/.test(x);
+function endpointIn(root, g, file, endpoints) {
+  if (!endpoints.length) return null;
+  const eps = endpoints.map((e) => { const m = /^(\w+)\s+(.*)$/.exec(e); return { method: m ? m[1].toUpperCase() : "ANY", segs: segs(m ? m[2] : e) }; });
+  const same = (a, b) => a.length === b.length && a.every((x, i) => x === b[i] || isParam(x) || isParam(b[i]));
+  const fb = g.model && g.model.byFile && g.model.byFile[file];
+  const all = [];
+  for (const ep of eps) {
+    let hit = null;
+    if (fb) {
+      for (const sym of fb.symbols || []) {
+        for (const u of sym.urls || []) {
+          const us = segs(urlPath(u));
+          const um = String((u && u.method) || "ANY").toUpperCase();
+          if (um !== "ANY" && ep.method !== "ANY" && um !== ep.method) continue;
+          const ok = u && u.suffix ? us.length && us.length <= ep.segs.length && same(us, ep.segs.slice(-us.length)) : same(us, ep.segs);
+          if (ok) { hit = sym.name || "?"; break; }
+        }
+        if (hit) break;
+      }
+    }
+    if (!hit) {
+      const o = gitOut(root, ["grep", "-n", "-F", "/" + ep.segs.join("/"), "--", file]);
+      if (o && o.trim()) hit = "?";
+    }
+    if (!hit) return null;
+    all.push(hit);
+  }
+  return { fn: all[0] };
+}
+
+const CONTAINER = /^(page|screen|view|flow|wizard|shell|layout|dashboard)$/;
+
+// Structural analog (no git history needed): when the request creates a container or ≥ 2 new
+// components, the closest existing flow in the same top area (the first 3 parts of the
+// feature folder): a file whose name ends with the container noun or Flow / Wizard / Step(s),
+// ranked by shared request words, then by imports of the reused components. Its footprint =
+// itself + the source files it imports from its own folder subtree (1 hop).
+function structuralAnalog(text, g) {
+  if (!g.feature || !g.rels) return null;
+  const fresh = newOnes(text, g);
+  const containers = fresh.filter((c) => CONTAINER.test(c.noun)).map((c) => c.noun);
+  if (!containers.length && fresh.length < 2) return null;
+  const top = g.feature.split("/").slice(0, 3).join("/");
+  const ends = new RegExp(`(${[...new Set(containers)].join("|")}${containers.length ? "|" : ""}flow|wizard|steps?)$`, "i");
+  const want = TH.bag(text.raw || "");
+  const reused = new Set(Object.values(g.reuse || {}));
+  const imports = (f) => {
+    if (!g.Q || !g.model) return [];
+    try { return g.Q.importsOf(g.model, f).files; } catch (_) { return []; }
+  };
+  const cands = [];
+  for (const f of g.rels) {
+    if (!f.startsWith(top + "/") || !TH.isSrc(f)) continue;
+    const stem = path.posix.basename(f).replace(/\.[^.]+$/, "");
+    if (!ends.test(stem)) continue;
+    let words = 0;
+    for (const w of TH.bag(f.replace(/\.[^.]+$/, ""))) if (want.has(w)) words++;
+    cands.push({ f, words });
+  }
+  if (!cands.length) return null;
+  // Ties on words: nearer the feature folder (shared leading path parts), then the reused components.
+  const fparts = g.feature.split("/");
+  const near = (f) => { const p = f.split("/"); let n = 0; while (n < p.length && n < fparts.length && p[n] === fparts[n]) n++; return n; };
+  cands.sort((a, b) => b.words - a.words || near(b.f) - near(a.f) || a.f.localeCompare(b.f));
+  const best = cands.filter((c) => c.words === cands[0].words && near(c.f) === near(cands[0].f)).slice(0, 20)
+    .map((c) => ({ ...c, imp: imports(c.f) }))
+    .map((c) => ({ ...c, reuse: c.imp.filter((x) => reused.has(x)).length }))
+    .sort((a, b) => b.reuse - a.reuse || a.f.localeCompare(b.f))[0];
+  if (!best.words && !best.reuse) return null;
+  const dir = path.posix.dirname(best.f) + "/";
+  const own = best.imp.filter((x) => x !== best.f && x.startsWith(dir) && TH.isSrc(x));
+  return { file: best.f, files: 1 + own.length };
 }
 
 function gitOut(root, args, timeout = 20000) {
@@ -303,10 +495,28 @@ function historyPart(root, request, anchors, opts) {
     out.cochange = TH.coChange(list, anchors);
     out.similar = TH.similarCommits(list, request);
     out.wiring = TH.wiringRatio(list);
+    out.prior = TH.cuePrior(list, request);
   }
   out.runs = TH.similarRuns(root, request, { runs: opts.runs });
   out.calibration = TH.calibration(root, { runs: opts.runs });
   return out;
+}
+
+// The files of the named targets that count. A name only the requirement doc gives ("the
+// DownArrow icon") counts when its file is the API module or in the feature folder: a doc
+// names many things it only reuses.
+function countedNamed(text, g) {
+  const fromReq = new Set(TT.namesOf(text.raw || ""));
+  const changes = new Set((text.doc && text.doc.changes) || []);
+  const docOnly = new Set(((text.doc && text.doc.names) || []).filter((n) => !fromReq.has(n)));
+  const out = [];
+  for (const [n, files] of Object.entries(g.named || {})) {
+    // A doc-only name counts only with a change verb before it; the API module also needs a new endpoint.
+    if (docOnly.has(n) && !changes.has(n)) continue;
+    if (g.apiRef && files.includes(g.api)) continue;
+    out.push(...files);
+  }
+  return [...new Set(out)];
 }
 
 // Weighted geometric mean: counts are skewed, so blend them on a log scale.
@@ -325,7 +535,8 @@ function estimate(text, g, h) {
   if (server.length) changed.add("route registration");
   if (text.creates.some((c) => c.layer === "data") && !text.creates.some((c) => c.noun === "migration")) added++;
   const clientApi = (text.doc && text.doc.apis > 0) || (/\bapi\b/i.test(text.raw || "") && !text.server);
-  if (clientApi && ui.length + text.elements > 0) changed.add(g.api || "api client");
+  if (clientApi && ui.length + text.elements > 0 && !(g.api && g.apiRef)) changed.add(g.api || "api client");
+  if (g.api && g.apiRef) why.push(`api: ${path.posix.basename(g.api)} (endpoint exists: ${g.apiRef.fn})`);
   // A signature or a rename changes every caller; a refactor about half of them.
   let blast = 0;
   if (g.blast.length && (text.cues.signature || text.cues.mechanical)) blast = g.blast.length;
@@ -339,18 +550,29 @@ function estimate(text, g, h) {
   for (let i = 0; i < Math.min(text.elements, 2); i++) changed.add(`element ${i + 1}`);
   for (let i = 0; i < Math.min(text.wires, 2); i++) changed.add(`wiring ${i + 1}`);
   if (text.cues.state && !text.creates.some((c) => c.noun === "store")) changed.add("state holder");
-  for (const f of Object.values(g.named).flat()) changed.add(f);
+  for (const f of countedNamed(text, g)) changed.add(f);
   for (const f of g.blast.slice(0, blast)) changed.add(f);
   // A new piece of an EXISTING feature (no new page or shell to hold it) is wired into the
   // feature's files: about `wiring ratio` existing files per new file (learned from git).
   const container = text.creates.some((c) => /^(page|screen|view|flow|wizard|shell|layout|dashboard)$/.test(c.noun));
   const pieces = text.creates.filter((c) => c.layer === "ui" || c.layer === "logic").length;
   let hosts = 0;
+  // The request extends an EXISTING container ("step 2 of the flow; step 1 already exists").
+  const extendsExisting = !container && /\b(flow|shell|page|wizard|stepper|screen|view)\b/i.test(text.raw || "")
+    && /\b(already exists?|already built|existing|sudah ada)\b/i.test(text.raw || "");
   if (pieces && !container && g.hosts.length) {
     const ratio = (h.wiring && h.wiring.ratio) || 2;
-    const want = Math.min(3, g.hosts.length, Math.max(1, Math.round(pieces * ratio)));
+    const want = Math.min(extendsExisting ? 1 : 3, g.hosts.length, Math.max(1, Math.round(pieces * ratio)));
     for (const f of g.hosts) { if (hosts >= want) break; if (!changed.has(f)) { changed.add(f); hosts++; } }
   }
+  // Placeholders (an unresolved edit, the state holder, elements) are absorbed by a real file of
+  // the feature, or by the existing container the request extends: they add 0 files.
+  const featureFile = g.feature ? [...changed].find((f) => f.startsWith(g.feature + "/")) : null;
+  let absorbed = 0;
+  if (featureFile || extendsExisting) {
+    for (const f of [...changed]) if (/^(edit: |element \d|state holder$)/.test(f)) { changed.delete(f); absorbed++; }
+  }
+  if (absorbed) why.push(`absorbed: ${absorbed} placeholder(s) into ${featureFile ? path.posix.basename(featureFile) : "the existing container"}`);
   // A long requirement doc splits a new component into parts (requirement length predicts
   // effort in the story-point studies): +1 sub-component per 40 lines after the first 40.
   let docUnits = 0;
@@ -365,7 +587,17 @@ function estimate(text, g, h) {
   let est = added + changed.size;
   const parts = [`${added} new`, `${changed.size} changed`];
   const structural = est;
+  // The closest existing flow in the same area (works with no git history).
+  const an = g.analog && g.analog.files ? g.analog : null;
+  if (an) { est = blend(est, an.files, 0.3); parts.push(`analog ${an.files}`); }
   if (h.similar.n >= 3 && h.similar.median_src) { est = blend(est, h.similar.median_src, 0.3); parts.push(`git analog ${h.similar.median_src}`); }
+  // The repo's own size prior for this kind of request (same leading cue). A short request
+  // with no create / modify unit leans on it more.
+  const pr = h.prior && h.prior.median ? h.prior : null;
+  // A unit = a create unit or an edit whose target resolved to a file; "fix the payout
+  // adjustment" (an edit with no known target) is a commit-like request.
+  const units = text.creates.length + text.modifies.filter((m) => m.target && (g.named[m.target] || []).length).length;
+  if (pr) est = blend(est, pr.median, units ? 0.1 : 0.25);
   if (h.runs.n >= 3 && h.runs.median_src) { est = blend(est, h.runs.median_src, 0.5); parts.push(`run analog ${h.runs.median_src}`); }
   // Self-calibration: this repo's finished runs say how far the RAW estimate was off.
   // `raw` is kept (run end copies it) so the factor never learns from its own output.
@@ -374,6 +606,8 @@ function estimate(text, g, h) {
   if (cal.learned && Math.abs(cal.factor - 1) >= 0.1) { est *= cal.factor; parts.push(`calibrated ×${cal.factor} from ${cal.n} runs`); }
   est = Math.max(1, Math.round(est));
   why.push(`~${est} source files (${parts.join(", ")})${newUnits.length ? `: ${newUnits.slice(0, 3).join(", ")}` : ""}`);
+  if (an) why.push(`analog: ${an.file} (${an.files} files)`);
+  if (pr) why.push(`history prior: ${pr.cue} median ${pr.median} (${pr.k} commits)`);
   if (blast) why.push(`${blast} caller file(s) must change (${text.cues.signature ? "signature" : text.cues.mechanical ? "rename" : "refactor"})`);
   if (reused.length) why.push(`reuse: ${reused.map((i) => path.posix.basename(g.reuse[i])).join(", ")} (exists; not new)`);
   if (docUnits) why.push(`requirement doc ${text.doc.lines} lines → +${docUnits} sub-component(s)`);
@@ -433,7 +667,7 @@ function decide(text, g, h, e) {
   return { score: Math.round(s), tier: tierOf(s), why, areas: a, history, mechanical };
 }
 
-function confidence(score, text, g, h, d) {
+function confidence(score, text, g, h, d, e) {
   const t = tierOf(score);
   const lo = { low: 0, mid: 25, high: 50, complex: 75 }[t];
   const margin = Math.max(0, Math.min(1, Math.min(score - lo, lo + 24 - score) / 12.5));
@@ -446,6 +680,13 @@ function confidence(score, text, g, h, d) {
     const diff = Math.abs(TIERS.indexOf(tierOf(fileScore(h.similar.median_src))) - TIERS.indexOf(t));
     c += diff === 0 ? 0.1 : diff >= 2 ? -0.1 : 0;
   }
+  // The structural estimate, the analog and the git estimate: agree within ×1.5 → +0.1;
+  // spread more than ×3 → −0.1.
+  const ests = [e && e.structural, g.analog && g.analog.files, h.similar.n >= 3 ? h.similar.median_src : null].filter((x) => Number.isFinite(x) && x > 0);
+  if (ests.length >= 2) {
+    const ratio = Math.max(...ests) / Math.min(...ests);
+    c += ratio <= 1.5 ? 0.1 : ratio > 3 ? -0.1 : 0;
+  }
   if (d.history === "agrees" || d.history === "moved") c += 0.15;
   if (d.history === "disagrees") c -= 0.1;
   return r2(Math.max(0.1, Math.min(0.95, c)));
@@ -453,16 +694,65 @@ function confidence(score, text, g, h, d) {
 
 // Disjoint groups for high / complex: by project, then by layer; a one-layer job is
 // split by its new components (the page with its wiring first). Advice for L2, not a plan.
+// A placeholder in `changed` (no real file): not a split unit.
+const PLACEHOLDER = /^(edit: |element \d|wiring \d|state holder$|route registration$|api client$|router$|one edit$)/;
+
+// The test files that import a file (the graph), else whose name holds the file's name.
+function testsOf(g, files) {
+  if (!g.rels) return [];
+  if (!g._tests) {
+    const idx = new Map();
+    const tests = g.rels.filter((f) => TH.kindOf(f) === "test");
+    if (g.Q && g.model) {
+      for (const t of tests) {
+        let fs2 = [];
+        try { fs2 = g.Q.importsOf(g.model, t).files; } catch (_) { /* none */ }
+        for (const x of fs2) (idx.get(x) || idx.set(x, []).get(x)).push(t);
+      }
+    }
+    g._tests = { idx, tests };
+  }
+  const out = new Set();
+  for (const f of files) {
+    if (ROUTER.test(f)) continue;
+    // By name first (remittance.api.js → remittance.api.spec.js), else the importer tests.
+    const base = path.posix.basename(f).replace(/\.[^.]+$/, "").toLowerCase();
+    const byName = base.length >= 4 ? g._tests.tests.filter((t) => path.posix.basename(t).toLowerCase().startsWith(base + ".")) : [];
+    if (byName.length) { for (const t of byName.slice(0, 2)) out.add(t); continue; }
+    const hit = g._tests.idx.get(f);
+    // A shared module that many tests import names no test of its own.
+    if (hit && hit.length && hit.length <= 3) for (const t of hit.slice(0, 2)) out.add(t);
+  }
+  return [...out].slice(0, 3);
+}
+
 function split(text, g, e, tier) {
   if (tier !== "high" && tier !== "complex") return [];
   const max = Math.min(3, CAP[tier]);
   const items = [];
   const fresh = newOnes(text, g);
-  for (const c of fresh) items.push({ unit: c.text || c.noun, key: c.layer === "logic" ? "ui" : c.layer, page: /^(page|screen|view|flow|wizard|shell|layout)$/.test(c.noun) });
+  for (const c of fresh) items.push({ unit: c.text || c.noun, key: c.layer === "logic" ? "ui" : c.layer, page: CONTAINER.test(c.noun) && c.noun !== "dashboard", fresh: true });
+  const multi = g.projects.length > 1;
+  const keyOf = (f) => { const l = layerAt(g, f); return multi ? projectOf(g.root || ".", f) : l === "logic" ? "ui" : l; };
+  // The real API module (a client file, not a server route) is placed below.
+  const apiFile = g.api && e.changed.includes(g.api) && layerAt(g, g.api) !== "api" ? g.api : null;
+  const seen = new Set();
+  const add = (f, key) => { if (seen.has(f)) return; seen.add(f); items.push({ unit: f, key }); };
   for (const f of e.changed) {
-    if (!f.includes("/")) continue;
-    const l = layerOf(f);
-    items.push({ unit: f, key: g.projects.length > 1 ? projectOf(g.root || ".", f) : l === "logic" ? "ui" : l });
+    if (PLACEHOLDER.test(f) || !f.includes("/") || f === apiFile) continue;
+    add(f, keyOf(f));
+  }
+  // New UI work: its feature constants and the locale files go with the UI group.
+  const uiKey = multi ? (items.find((x) => x.key !== "api" && !x.fresh && layerAt(g, x.unit) === "ui") || {}).key || "ui" : "ui";
+  if (fresh.some((c) => c.layer === "ui")) {
+    for (const f of g.constants || []) add(f, uiKey);
+    for (const f of (g.localeFiles || []).slice(0, 4)) add(f, uiKey);
+  }
+  if (apiFile) {
+    const uiUnits = items.filter((x) => x.key === uiKey).length;
+    const own = max >= 2 && uiUnits >= 3;
+    add(apiFile, own ? "api" : uiKey);
+    if (own) for (const t of testsOf(g, [apiFile])) add(t, "api");
   }
   const groups = new Map();
   for (const it of items) (groups.get(it.key) || groups.set(it.key, []).get(it.key)).push(it);
@@ -480,7 +770,12 @@ function split(text, g, e, tier) {
     list[list.length - 1].its.push(...last.its);
   }
   if (list.length < 2) return [];
-  return list.map((x, i) => ({ g: `G${i + 1}`, layer: x.key, units: x.its.map((it) => it.unit).slice(0, 6) }));
+  return list.map((x, i) => {
+    const units = x.its.map((it) => it.unit).slice(0, 8);
+    const files = units.filter((u) => u.includes("/") && TH.isSrc(u));
+    const tests = testsOf(g, files).filter((t) => !units.includes(t));
+    return { g: `G${i + 1}`, layer: x.key, units, ...(tests.length ? { tests } : {}) };
+  });
 }
 
 function coverageBar(root) {
@@ -519,14 +814,25 @@ function executor(root, text, g, e, d, conf, groups, opts) {
 // The engine. opts: { doc, history (false = no git, no runs), cache, runs, graph }.
 function compute(root, request, opts = {}) {
   const t0 = Date.now();
-  const text = TT.parse(request, { root, doc: opts.doc });
+  // The graph is loaded once: opts.loaded (prep's graph), else loadGraph. An injected graph part
+  // (opts.graph) loads nothing.
+  const loaded = opts.graph ? null : getLoaded(root, opts);
+  const model = loaded && loaded.model;
+  const gitKnown = TT.knownFromGit(root);
+  const known = (n) => {
+    if (model) {
+      if (model.fileSet.has(n) || (model.byName.get(n) || []).length) return true;
+    }
+    return gitKnown ? gitKnown(n) : false;
+  };
+  const text = TT.parse(request, { root, doc: opts.doc, known });
   text.raw = String(request || "");
   // The git log is read once (cached by HEAD) and shared by the git part and the history part.
   let list;
   const commits = () => (list !== undefined ? list : (list = opts.history === false ? null : TH.commits(root, { cache: opts.cache !== false })));
   // opts.graph: an injected graph part (tests); missing fields get their empty defaults.
   // No graph → the git part (unless the graph was injected; opts.gitFallback forces it).
-  let part = opts.graph || graphPart(root, request, text);
+  let part = opts.graph || graphPart(root, request, text, loaded);
   // A graph that found NO related file (a language it does not read, such as Swift or Dart,
   // gives an index with none of those files) also asks git; git wins only when it finds some.
   const empty = part.ok && !(part.core || []).length && !Object.keys(part.named || {}).length;
@@ -539,13 +845,13 @@ function compute(root, request, opts = {}) {
   }
   const g = Object.assign({ ok: false, source: "graph", core: [], named: {}, blast: [], hosts: [], reuse: {}, feature: null, tests: 0, locales: 0, router: null, api: null, layers: [], projects: [], risky: [] }, part);
   g.root = root;
-  const anchors = [...new Set([...Object.values(g.named).flat(), ...(g.router ? [g.router] : []), ...(g.api ? [g.api] : []), ...g.core.slice(0, 2)])];
+  const anchors = [...new Set([...countedNamed(text, g), ...(g.router ? [g.router] : []), ...(g.api ? [g.api] : []), ...g.core.slice(0, 2)])];
   const h = opts.history === false
     ? { commits: 0, cochange: [], similar: { n: 0, median_src: null, samples: [] }, runs: { n: 0 }, wiring: TH.wiringRatio(null), calibration: { factor: 1, n: 0, learned: false } }
     : historyPart(root, request, anchors, { ...opts, list: commits() });
   const e = estimate(text, g, h);
   const d = decide(text, g, h, e);
-  const conf = confidence(d.score, text, g, h, d);
+  const conf = confidence(d.score, text, g, h, d, e);
   const sp = split(text, g, e, d.tier);
   const ex = executor(root, text, g, e, d, conf, sp.length || 1, opts);
   const why = [...d.why, ...e.why];
@@ -559,8 +865,8 @@ function compute(root, request, opts = {}) {
     est_files: e.est, executor: ex.pick, why: why.slice(0, 6), split: sp,
     detail: {
       text: { words: text.words, creates: text.creates, elements: text.elements, modifies: text.modifies, wires: text.wires, names: text.names, layers: text.layers, cues: Object.keys(text.cues).filter((k) => text.cues[k]), risk: text.risk, ui_states: text.ui_states, doc: text.doc },
-      graph: { ok: g.ok, source: g.source, reason: g.reason, store: g.store, files: g.files, core: g.core, feature: g.feature, hosts: g.hosts, named: g.named, blast: g.blast, router: g.router, api: g.api, layers: g.layers, projects: g.projects, tests: g.tests, locales: g.locales, risky: g.risky, specific: g.specific },
-      history: { commits: h.commits, cochange: h.cochange, similar: h.similar, runs: h.runs, wiring: h.wiring, calibration: h.calibration },
+      graph: { ok: g.ok, source: g.source, reason: g.reason, store: g.store, files: g.files, core: g.core, feature: g.feature, hosts: g.hosts, named: g.named, blast: g.blast, router: g.router, api: g.api, layers: g.layers, projects: g.projects, tests: g.tests, locales: g.locales, risky: g.risky, specific: g.specific, analog: g.analog || null },
+      history: { commits: h.commits, cochange: h.cochange, similar: h.similar, prior: h.prior, runs: h.runs, wiring: h.wiring, calibration: h.calibration },
       estimate: { raw: e.raw, structural: e.structural, added: e.added, changed: e.changed, blast: e.blast, ripple: e.ripple, hosts: e.hosts, calibration: e.calibration },
       areas: d.areas, history_shift: d.history, mechanical: d.mechanical, executor: ex,
     },
@@ -570,7 +876,9 @@ function compute(root, request, opts = {}) {
 
 // The compact form prep puts in its JSON (the full answer goes to prep.json).
 function brief(r) {
-  return { tier: r.tier, score: r.score, conf: r.conf, cap: r.cap, groups: r.groups, est_files: r.est_files, executor: r.executor, why: r.why.slice(0, 3).map((w) => w.slice(0, 80)), ...(r.split.length ? { split: r.split.map((x) => `${x.g} ${x.layer}: ${x.units.map((u) => path.posix.basename(u)).join(", ")}`.slice(0, 90)) } : {}) };
+  const gr = (r.detail && r.detail.graph) || {};
+  return { tier: r.tier, score: r.score, conf: r.conf, cap: r.cap, groups: r.groups, est_files: r.est_files, executor: r.executor, why: r.why.slice(0, 3).map((w) => w.slice(0, 80)),
+    ...(gr.api ? { api: path.posix.basename(gr.api) } : {}), ...(gr.feature ? { feature: path.posix.basename(gr.feature) } : {}), ...(r.split.length ? { split: r.split.map((x) => `${x.g} ${x.layer}: ${x.units.map((u) => path.posix.basename(u)).join(", ")}`.slice(0, 90)) } : {}) };
 }
 
 // ── eval: the engine and jev against the runs this repo finished ─────────────
@@ -661,4 +969,4 @@ function cmd(argv = []) {
   return 0;
 }
 
-module.exports = { TIERS, CAP, fileScore, tierOf, sizeTier, layerOf, graphPart, historyPart, estimate, decide, confidence, split, executor, compute, brief, evaluate, cmd };
+module.exports = { TIERS, CAP, fileScore, tierOf, sizeTier, layerOf, loadGraph, featureFolder, structuralAnalog, graphPart, historyPart, estimate, decide, confidence, split, executor, compute, brief, evaluate, cmd };

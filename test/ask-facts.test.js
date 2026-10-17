@@ -74,3 +74,69 @@ test("mustAsk: no router, a typo request, a route request", (t) => {
   assert.ok(m[0].q.includes("src/router/index.js"));
   assert.strictEqual(m[0].seen[0].path, "/remittances/outwards/create");
 });
+
+test("mustAsk steps: a comment that the URL stays the same → inside the shell first", (t) => {
+  if (!HAS_GIT) return t.skip("git is missing");
+  const root = gitRepo({
+    "src/constants/payRoutes.js": "export const PAY_ROUTE = 'Pay';\n\n// Steps switch inside PayFlow; the URL stays the same on every step\nexport const PAY_STEPS = { A: 0, B: 1 };\n",
+    "src/views/PayFlow.vue": "<script>\nexport default { methods: { next() { this.goToStep(stepIndex); } } };\n</script>\n",
+  });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const m = af.mustAsk(root, "Build the PayFlow 2-step wizard", { engine: { detail: { graph: {}, text: { creates: [] } } } });
+  const s = m.filter((i) => i.kind === "steps");
+  assert.strictEqual(s.length, 1, JSON.stringify(m));
+  assert.strictEqual(s[0].seen[0].v, "inside the shell (one route, step index)");
+  assert.strictEqual(s[0].rec, s[0].seen[0].v);
+  assert.ok(s[0].seen[0].at.includes("src/constants/payRoutes.js:3"), JSON.stringify(s[0]));
+  assert.ok(s[0].q.includes("src/constants/payRoutes.js"));
+});
+
+test("mustAsk field: payload X_id with no `id` in the repo data → field item; with `id` → none", (t) => {
+  if (!HAS_GIT) return t.skip("git is missing");
+  const doc = "# Rate\n\nThe request json payload is:\n```json\n{\"destination_country\":\"PH\",\"payment_method_id\":\"uuid-1\"}\n```\n";
+  const mk = (row) => gitRepo({ "doc.md": doc, "mocks/payment-methods.json": `[\n  ${row}\n]\n` });
+  const root = mk('{ "code": "BANK", "name": "Bank" }');
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const f = af.mustAsk(root, "Add the rate call", { doc: "doc.md" }).filter((i) => i.kind === "field");
+  assert.strictEqual(f.length, 1);
+  assert.ok(f[0].q.includes("payment_method_id") && f[0].q.includes("doc.md:5"), f[0].q);
+  assert.strictEqual(f[0].seen[0].v, "code");
+  assert.ok(f[0].seen[0].at[0].startsWith("mocks/payment-methods.json:"));
+  const root2 = mk('{ "id": "m1", "code": "BANK" }');
+  t.after(() => fs.rmSync(root2, { recursive: true, force: true }));
+  assert.deepStrictEqual(af.mustAsk(root2, "Add the rate call", { doc: "doc.md" }).filter((i) => i.kind === "field"), []);
+});
+
+test("mustAsk name: a camelCase spec name with PascalCase siblings → the PascalCase path first", (t) => {
+  if (!HAS_GIT) return t.skip("git is missing");
+  const root = gitRepo({
+    "doc.md": "# Order\n\nThe test spec file is named orderCreateJourney.\n",
+    "tests/unit/views/shop/OrderListJourney.spec.js": "it('x', () => {});\n",
+    "tests/unit/views/shop/Cart.spec.js": "it('y', () => {});\n",
+  });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const n = af.mustAsk(root, "Add the order create view", { doc: "doc.md" }).filter((i) => i.kind === "name");
+  assert.strictEqual(n.length, 1);
+  assert.strictEqual(n[0].seen[0].v, "tests/unit/views/shop/OrderCreateJourney.spec.js");
+  assert.strictEqual(n[0].seen[0].at[0], "tests/unit/views/shop/OrderListJourney.spec.js");
+  assert.strictEqual(n[0].seen[1].v, "orderCreateJourney");
+});
+
+test("mustAsk: no doc and a typo request → []", (t) => {
+  if (!HAS_GIT) return t.skip("git is missing");
+  const root = gitRepo(FILES);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const engine = { detail: { graph: { router: "src/router/index.js" }, text: { creates: [] } } };
+  assert.deepStrictEqual(af.mustAsk(root, "Fix the typo in the balance tooltip text", { engine }), []);
+});
+
+test("mustAsk route: kind route, v = path, rec = first v", (t) => {
+  if (!HAS_GIT) return t.skip("git is missing");
+  const root = gitRepo(FILES);
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const engine = { detail: { graph: { router: "src/router/index.js" }, text: { creates: [] } } };
+  const [r] = af.mustAsk(root, "Add the outwards remittance create page", { engine });
+  assert.strictEqual(r.kind, "route");
+  assert.strictEqual(r.seen[0].v, r.seen[0].path);
+  assert.strictEqual(r.rec, "/remittances/outwards/create");
+});

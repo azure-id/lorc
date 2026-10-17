@@ -1,14 +1,19 @@
 "use strict";
-// lorc slice — writes .claude/lorc/run/<slug>/slice-<n>.md (≤ 24,576 B). The
+// lorc slice — writes .claude/lorc/run/<slug>/slice-<n>.md (≤ 32,768 B). The
 // executor reads this ONE file; the main session holds only its path.
 const fs = require("fs");
 const path = require("path");
 const paths = require("./paths.js");
 const { emit } = require("./json.js");
 
-const MAX_BYTES = 24576;
+const MAX_BYTES = 32768;
 const REFCODE_MAX = 16384;
-const ANCHORS_MAX = 2500;
+const ANCHORS_MAX = 1500;
+const CONTEXT_MAX = 7000;
+const CONTEXT_CODE_MAX = 2500;
+const DOC_INLINE_MAX = 8192;
+const PLAN_MAX = 20480;
+const CONTEXT_TITLE = "## Context (request, doc and graph) — read these ranges with offset/limit, never whole files";
 // Copied from agents-src/executor.template.md (the return block). Keep the two equal.
 const RETURN_SHAPE = [
   "```json",
@@ -51,6 +56,102 @@ function anchors(root, files, focus) {
     out.push(`${m[4]} · ${m[1]}:${m[2]}-${m[3]}${callers.length ? ` · callers: ${callers.join(", ")}` : ""}`);
   }
   return { text: cutLines(out.join("\n"), ANCHORS_MAX), tests: [...tests] };
+}
+
+// No input.focus: task title words + task file basenames + the run request's words (≤ 8, no verbs).
+function deriveFocus(title, files, request) {
+  const { mapWords } = require("./prep.js");
+  const names = files.map((f) => base(f).replace(/\.[^.]+$/, "")).filter(Boolean);
+  const out = [];
+  for (const w of [...mapWords(title), ...names, ...mapWords(request)]) {
+    if (!out.some((x) => x.toLowerCase() === w.toLowerCase())) out.push(w);
+    if (out.length >= 8) break;
+  }
+  return out.join(",");
+}
+
+const fence = (body) => { let f = "```"; while (body.includes(f)) f += "`"; return f; };
+
+// Pick the run's context items for this task (<runDir>/context.json). Each entry is
+// { line, code } — code is optional; the section keeps ≤ CONTEXT_MAX B, code ≤ CONTEXT_CODE_MAX B.
+function contextPart(runDir, input, files, refFiles) {
+  const pack = paths.readJson(path.join(runDir, "context.json"), null);
+  if (!pack) return [];
+  const fileSet = new Set(files);
+  const refSet = new Set(refFiles);
+  const creates = Boolean(input.creates);
+  const all = { targets: pack.targets || [], exemplars: pack.exemplars || [], tests: pack.tests || [], reuse: pack.reuse || [] };
+  const seen = new Set();
+  const picked = [];
+  const add = (it) => {
+    const k = `${it.file}:${it.start}-${it.end}`;
+    if (seen.has(k)) return;
+    seen.add(k);
+    picked.push(it);
+  };
+  // 1. Items in the task's files (targets first), 2. in its refs, 3. exemplars, tests, reuse when the task creates a file.
+  for (const k of ["targets", "exemplars", "tests", "reuse"]) for (const it of all[k]) if (fileSet.has(it.file)) add(it);
+  for (const k of ["targets", "exemplars", "tests", "reuse"]) for (const it of all[k]) if (refSet.has(it.file)) add(it);
+  if (creates) for (const k of ["exemplars", "tests", "reuse"]) for (const it of all[k]) add(it);
+  const out = picked.map((it) => ({
+    file: it.file, line: `- ${it.file}:${it.start}${it.end !== it.start ? "-" + it.end : ""} — ${it.what}${it.why ? ` (${it.why})` : ""}`,
+    code: it.code ? it.code : "",
+  }));
+  const text = [input.title, input.notes, ...(input.accept || []), ...(input.facts || [])].map((x) => String(x || "")).join("\n").toLowerCase();
+  for (const e of pack.entities || []) {
+    const name = String(e.name || "").toLowerCase();
+    if (!name || name.length < 3 || !text.includes(name)) continue;
+    for (const a of (e.at || []).slice(0, 3)) {
+      if (seen.has(a)) continue;
+      seen.add(a);
+      out.push({ file: String(a).split(":")[0], line: `- ${a} — ${e.name} (${e.type || "name"})`, code: "" });
+    }
+  }
+  // Budget: whole lines ≤ CONTEXT_MAX; inline code ≤ CONTEXT_CODE_MAX in total.
+  let used = bytes(CONTEXT_TITLE) + 1;
+  let codeUsed = 0;
+  const kept = [];
+  for (const c of out) {
+    let code = "";
+    if (c.code) {
+      const blk = `${fence(c.code)}\n${c.code}\n${fence(c.code)}`;
+      if (codeUsed + bytes(blk) + 1 <= CONTEXT_CODE_MAX) code = blk;
+    }
+    const b = bytes(c.line) + 1 + (code ? bytes(code) + 1 : 0);
+    if (used + b > CONTEXT_MAX) {
+      if (!code || used + bytes(c.line) + 1 > CONTEXT_MAX) continue;
+      code = "";
+    }
+    used += bytes(c.line) + 1 + (code ? bytes(code) + 1 : 0);
+    if (code) codeUsed += bytes(code) + 1;
+    kept.push({ file: c.file, line: c.line, code });
+  }
+  return kept;
+}
+
+// run.json `doc`: ≤ DOC_INLINE_MAX B → the text; bigger → its path and headings.
+function requirementPart(root, run) {
+  if (!run || !run.doc) return null;
+  const p = path.isAbsolute(run.doc) ? run.doc : path.join(root, run.doc);
+  let t;
+  try { t = fs.readFileSync(p, "utf8"); } catch (_) { return null; }
+  const rel = path.relative(root, p).replace(/\\/g, "/");
+  const lines = t.replace(/\r\n/g, "\n").split("\n");
+  const heads = [];
+  let inFence = false;
+  lines.forEach((l, i) => {
+    if (/^\s*(```|~~~)/.test(l)) inFence = !inFence;
+    else if (!inFence && /^#{1,6}\s/.test(l)) heads.push(`- ${i + 1}: ${l.trim()}`);
+  });
+  return { rel, text: lines.join("\n").trimEnd(), heads, inline: bytes(t) <= DOC_INLINE_MAX };
+}
+
+function renderRequirement(q) {
+  if (q.inline) {
+    const f = fence(q.text);
+    return ["## Requirement (verbatim — do not open the file again)", `${q.rel}`, `${f}md`, q.text, f];
+  }
+  return ["## Requirement (too big to inline — read only the sections you need, with offset/limit)", q.rel, ...q.heads.slice(0, 60)];
 }
 
 function patternPart(root, files) {
@@ -103,9 +204,15 @@ function commandsPart(root, files, graphTests = []) {
 function render(p) {
   const L = [`# Slice ${p.n} — ${p.title}   (lorc run ${p.slug})`, "## Task", p.title];
   if (p.notes) L.push(p.notes);
+  if (p.read) L.push("## Read first — ONE call", `Read ${p.read.path} (ONE Read call, ${p.read.bytes} B): ${p.read.ranges} ranges — ${p.read.list}`);
   if (p.facts.length) L.push("## Known facts (the orchestrator already read these — do not re-read to learn them)", ...p.facts.map((f) => `- ${f}`));
   L.push("## Acceptance", ...(p.accept.length ? p.accept.map((a) => `- ${a}`) : ["- (none given)"]));
   L.push("## Files", ...p.fileRows);
+  if (p.ctx.length) {
+    L.push(CONTEXT_TITLE);
+    for (const c of p.ctx) { L.push(c.line); if (c.code) L.push(c.code); }
+  }
+  if (p.req) L.push(...renderRequirement(p.req));
   if (p.refs.length) L.push("## Model on these (read them first — they are the closest existing code)", ...p.refs.map((r) => `- ${r}`));
   if (p.code.length || p.notInlined.length) {
     L.push("## Reference code (verbatim — model your code on it; do not re-read these ranges)");
@@ -177,14 +284,77 @@ function refBlock(root, r) {
   return { head: `${r.file}:${a}-${b}`, text: `${r.file}:${a}-${b}\n${fence}${ext}\n${body}\n${fence}` };
 }
 
+// A ref with no range on a file over REF_LONG lines: name a range. A context card for the
+// file gives the range (its template first) and its ranges; else say how long the file is.
+const REF_LONG = 150;
+function rangeRefs(root, runDir, kept) {
+  const pack = (() => { try { return paths.readJson(path.join(runDir, "context.json"), null); } catch (_) { return null; } })() || {};
+  const items = ["targets", "exemplars", "tests", "reuse"].flatMap((k) => pack[k] || []);
+  return kept.map((s) => {
+    const m = /^(.+?)(?:\s+[—–-]+\s+(.+))?$/.exec(s);
+    const file = m[1];
+    if (/:\d+(-\d+)?$/.test(file)) return s;
+    let n = 0;
+    try { n = fs.readFileSync(path.join(root, file), "utf8").replace(/\r?\n$/, "").split("\n").length; } catch (_) { return s; }
+    if (n <= REF_LONG) return s;
+    const why = m[2] ? ` — ${m[2]}` : "";
+    const its = items.filter((it) => it.file === file);
+    const it = its.find((x) => /(^|· )(template|methods:)/.test(String(x.what || ""))) || its[0];
+    if (!it) return `${file}${why} (${n} lines — read a range, not the whole file)`;
+    const tm = /template (\d+)-(\d+)/.exec(String(it.what || ""));
+    const a = tm ? Number(tm[1]) : it.start;
+    const b = tm ? Number(tm[2]) : it.end;
+    return `${file}:${a}-${b}${why} (card: ${it.what})`;
+  });
+}
+
 function buildSlice(root, slug, n, input) {
   const runDir = require("./runs.js").runDir(root, slug);
   const files = input.files.map((f) => String(f).replace(/\\/g, "/"));
   const accept = Array.isArray(input.accept) ? input.accept.map(String) : [];
   const fileRows = files.map((f) => `- ${f} (${fs.existsSync(path.join(root, f)) ? "modify" : "create"})`);
   const existing = files.filter((f) => fs.existsSync(path.join(root, f)));
+  const run = paths.readJson(path.join(runDir, "run.json"), null);
+  const req = (() => { try { return requirementPart(root, run); } catch (_) { return null; } })();
+  let refs = parseRefs(root, input.refs);
+  if (req && req.inline) {
+    // The doc is in the slice: drop it from refs.
+    const isDoc = (s) => String(s).split(/\s+[—–-]+\s+/)[0].replace(/:\d+(-\d+)?$/, "") === req.rel;
+    refs = { kept: refs.kept.filter((s) => !isDoc(s)), dropped: refs.dropped, ranged: refs.ranged.filter((r) => r.file !== req.rel) };
+  }
+  const refFiles = refs.kept.map((s) => String(s).split(/\s+[—–-]+\s+/)[0].replace(/:\d+(-\d+)?$/, ""));
+  const creates = files.some((f) => !fs.existsSync(path.join(root, f)));
+  let ctx = [];
+  try { ctx = contextPart(runDir, { ...input, creates }, files, refFiles); } catch (_) { ctx = []; }
+  // 0.4.2: the read plan — the ranges ONE `lorc read --run <slug> --task <n>` call prints.
+  let read = null;
+  try {
+    const pack = paths.readJson(path.join(runDir, "context.json"), null) || {};
+    const planRefs = (Array.isArray(input.refs) ? input.refs : []).filter((s) => !(req && req.inline && String(s).split(/\s+[—–-]+\s+/)[0].replace(/:[\d,-]+$/, "") === req.rel));
+    const words = [input.title, input.notes, ...accept].map((x) => String(x || "")).join(" ");
+    const plan = require("./context.js").readPlan(root, pack, { files, refs: planRefs, words, creates, budget: PLAN_MAX, docText: req ? req.text : "" });
+    if (plan.length) {
+      const r = require("./read.js").render(root, plan, PLAN_MAX);
+      paths.atomicWrite(path.join(runDir, `plan-${n}.json`), JSON.stringify({ v: 1, budget: PLAN_MAX, ranges: r.ranges, bytes: r.bytes, plan }, null, 1) + "\n");
+      const list = plan.map((f) => `${base(f.file)}:${f.ranges.map(([a, b]) => `${a}-${b}`).join(",")}`).join("; ");
+      // 0.4.3: the plan text goes to a file: one Read, never a persisted "output too large" result.
+      const readFile = path.join(runDir, `read-${n}.md`);
+      paths.atomicWrite(readFile, r.text);
+      read = { ranges: r.ranges, bytes: Buffer.byteLength(r.text), list, plan, path: readFile };
+      // Drop the context lines whose whole range the plan prints.
+      const printed = (file, a, b) => plan.some((f) => f.file === file && f.ranges.some(([x, y]) => x <= a && y >= b));
+      ctx = ctx.filter((c) => {
+        const m = /^- (.+?):(\d+)(?:-(\d+))? — /.exec(c.line);
+        return !m || !printed(m[1], +m[2], +(m[3] || m[2]));
+      });
+    }
+  } catch (_) { read = null; }
+  // A file the context section already covers gets no anchors.
+  const ctxFiles = new Set(ctx.map((c) => c.file));
+  const anchorFiles = existing.filter((f) => !ctxFiles.has(f));
+  const focus = input.focus || deriveFocus(String(input.title || ""), files, run && run.request);
   let an = { text: "", tests: [] };
-  try { if (existing.length) an = anchors(root, existing, input.focus); } catch (_) { /* no anchors */ }
+  try { if (anchorFiles.length) an = anchors(root, anchorFiles, focus); } catch (_) { /* no anchors */ }
   const anchorText = an.text;
   let pattern = { lang: "none", conventions: "", invariants: "" };
   try { pattern = patternPart(root, files); } catch (_) { /* none */ }
@@ -204,7 +374,6 @@ function buildSlice(root, slug, n, input) {
   }
   let commands = "- typecheck/build: none\n- tests for this task: none found\n- lint: none";
   try { commands = commandsPart(root, files, an.tests); } catch (_) { /* keep */ }
-  const refs = parseRefs(root, input.refs);
   const code = [];
   const notInlined = [];
   let used = 0;
@@ -216,10 +385,13 @@ function buildSlice(root, slug, n, input) {
     used += b;
     code.push(blk);
   }
-  const p = { code: code.map((c) => c.text), notInlined, refs: refs.kept, n, slug, title: String(input.title), notes: input.notes ? String(input.notes) : "", facts: parseFacts(input.facts), accept, fileRows, anchors: anchorText, pattern, rules, wiki, commands };
+  let refLines = refs.kept;
+  try { refLines = rangeRefs(root, runDir, refs.kept); } catch (_) { /* keep */ }
+  const p = { code: code.map((c) => c.text), notInlined, refs: refLines, n, slug, title: String(input.title), notes: input.notes ? String(input.notes) : "", facts: parseFacts(input.facts), accept, fileRows, anchors: anchorText, pattern, rules, wiki, commands, ctx, req, read };
   let text = render(p);
   let trimmed = false;
-  // Trim order: graph anchors, conventions, wiki, facts, then reference code (last block first, whole blocks only).
+  // Trim order: graph anchors, conventions, wiki, context code, context lines (from the end), facts,
+  // reference code (last block first, whole blocks only), then the requirement (to headings).
   const over = () => bytes(text) > MAX_BYTES;
   if (over() && p.anchors) {
     trimmed = true;
@@ -234,11 +406,14 @@ function buildSlice(root, slug, n, input) {
     text = render(p);
   }
   if (over() && p.wiki) { trimmed = true; p.wiki = ""; text = render(p); }
+  for (let i = p.ctx.length - 1; i >= 0 && over(); i--) if (p.ctx[i].code) { trimmed = true; p.ctx[i].code = ""; text = render(p); }
+  while (over() && p.ctx.length) { trimmed = true; p.ctx.pop(); text = render(p); }
   while (over() && p.facts.length) { trimmed = true; p.facts.pop(); text = render(p); }
   while (over() && p.code.length) { trimmed = true; p.code.pop(); p.notInlined.unshift(code[p.code.length].head); text = render(p); }
+  if (over() && p.req && p.req.inline) { trimmed = true; p.req.inline = false; text = render(p); }
   const file = path.join(runDir, `slice-${n}.md`);
   paths.atomicWrite(file, text);
-  return { path: file, bytes: bytes(text), trimmed, files, accept, refs_dropped: refs.dropped };
+  return { path: file, bytes: bytes(text), trimmed, files, accept, refs_dropped: refs.dropped, read: read ? { path: read.path, ranges: read.ranges, bytes: read.bytes } : null };
 }
 
 function valueOf(argv, flag) {
@@ -263,9 +438,10 @@ function cmd(argv = []) {
   const r = buildSlice(root, slug, n, input);
   runs.addTask(root, slug, { n: /^\d+$/.test(n) ? Number(n) : n, title: String(input.title), files: r.files, accept: r.accept, slice: r.path });
   const o = { path: r.path, bytes: r.bytes, trimmed: r.trimmed };
+  if (r.read) o.read = r.read;
   if (r.refs_dropped.length) o.refs_dropped = r.refs_dropped;
   emit(o);
   return 0;
 }
 
-module.exports = { buildSlice, RETURN_SHAPE, commandsPart, MAX_BYTES, REFCODE_MAX, cmd };
+module.exports = { PLAN_MAX, buildSlice, RETURN_SHAPE, commandsPart, contextPart, requirementPart, deriveFocus, CONTEXT_MAX, CONTEXT_CODE_MAX, DOC_INLINE_MAX, MAX_BYTES, REFCODE_MAX, cmd };

@@ -1,5 +1,126 @@
 # Changelog
 
+## 0.4.3 — 17-10-2026
+**One small read file per executor task; the eval medians beat 0.3.3 on every measure.**
+
+**Why.** Eval l1-ls-1 on 0.4.2 passed (88, 692 s, $2.45, 4.14M tokens). The main plan worked: the main dig fell to 2 calls / 9 KB (was 4–6 / 44–57 KB).
+The task plan did not: `lorc read --task 1` printed 56 KB, and Claude Code saved it as "output too large". The executor needed 2 Reads of the saved file and still made 11 dig calls. No call was saved, and the context grew by 14k tokens.
+
+**Changes**
+- **Task plan: 20 KB, high-precision items only.** The plan has no method dumps for refs without ranges, no templates and no reuse props. The items come in this order:
+  - the targets of the task files;
+  - the doc CSS merged range;
+  - style helpers (only when the doc names the word and the hit is in an exemplar's file or a shared `_*.scss` partial);
+  - the test setup and top-level helpers (no `it` block);
+  - the matched methods inside ranged refs.
+- **Delivery as a file.** `lorc slice` writes the plan text to `<run>/read-<n>.md`. The "Read first" line says `Read <path> (ONE Read call, <bytes> B)`. `lorc read` stays for the main plan (≤ 20 KB, never saved as too large) and for people.
+- **Executor.** "Start with ONE Read of the slice's read file. Then read only what it lacks, all of it in ONE batched message."
+- **Eval repo check.** RMT1, l1-ls-2 task-1 input: the task plan has 13 ranges, 19.4 KB, 16 % of the lines the l1-ls-2 executor read. The main plan is 19.6 KB.
+
+**Result** (RMT1 step 1, lorc alone, 3 runs, medians)
+
+| | lane s | cost $ | tokens | graph calls | score | e2e |
+|---|---|---|---|---|---|---|
+| 0.3.3 | 746 | 2.82 | 4.31M | 1 | 86 | 3/3 |
+| 0.4.1 | 709 | 2.60 | 4.30M | 0 | 88 | 3/3 |
+| 0.4.3 | 627 | 2.36 | 3.40M | 0 | 88 | 3/3 |
+
+0.4.3 vs 0.3.3: lane −16 %, cost −16 %, tokens −21 %, score +2. vs /orc-quick: −20 %, −40 %, −42 %, +4.
+
+## 0.4.2 — 17-10-2026
+**A read plan: `lorc read` prints the code ranges that a task or the main session needs, in one call.**
+
+**Why.** Eval RMT1 × 3 on 0.4.1 passed (87/88/88; medians 709 s, $2.60, 4.30M tokens). The UI executor used 70–75 % of the tokens (2.6–3.1M, 26–32 API calls, peak context 141–148k).
+Before its first write it made ~16 sequential read calls (~140 KB), and each call re-read the whole context (~100k tokens). The context pack already named almost all of these files and many of the ranges. The main session also made 4–6 dig calls (44–57 KB) after prep.
+
+**Changes**
+- **Read plan.** New `readPlan()` in `bin/lib/context.js`. It gives the line ranges that one task (or the main session) needs, merged when ≤ 8 lines apart, in priority order. It cuts them to a byte budget (estimated from the real line lengths).
+  - Task plan (56 KB), first: the refs with ranges; the refs with a card (template + ≤ 5 matching methods); the targets of the task files (parent route head + insertion point ± 12, last exported API function + export block, the i18n block of each locale file, feature constants).
+  - Then: the exemplar methods whose name shares a stem with the task words (≤ 4 per exemplar, ≤ 10 KB); the exemplar template when the task creates a UI file (≤ 6 KB); the merged style range of the doc CSS classes.
+  - Then: the test setup + top-level `render*`/`mount*`/`build*`/`make*`/`setup*` helpers + the first `it(` of the closest `describe`; the props and emits of reuse components; short refs.
+  - Main plan (20 KB): the targets, the requirement doc, the `must_ask` evidence (± 6 lines) and `context.md`.
+- **`lorc read --run <slug> [--task <n>] [--json]`.** New `bin/lib/read.js`. It prints each range as `== file:a-b — why ==` and `<line>│<text>` rows, then `(<n> ranges, <bytes> B — read more only for what is missing)`. It never prints more than the budget. A missing file gives one line `(missing <file>)`.
+- **Slice.** `lorc slice` writes `<run>/plan-<n>.json` and puts `## Read first — ONE call` after `## Task`. The Context section drops the lines that the plan prints. The slice JSON has `read: { ranges, bytes }`.
+- **Executor and SKILL.md.** The executor starts with the slice's `lorc read` command (ONE call). SKILL.md L1: after prep, `lorc read --run <slug>`, then dig only what it lacks (≤ 2 calls).
+
+**Result** Eval repo (RMT1, the real task-1 input of l1-ls-2): the task plan has 26 ranges, 55.8 KB, 45 % of the lines the l1-ls-2 executor read. The main plan is 19.6 KB.
+Style helpers that the doc names (shimmer, tooltip, divider …) add their mixin / keyframes / rule range (≤ 40 lines).
+
+## 0.4.1 — 17-10-2026
+**Executors send fewer messages, and every slice ref on a large file gets a range.**
+
+**Why.** Eval run l1-ls-1 on 0.4.0 (RMT1) passed (87, 791 s, $2.89, 4.71M tokens). The UI executor used 3.50M tokens in 33 API calls (peak context 151k). Every call re-reads the whole context, so the number of calls drives tokens and time.
+It made 17 dig calls before the first write and 18 one-by-one Edits: 7 to different files with no order between them, and 9 that patched a file it had just written. It read `CreateRecipient.vue` whole (31.5 KB) because the slice ref had no range (~240k tokens over ~30 later calls).
+
+**Changes**
+- **Executor: fewer messages.** A new block in the executor template sets these rules:
+  - put all independent tool calls of a step in ONE message (ranged reads, edits to different files);
+  - write a new file complete in ONE Write; do not patch it with a row of small Edits;
+  - read only a named range of a file over 150 lines;
+  - run the tests once after all files are written, fix, then run them once more.
+- **Slice refs with a range.** A ref with no line range on a file over 150 lines gets a range. With a context card for the file: `file:<start>-<end> — <why> (card: <card ranges>)` (the template range first). Without a card: `(N lines — read a range, not the whole file)`. The slice inlines no more code than before.
+
+## 0.4.0 — 17-10-2026
+**lorc owns its code graph engine, gives each run a context pack, and has a smarter tier engine.**
+
+**Why.** Eval evidence: 0.3.3 lanes dug 6 calls / 54 KB (main) and 16 calls / 151 KB (executors) before the first write. Executors read the same exemplars, test setup, i18n block and API exports again in every run.
+
+**Changes**
+- **Code graph engine.** lorc owns the engine. It moved from `vendor/graph/` (ORC 2.3.0 copy) to `bin/lib/graph/`. The engine id is `lgraph@1`.
+  - Parallel extraction (worker_threads, ≥ 200 files).
+  - Faster resolve: alias-config reads are cached.
+  - lorc reads `.git/index` directly, with a git fallback for conflicts, skip-worktree, intent-to-add and unknown extensions.
+- **Store format 2.** The store stays in the same folder `.claude/lorc/orc/graph/`.
+  - Content-addressed buckets (`index/`, `resolved/`, `names/`) with a manifest in `meta.json` / `derived.json`.
+  - An update writes only the buckets that changed. Readers stay lock-free.
+  - The files of the previous manifest stay until the next update (GC).
+  - No `blobs/`, no shards, no `wide.json`.
+- **Speed and size.** Eval repo, 801 files, median of 3. lorc's own repo: 1-file update 867 KB → 46 KB written.
+
+  | measure | 0.3.3 | 0.4.0 |
+  |---|---|---|
+  | cold build wall ms | 3,710 | 2,024 |
+  | store size | 16.1 MB in 1,051 files | 9.8 MB in 196 files |
+  | 1-file update wall ms | 1,274 | 834 |
+  | 1-file update bytes written | 11.5 MB in 253 files | 254 KB in 4 files |
+  | no-op update ms | 488 | 392 |
+
+- **More robust graph.** Extractor fixes:
+  - `export default ({…})`, local consts exported by `export {}` / `export default NAME`, multi-declarator `const a = …, b = …`;
+  - name-only Vue SFCs, `describe(...)` blocks as `test` symbols, `module.exports.x = function`, import-then-export barrels;
+  - a URL through a file constant, locale JSON keys (`i18n` files: key → line);
+  - test-helper calls (`expect`, `wrapper.*`, Testing Library …) are not stored.
+
+  | eval repo | 0.3.3 | 0.4.0 |
+  |---|---|---|
+  | zero-symbol files | 60 | 8 |
+  | partial files | 72 | 17 |
+  | symbols | 8,531 | 9,611 |
+  | API functions with a URL | 43 of 255 | 248 of 268 |
+
+- **Backward compatible.** lorc still reads a format-1 store (lorc ≤ 0.3.x, `graph@7`) as is.
+  - `lorc graph upgrade` converts it in place. Each language parses again only when its extractor version changed. Eval repo: 2.5 s.
+  - `lorc graph status --heal` (prep) upgrades it too. `lorc graph sync` stays as a no-op.
+  - The `orc-store` and `copy` store modes are removed (the engine id of ORC no longer matches). Delegate mode (ORC ≥ 2.2.0 with `code_graph` on/semi) stays.
+- **Context pack (graph on point).** New `bin/lib/context.js` and `lorc context "<request>" [--doc] [--run] [--json]`.
+  - It links the names in the request and the doc to anchored line ranges: identifiers, files, CSS classes incl. nested SCSS BEM, endpoints, quoted UI text, "create recipient component".
+  - It adds the change targets (route rows + insertion point, API exports + append line, feature constants, the i18n block, the entry/CTA), the closest exemplars with cards (props, emits, methods, children), the test setup to copy, and 1-hop reuse.
+  - prep writes `<run>/context.md` + `context.json`; prep JSON has `context.path`.
+  - The slice embeds the context items of the task and inlines the requirement doc (≤ 8 KB) with "do not open it again". Slice cap 24 KB → 32 KB.
+  - Eval repo (RMT1): changed files 5 of 5 with their regions, 15 of the 20 files that executors read in 0.3.3 runs (slice: 17 of 20), precision 0.71, 8 KB. 0.3.3 prep focus rows: 0 of 5 changed files.
+- **prep in process.** One model load for each prep. Heal, tier engine and context run in the prep process (no graph child processes).
+- **Tier engine.** Better signals:
+  - A client router is UI wiring (not "api"). The API module comes from the doc endpoint or a doc file name, and counts as changed only when the endpoint is new.
+  - Doc names count as changed only after a change verb. The feature folder is where new files go.
+  - Split groups list real files: a UI group with router, keys, locale; an API group with the module + its spec. Placeholders go into real files.
+  - Structural analog (the closest existing flow, its 1-hop footprint) works with no git history. IDF-weighted git analogs with a dynamic k (Kocaguneli et al., TSE 2012). A cue prior from the history of the repo.
+  - Confidence comes from signal agreement.
+  - Result: RMT1: high with the correct split (0.3.3: router in the "api" group). RMT3: mid, est 3 (0.3.3: high, est 6). Backtest on 40 dashboard commits (`bench-tier`): seed 1 median abs error 2 → 1, within ±1 file 48 → 53 %, within ×1.5 25 → 33 %; seed 2 level.
+- **Answer recommendations (`must_ask`).** Items now have `kind` (`route`, `steps`, `field`, `name`), `seen[].v` options with `at` evidence, and `rec`.
+  - `rec` covers the step pattern (inside the shell vs one route per step) from step constants and their comments, a payload field with no source in the repo data, and a doc spec name that breaks the sibling naming.
+  - Route items keep `path` for older skills.
+- **SKILL and executor.** L1 reads `context.path` first (max 3 dig calls). L3 shows the `must_ask` options. L4: the slice carries the context and the doc. The executor reads only the listed ranges and never opens the requirement file again.
+
 ## 0.3.5 — 14-10-2026
 Docs only. README: short sections with links to new pages under `docs/` (how-it-works, tiers, executors, orc, features, settings, commands, benchmark); live npm version badge. No fact was removed: the README text moved into the `docs/` pages. No code change.
 

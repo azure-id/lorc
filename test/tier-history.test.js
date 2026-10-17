@@ -67,11 +67,62 @@ test("similarCommits", () => {
     c(["src/z.js"], 0, 1, "unrelated thing entirely"),
     c(["README.md"], 0, 0, "refund payments docs only"),
   ];
-  const r = h.similarCommits(list, "add a refund button to payments");
+  const r = h.similarCommits(list, "add a refund button to payments", { k: 7 });
   assert.strictEqual(r.n, 4);
   assert.strictEqual(r.median_src, 1.5);
   assert.strictEqual(r.samples.length, 3);
   assert.strictEqual(h.similarCommits(list, "refund").n, 0);
+});
+
+test("similarCommits: IDF weights a rare shared word over a common one", () => {
+  const idf = h.idfOf([new Set(["page", "refund"]), new Set(["page", "x1"]), new Set(["page", "y1"]), new Set(["page", "z1"])]);
+  assert.ok(idf("refund") > idf("page"));
+  const a = new Set(["page", "refund", "button"]);
+  const rare = h.weightedOverlap(a, new Set(["refund", "button", "page"]), idf);
+  assert.ok(Math.abs(rare.score - 1) < 1e-9);
+  // Same shared count (2): the pair with the rare word scores higher.
+  const withRare = h.weightedOverlap(a, new Set(["refund", "page", "z1"]), idf).score;
+  const common = h.weightedOverlap(new Set(["page", "z1", "q1"]), new Set(["page", "z1", "refund"]), idf).score;
+  assert.ok(withRare > 0 && common > 0);
+  // Plain overlap ties A and B (2 of 3 words each); IDF ranks B (the rare word "payout") first.
+  const subjects = [
+    c(["src/a.js"], 0, 1, "page summary tidy"),
+    c(["src/b.js"], 0, 1, "payout page tidy"),
+    ...Array.from({ length: 15 }, (_, i) => c(["src/x.js"], 0, 1, `page w${i}`)),
+    ...Array.from({ length: 15 }, (_, i) => c(["src/x.js"], 0, 1, `summary q${i}`)),
+  ];
+  const r = h.similarCommits(subjects, "payout summary page", { k: 2 });
+  assert.strictEqual(r.samples[0].s, "payout page tidy");
+});
+
+test("similarCommits: dynamic k picks the smallest spread of 3, 5, 7", () => {
+  assert.strictEqual(h.spread([2, 2, 2]), 0);
+  const mk = (n, s) => c(Array.from({ length: n }, (_, i) => `src/f${i}.js`), 0, n, s);
+  // The top 3 agree (2 files); hits 4–7 are wide: k = 3.
+  const list = [mk(2, "payout refund page a1"), mk(2, "payout refund page a2"), mk(2, "payout refund page a3"),
+    mk(9, "payout refund b1"), mk(1, "payout refund b2"), mk(14, "payout refund b3"), mk(1, "payout refund b4")];
+  const r = h.similarCommits(list, "payout refund page");
+  assert.strictEqual(r.k, 3);
+  assert.strictEqual(r.n, 3);
+  assert.strictEqual(r.median_src, 2);
+  // All 7 agree after a wide top 3: k = 7.
+  const l2 = [mk(1, "payout refund page a1"), mk(9, "payout refund page a2"), mk(2, "payout refund page a3"),
+    mk(4, "payout refund b1"), mk(4, "payout refund b2"), mk(4, "payout refund b3"), mk(4, "payout refund b4")];
+  assert.strictEqual(h.similarCommits(l2, "payout refund page").k, 7);
+  // Fewer than 3 hits: no estimate as before (the caller needs n ≥ 3).
+  assert.ok(h.similarCommits(list.slice(0, 2), "payout refund page").n < 3);
+});
+
+test("cuePrior: the median size of the same leading cue", () => {
+  const list = [
+    ...Array.from({ length: 6 }, (_, i) => c(["src/a.js"], 0, 1, `fix: bug ${i}`)),
+    ...Array.from({ length: 6 }, (_, i) => c(["src/a.js", "src/b.js", "src/c.js", "src/d.js"], 4, 0, `feat: add thing ${i}`)),
+    c(["src/a.js"], 0, 1, "chore(deps): bump x"),
+  ];
+  assert.deepStrictEqual(h.cuePrior(list, "fix the header crash"), { cue: "fix", median: 1, k: 6 });
+  assert.deepStrictEqual(h.cuePrior(list, "add a settings page"), { cue: "add", median: 4, k: 6 });
+  assert.strictEqual(h.cuePrior(list, "bump lodash").median, null);
+  assert.strictEqual(h.cuePrior(null, "fix x").median, null);
 });
 
 test("wiringRatio", () => {

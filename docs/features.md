@@ -2,6 +2,13 @@
 
 [← README](../README.md)
 
+## Code graph
+
+- Store format 2: content-addressed buckets with a manifest. An update writes only the buckets that changed. More: [graph.md](graph.md).
+- More robust extraction: `export default ({…})`, `export {}` / `export default NAME` of local consts, multi-declarator `const`, name-only Vue SFCs, `describe(...)` blocks as `test` symbols, `module.exports.x = function`, import-then-export barrels, a URL through a file constant. Test-helper calls (`expect`, `wrapper.*`, Testing Library …) are not stored.
+- i18n keys: locale JSON files give each key with its line.
+- Eval repo: zero-symbol files 60 → 8, partial files 72 → 17, API functions with a URL 43 of 255 → 248 of 268.
+
 ## House rules and anti-slop
 
 - `lorc rules init` writes `HOUSE-RULES.md` in the repo root, with the levels P0, P1, P2 and P3.

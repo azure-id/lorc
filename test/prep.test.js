@@ -87,6 +87,53 @@ test("prep on a risky path sets tier_hint.risky_paths", () => {
   assert.ok(o.tier_hint.risky_paths.includes("src/payments/charge.js"), JSON.stringify(o.graph));
 });
 
+test("W20b: context in the JSON — path with a run, no path with --no-start", () => {
+  const e = repo();
+  const o = JSON.parse(e.lorc(["prep", "add a subtract helper next to add in math", "--json"]).stdout);
+  assert.ok(o.context && typeof o.context.items === "number" && typeof o.context.bytes === "number", JSON.stringify(o.context));
+  assert.ok(o.context.path && fs.existsSync(o.context.path) && fs.existsSync(path.join(o.run_dir, "context.json")));
+  const run = JSON.parse(fs.readFileSync(path.join(o.run_dir, "run.json"), "utf8"));
+  assert.ok("doc" in run);
+  const n = JSON.parse(e.lorc(["prep", "add subtract", "--json", "--no-start"]).stdout);
+  assert.ok(n.context && !("path" in n.context) && typeof n.context.items === "number", JSON.stringify(n.context));
+});
+
+test("W20b: heal runs in process through graph-router.heal (no child)", () => {
+  const e = repo();
+  const R = require("../bin/lib/graph-router.js");
+  const old = R.heal;
+  let calls = 0;
+  R.heal = (root) => { calls++; assert.strictEqual(root, e.root); return { state: "fresh" }; };
+  try {
+    const o = prep.prep(e.root, "add subtract", { start: false });
+    assert.strictEqual(calls, 1);
+    assert.strictEqual(o.graph.state, "fresh");
+  } finally { R.heal = old; }
+  assert.ok(!/lorcJson\(root, \["graph", "(status|sync)"/.test(fs.readFileSync(require.resolve("../bin/lib/prep.js"), "utf8")));
+});
+
+test("W20b: fit keeps must_ask and context.path; seen.at cut to 1", () => {
+  const big = "q".repeat(1200);
+  const o = {
+    graph: { focus: [] }, wiki: { pages: [] }, pad: "z".repeat(2800),
+    must_ask: [{ kind: "route_path", seen: [{ v: "/a", at: ["x.js:1", "y.js:2", "z.js:3"] }] }],
+    context: { path: "/run/context.md", items: 12, bytes: 4000, note: big },
+  };
+  const out = prep.fit(o);
+  assert.ok(Buffer.byteLength(JSON.stringify(out)) <= 4096);
+  assert.strictEqual(out.must_ask.length, 1);
+  assert.deepStrictEqual(out.must_ask[0].seen[0].at, ["x.js:1"]);
+  assert.deepStrictEqual(out.context, { path: "/run/context.md" });
+});
+
+test("mapWords: every content word, verbs dropped, ≤ 12", () => {
+  const w = prep.mapWords("Build outward remittance create-transaction route shell with 4-step stepper and step 1 Amount & Method; wire Transfer Fund button");
+  assert.ok(!w.includes("build") && !w.includes("create") && !w.includes("wire"));
+  assert.ok(w.includes("remittance") && w.includes("button") && w.length <= 12, w.join(","));
+  assert.deepStrictEqual(prep.packRows({ targets: [{ what: "w".repeat(50), file: "a.js", start: 3 }], exemplars: [{ what: "e", file: "b.js", start: 1 }] }),
+    [{ sym: "w".repeat(40), file: "a.js", line: 3 }, { sym: "e", file: "b.js", line: 1 }]);
+});
+
 test("keywords drop stop words and short words, ≤ 6", () => {
   assert.deepStrictEqual(prep.keywords("Please add a new export button to the orders page and the invoice list today"), ["export", "button", "orders", "page", "invoice", "list"]);
 });

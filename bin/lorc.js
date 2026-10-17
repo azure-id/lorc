@@ -61,10 +61,12 @@ Object.assign(COMMANDS, {
   extra: lazy("extra.js", "extra executors: status | list | dispatch --slot <s> --slice <path>"),
   prep: lazy("prep.js", "prep \"<request>\" [--json] [--no-start]: the one L0 call of /lorc"),
   slice: lazy("slice.js", "slice --run <slug> --task <n> - : write an executor slice (JSON on stdin)"),
+  read: lazy("read.js", "read --run <slug> [--task <n>] [--json]: print the read plan (the ranges to read) in ONE call"),
   check: lazy("check.js", "check --run <slug> [--lint-only] [--build] [--full]: affected tests, lint, typecheck"),
   cov: lazy("coverage.js", "cov [--bar <n>] [--json]: coverage of the changed source files, source branches apart from generated ones (no test run)"),
   review: lazy("review.js", "review prep --run <slug> [--tier <t>]: write the review packet"),
   tier: lazy("tier.js", "tier \"<request>\" [--doc <path>] [--json] [--brief] [--no-heal]: lorc's tier engine · tier eval [--recompute]"),
+  context: lazy("context.js", "context \"<request>\" [--doc <path>] [--run <slug>] [--json]: anchored line ranges for the request"),
   jev: lazy("jev.js", "TypeSafe jev tier judge: status [--ping] | connect - | disconnect | tier"),
 });
 

@@ -1,38 +1,6 @@
 {
   "copy": [
     {
-      "from": "bin/graph.js",
-      "to": "vendor/graph/graph.js"
-    },
-    {
-      "from": "bin/graph-extract.js",
-      "to": "vendor/graph/graph-extract.js"
-    },
-    {
-      "from": "bin/graph-query.js",
-      "to": "vendor/graph/graph-query.js"
-    },
-    {
-      "from": "bin/graph-resolve.js",
-      "to": "vendor/graph/graph-resolve.js"
-    },
-    {
-      "from": "bin/graph-signals.js",
-      "to": "vendor/graph/graph-signals.js"
-    },
-    {
-      "from": "bin/graph-notes.js",
-      "to": "vendor/graph/graph-notes.js"
-    },
-    {
-      "from": "bin/graph-map.js",
-      "to": "vendor/graph/graph-map.js"
-    },
-    {
-      "from": "bin/graph-shard.js",
-      "to": "vendor/graph/graph-shard.js"
-    },
-    {
       "from": "bin/pricing.json",
       "to": "vendor/pricing.json"
     },
@@ -145,7 +113,5 @@
       "to": "templates/skills/lorc-pattern/references/fe-vue.md"
     }
   ],
-  "local": [
-    "vendor/graph/graph-gain.js"
-  ]
+  "local": []
 }

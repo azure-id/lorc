@@ -7,6 +7,40 @@
 Arms: Q = `/orc-quick`. LS = lorc alone. LO = lorc with ORC installed.
 Gate per cell: cost lower AND tokens lower AND lane time lower AND score median not lower than Q AND the critical e2e steps pass in 3 of 3 runs.
 
+## lorc 0.4.3 (17-10-2026)
+
+Eval kit `2.1.2-dashboard-eval`, task RMT1 step 1, lorc alone, 3 runs per version, medians.
+
+| Version | Lane s | Cost $ | Tokens | Graph calls | Score | E2E |
+|---|---|---|---|---|---|---|
+| **0.4.3** | **627** | **2.36** | **3.40M** | **0** | **88** | **3/3 (30/30 checks each)** |
+| 0.4.1 | 709 | 2.60 | 4.30M | 0 | 88 | 3/3 |
+| 0.3.3 | 746 | 2.82 | 4.31M | 1 | 86 | 3/3 |
+| `/orc-quick` (ORC 2.3.0) | 785 | 3.95 | 5.90M | — | 84 | 3/3 |
+
+- 0.4.3 vs 0.3.3: lane −16 %, cost −16 %, tokens −21 %, score +2, graph calls 1 → 0.
+- 0.4.3 vs `/orc-quick`: lane −20 %, cost −40 %, tokens −42 %, score +4.
+
+Runs (0.4.3): 667 s, $2.47, 4.20M, PASS 87 · 546 s, $2.36, 3.39M, PASS 90 · 627 s, $2.25, 3.40M, PASS 88.
+
+Where the gain came from:
+- The main session dig fell from 4–6 calls / 44–57 KB to 2 calls / 9 KB (context pack + `lorc read`).
+- The UI executor fell from 2.6–3.1M tokens / 26–32 calls (0.4.1) to 2.2–3.0M tokens / 26–30 calls (read file + batching rules).
+
+Offline (eval repo, 801 files, median of 3, 0.3.3 → 0.4.x):
+
+| Metric | 0.3.3 | 0.4.x |
+|---|---|---|
+| Cold build (wall) | 3,710 ms | 2,024 ms |
+| Store | 16.1 MB / 1,051 files | 9.8 MB / 196 files |
+| 1-file update | 1,274 ms | 834 ms |
+| 1-file update, written | 11.5 MB / 253 files | 254 KB / 4 files |
+| Files with zero symbols | 60 | 8 |
+| Partial files | 72 | 17 |
+| API functions with a URL | 43/255 | 248/268 |
+
+A graph@7 store upgrades in place in 2.5 s.
+
 ## Step 1 (RMT1) — lorc 0.3.x, `/orc-quick` and no skill
 
 Arms: Q = `/orc-quick` (3 runs). LS = lorc alone (3 runs per version). No skill = plain Claude Code, same model and

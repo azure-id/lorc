@@ -11,7 +11,7 @@ const T = (...p) => path.join(ROOT, "templates", ...p);
 const SKILL = T("skills", "lorc", "SKILL.md");
 const REFS = T("skills", "lorc", "references");
 const REVIEWER = T("agents", "lorc-reviewer-opus-5-low.md");
-const SKILL_COMMANDS = ["prep", "graph", "slice", "check", "review", "run", "usage", "wait", "jev"];
+const SKILL_COMMANDS = ["prep", "read", "graph", "slice", "check", "review", "run", "usage", "wait", "jev"];
 
 const read = (f) => fs.readFileSync(f, "utf8").replace(/\r\n/g, "\n");
 const size = (f) => Buffer.byteLength(read(f));
@@ -30,6 +30,15 @@ test("SKILL.md fits 8,192 bytes and has name + description", () => {
   const f = front(read(SKILL));
   assert.strictEqual(f.name, "lorc");
   assert.ok(f.description);
+});
+
+test("W20b: SKILL.md reads context.path first; slice adds context + doc; must_ask options", () => {
+  const s = read(SKILL);
+  assert.ok(!s.includes("Start with ONE `lorc graph ctx`"));
+  assert.ok(s.includes("options = its `seen[].v`"));
+  assert.ok(s.includes("The slice adds the task's context items and the requirement doc by itself"));
+  assert.ok(size(SKILL) <= 8192);
+  for (const f of executors()) assert.ok(read(f).includes("Never open the requirement file again"), f);
 });
 
 test("each reference fits 4,096 bytes", () => {
@@ -125,4 +134,23 @@ test("0.3.2: executor, reviewer and SKILL texts", () => {
 test("0.3.3: SKILL asks must_ask items", () => {
   const s = fs.readFileSync(SKILL, "utf8");
   assert.ok(s.includes("must_ask[]") && s.includes("never your own pick"));
+});
+
+test("0.4.1: executor batches calls, writes whole files, reads ranges", () => {
+  const ex = read(path.join(ROOT, "agents-src", "executor.template.md")).replace(/\s+/g, " ");
+  assert.ok(ex.includes("Every message re-reads your whole context"));
+  assert.ok(ex.includes("Write a new file complete in ONE Write"));
+  assert.ok(ex.includes("A file over 150 lines: read only the range"));
+  assert.ok(ex.includes("Never open the requirement file again"));
+});
+
+test("0.4.2: SKILL L1 and the executor start with ONE lorc read call", () => {
+  const s = read(SKILL).replace(/\s+/g, " ");
+  assert.ok(s.includes("After prep: `lorc read --run <slug>` (ONE call"));
+  assert.ok(s.includes("Then dig only what it lacks (≤ 2 calls)"));
+  assert.ok(!s.includes("Read `context.path` FIRST"));
+  assert.ok(size(SKILL) <= 8192);
+  const ex = read(path.join(ROOT, "agents-src", "executor.template.md")).replace(/\s+/g, " ");
+  assert.ok(ex.includes("Start with ONE Read of the slice's read file"));
+  for (const f of executors()) assert.ok(read(f).includes("slice's read file"), f);
 });

@@ -1,0 +1,61 @@
+{
+ "bin/lib/paths.js": [
+  "repoRoot|function|10-19",
+  "homeDir|function|21-23",
+  "homeClaude|function|25-27",
+  "argValue|function|29-32",
+  "resolveClaudeDir|function|34-39",
+  "projectLorcDir|function|41-43",
+  "globalLorcDir|function|45-47",
+  "parseVer|function|49-53",
+  "semverGte|function|55-63",
+  "readJson|function|65-71",
+  "findOrc|function|73-96",
+  "atomicWrite|function|98-108",
+  "MIN_ORC_DELEGATE|const|8-8"
+ ],
+ "bin/lib/json.js": [
+  "wantsJson|function|3-5",
+  "emit|function|8-10"
+ ],
+ "bin/lib/wait.js": [
+  "scale|function|11-14",
+  "now|function|16-19",
+  "planHop|function|22-27",
+  "sleepWithBeats|function|32-41",
+  "run|function|43-89",
+  "cmd|function|93-95",
+  "sleep|function|29-29",
+  "out|function|46-46",
+  "finish|function|47-50"
+ ],
+ "bin/lib/stats.js": [
+  "transcriptDir|function|11-14",
+  "sessionFiles|function|16-24",
+  "pricing|function|26-28",
+  "rateFor|function|30-38",
+  "addVec|function|41-44",
+  "runStats|function|46-86",
+  "collect|function|88-99",
+  "cmd|function|101-113",
+  "zero|function|40-40",
+  "val|function|102-102"
+ ],
+ "bin/lib/usage.js": [
+  "toMs|function|11-20",
+  "nowMs|function|22-26",
+  "loadSettings|function|28-35",
+  "readOne|function|37-42",
+  "readUsage|function|44-67",
+  "check|function|69-88",
+  "cmd|function|93-117",
+  "num|function|74-74",
+  "DEFAULTS|const|8-8"
+ ],
+ "bin/lib/behaviour.js": [
+  "record|function|11-30",
+  "read|function|32-41",
+  "file|function|8-8",
+  "CAP|const|7-7"
+ ]
+}

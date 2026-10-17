@@ -99,16 +99,230 @@ function routeHints(root, router, words) {
     .map((e) => ({ path: e.path, at: e.at }));
 }
 
-// prep's `must_ask[]`: [{ q, seen: [{ path, at[] }] }] or [].
-function mustAsk(root, request, { doc, engine } = {}) {
-  let docText = "";
-  if (doc) { try { docText = fs.readFileSync(path.resolve(root, doc), "utf8"); } catch (_) { docText = ""; } }
-  const router = engine && engine.detail && engine.detail.graph ? engine.detail.graph.router : null;
-  if (!router || !addsRoute(`${request}\n${docText}`, engine)) return [];
-  // Stems from the request; the doc only when the request has fewer than 2 (doc words are broad).
-  let words = stems(request);
-  if (words.length < 2) words = stems(`${request} ${docText.slice(0, 4000)}`);
-  return [{ q: `route path of the new page (router ${router})`, seen: routeHints(root, router, words) }];
+// ---- 0.4.0: more must-ask kinds (steps, field, name). Facts with evidence; the first option is the rec.
+
+const STEP_WORDS = /\b(steps?|stepper|wizard|multi-step|\d+-step)\b/i;
+const EXCL = [":(exclude)**/node_modules/**", ":(exclude)**/dist/**", ":(exclude)**/*.lock", ":(exclude)**/package-lock.json"];
+const SHELL_V = "inside the shell (one route, step index)";
+const ROUTES_V = "one route per step";
+const lineOf = (text, idx) => String(text).slice(0, idx).split("\n").length;
+const readLines = (root, f) => { try { return fs.readFileSync(path.join(root, f), "utf8").split(/\r?\n/); } catch (_) { return []; } };
+const option = (v, at) => ({ v, at: at.slice(0, MAX_AT) });
+const item = (q, kind, seen, why) => {
+  const it = { q, kind, seen: seen.slice(0, MAX_PATHS) };
+  if (it.seen.length) it.rec = it.seen[0].v;
+  if (why) it.why = why;
+  return it;
+};
+
+// The request, the doc or the engine names steps (step, stepper, wizard, multi-step, "N-step").
+function namesSteps(text, engine) {
+  if (STEP_WORDS.test(text)) return true;
+  const creates = engine && engine.detail && engine.detail.text ? engine.detail.text.creates || [] : [];
+  return creates.some((c) => ["step", "stepper", "wizard"].includes(String(c.noun || "").toLowerCase()));
 }
 
-module.exports = { mustAsk, routeHints, definedPaths, stems, addsRoute, weightOf };
+// kind "steps": how the flow switches steps. One git grep for step constants, step-index use and
+// step routes. A comment within ±3 lines of the constant says which side is true (strong evidence).
+function stepsItem(root, words) {
+  const out = git(root, ["grep", "-n", "-I", "-E", "--no-color",
+    "-e", "\\b[A-Z][A-Z0-9_]*STEPS?\\b[[:space:]]*[=:]",
+    "-e", "\\b(goToStep|stepIndex|currentStep|activeStep)\\b",
+    "-e", "path[[:space:]]*:[[:space:]]*['\"`][^'\"`]*step",
+    "--", ".", ...EXCL]);
+  const consts = []; const idx = new Map(); const per = new Map();
+  for (const line of out.split(/\r?\n/)) {
+    const m = /^(.+?):(\d+):(.*)$/.exec(line);
+    if (!m) continue;
+    const file = m[1].replace(/\\/g, "/");
+    if (TEST_RE.test(file) || DOC_RE.test(file)) continue;
+    if (/\b[A-Z][A-Z0-9_]*STEPS?\b\s*[=:]/.test(m[3])) consts.push({ file, n: +m[2] });
+    if (/\b(goToStep|stepIndex|currentStep|activeStep)\b/.test(m[3]) && !idx.has(file)) idx.set(file, `${file}:${m[2]}`);
+    if (/path\s*:\s*['"`][^'"`]*step/i.test(m[3]) && !per.has(file)) per.set(file, `${file}:${m[2]}`);
+  }
+  let best = null;
+  for (const c of consts) {
+    const lines = readLines(root, c.file);
+    const win = [];
+    for (let k = Math.max(1, c.n - 3); k <= Math.min(lines.length, c.n + 3); k++) win.push({ k, t: lines[k - 1] });
+    const hay = `${c.file} ${win.map((w) => w.t).join(" ")}`.toLowerCase();
+    const score = words.filter((w) => hay.includes(w)).length;
+    if (score && (!best || score > best.score)) best = { ...c, win, score };
+  }
+  if (!best) return null;
+  let shellW = 0; let routesW = 0; const shellAt = []; const routesAt = [];
+  for (const w of best.win) {
+    if (!/^\s*(\/\/|\/?\*|#|<!--)/.test(w.t || "")) continue;
+    const t = w.t.toLowerCase();
+    if (/(url|route|path)[^.;]{0,40}(stays|same|does not change|unchanged)|inside|same url|one route/.test(t)) { shellW += 3; shellAt.push(`${best.file}:${w.k}`); }
+    else if (/(route|url|path) (per|for each|for every) step|own (route|url)/.test(t)) { routesW += 3; routesAt.push(`${best.file}:${w.k}`); }
+  }
+  const near = (x) => words.filter((w) => x.toLowerCase().includes(w)).length;
+  for (const a of [...idx.values()].sort((x, y) => near(y) - near(x))) { shellW += 1; shellAt.push(a); }
+  for (const a of per.values()) { routesW += 1; routesAt.push(a); }
+  const shell = option(SHELL_V, shellAt); const routes = option(ROUTES_V, routesAt);
+  return item(`How does the flow switch steps? (${best.file})`, "steps", routesW > shellW ? [routes, shell] : [shell, routes]);
+}
+
+// Doc payload keys: JSON objects after payload / request / body. [{ key, line }].
+function payloadKeys(docText) {
+  const out = [];
+  const re = /\b(payload|request|body)\b/gi;
+  let m;
+  while ((m = re.exec(docText))) {
+    const open = docText.indexOf("{", m.index);
+    if (open < 0 || open - m.index > 200) continue;
+    let d = 0; let end = -1;
+    for (let k = open; k < docText.length && k < open + 4000; k++) {
+      if (docText[k] === "{") d++;
+      else if (docText[k] === "}" && --d === 0) { end = k; break; }
+    }
+    if (end < 0) continue;
+    const block = docText.slice(open, end + 1);
+    for (const km of block.matchAll(/["']?([A-Za-z_][A-Za-z0-9_]*)["']?\s*:/g)) {
+      if (!out.some((o) => o.key === km[1])) out.push({ key: km[1], line: lineOf(docText, open + km.index) });
+    }
+    re.lastIndex = end;
+  }
+  return out;
+}
+
+// Keys of the first object in the first array of a JSON value.
+function firstKeys(v, depth = 0) {
+  if (depth > 6 || v === null || typeof v !== "object") return null;
+  if (Array.isArray(v)) return v.length && v[0] && typeof v[0] === "object" && !Array.isArray(v[0]) ? Object.keys(v[0]) : null;
+  for (const x of Object.values(v)) { const k = firstKeys(x, depth + 1); if (k) return k; }
+  return null;
+}
+
+// Object keys of the data near a mention (≤ 40 lines): a mockoon "body" string, or a line scan.
+function dataKeys(lines, n) {
+  const win = lines.slice(n - 1, n + 39);
+  for (const l of win) {
+    const b = /^\s*"body"\s*:\s*("(?:[^"\\]|\\.)*")/.exec(l);
+    if (b) { try { const k = firstKeys(JSON.parse(JSON.parse(b[1]))); if (k) return k; } catch (_) { /* not JSON */ } }
+  }
+  const text = win.join("\n");
+  const a = text.search(/\[\s*\{/);
+  const start = a >= 0 ? text.indexOf("{", a) : text.indexOf("{");
+  if (start < 0) return null;
+  const keys = []; let d = 0;
+  for (let k = start; k < text.length; k++) {
+    const ch = text[k];
+    if (ch === "{" || ch === "[") d++;
+    else if (ch === "}" || ch === "]") { if (--d === 0) break; }
+    else if (d === 1 && /[\s{,]/.test(text[k - 1] || " ")) {
+      const km = /^["']?([A-Za-z_][A-Za-z0-9_]*)["']?\s*:/.exec(text.slice(k, k + 80));
+      if (km) { if (!keys.includes(km[1])) keys.push(km[1]); k += km[0].length - 1; }
+    }
+  }
+  return keys.length ? keys : null;
+}
+
+const DATA_SPECS = [":(glob)**/mock*/**", ":(glob)**/mockoon/**", ":(glob)**/fixture*/**", ":(glob)**/__mocks__/**", ":(glob)**/*.api.js", ":(glob)**/*.api.ts"];
+
+// kind "field": a doc key `X_id` / `XId` whose entity X has repo data with no `id` key.
+function fieldItems(root, doc, docText) {
+  for (const { key, line } of payloadKeys(docText)) {
+    const em = /^([a-z][a-z0-9_]*?)_id$/.exec(key) || /^([a-z][A-Za-z0-9]*?)Id$/.exec(key);
+    if (!em) continue;
+    const parts = em[1].replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase().split("_").filter(Boolean);
+    if (!parts.length) continue;
+    const forms = new Set();
+    for (const sep of ["_", "-", ""]) for (const pl of ["", "s"]) {
+      const p = parts.slice(); p[p.length - 1] += pl;
+      forms.add(sep ? p.join(sep) : p[0] + p.slice(1).map((x) => x[0].toUpperCase() + x.slice(1)).join(""));
+    }
+    const hits = [];
+    const args = ["grep", "-n", "-I", "-i", "-F", "--no-color"];
+    for (const f of forms) args.push("-e", f);
+    for (const l of git(root, [...args, "--", ...DATA_SPECS, ...EXCL]).split(/\r?\n/)) {
+      const m = /^(.+?):(\d+):/.exec(l);
+      if (m && hits.length < 40) hits.push({ file: m[1].replace(/\\/g, "/"), n: +m[2] });
+    }
+    for (const f of git(root, ["ls-files", "--", ...DATA_SPECS]).split(/\r?\n/)) {
+      const low = f.toLowerCase();
+      if (f && [...forms].some((x) => low.includes(x.toLowerCase()))) hits.push({ file: f, n: 1 });
+    }
+    const cand = new Map(); let hasId = false; const cache = new Map();
+    for (const h of hits) {
+      if (!cache.has(h.file)) cache.set(h.file, readLines(root, h.file));
+      const keys = dataKeys(cache.get(h.file), h.n);
+      if (!keys) continue;
+      if (keys.includes("id")) { hasId = true; break; }
+      for (const k of keys) { const at = cand.get(k) || []; if (at.length < MAX_AT) at.push(`${h.file}:${h.n}`); cand.set(k, at); }
+    }
+    if (hasId || !cand.size) continue;
+    const x = parts.join("_"); const lastW = parts[parts.length - 1];
+    const pref = ["code", "uuid", `${x}_code`, `${lastW}_code`, "value", "key", "slug", lastW, "type", "name"];
+    const order = [...pref.filter((k) => cand.has(k)), ...[...cand.keys()].filter((k) => !pref.includes(k))];
+    return [item(`Which field of ${x} is sent as \`${key}\`? (${doc}:${line})`, "field",
+      order.map((k) => option(k, cand.get(k))), "the repo data has no `id` key")];
+  }
+  return [];
+}
+
+// kind "name": the doc names a new spec in a casing that differs from its sibling specs.
+function nameItem(root, doc, docText) {
+  const lines = docText.split(/\r?\n/);
+  let found = null;
+  for (let i = 0; i < lines.length && !found; i++) {
+    if (!/\b(spec|test)\b/i.test(lines[i])) continue;
+    const m = /\b([a-z][a-z0-9]*(?:[A-Z][a-z0-9]*)+)(\.(?:spec|test)\.[cm]?[jt]sx?)?\b/.exec(lines[i]);
+    if (m) found = { name: m[1], ext: m[2], line: i + 1 };
+  }
+  if (!found) return null;
+  const parts = found.name.split(/(?=[A-Z])/).map((p) => p.toLowerCase());
+  const suffix = parts[parts.length - 1];
+  const specs = git(root, ["ls-files", "--", ":(glob)**/*.spec.*", ":(glob)**/*.test.*"]).split(/\r?\n/).filter(Boolean);
+  const byDir = new Map();
+  for (const f of specs) {
+    const base = path.posix.basename(f);
+    if (!/^[A-Z]/.test(base)) continue;
+    const dir = path.posix.dirname(f);
+    const low = f.toLowerCase();
+    const score = parts.filter((p) => p.length >= 4 && low.includes(p)).length + (base.toLowerCase().includes(suffix) ? 2 : 0);
+    const e = byDir.get(dir) || { dir, score: 0, files: [] };
+    e.score = Math.max(e.score, score);
+    e.files.push(f);
+    byDir.set(dir, e);
+  }
+  const best = [...byDir.values()].sort((a, b) => b.score - a.score || a.dir.localeCompare(b.dir))[0];
+  if (!best || best.score < 2) return null;
+  const has = (f) => Number(path.posix.basename(f).toLowerCase().includes(suffix));
+  const sib = best.files.sort((a, b) => has(b) - has(a));
+  const ext = found.ext || (/(\.(?:spec|test)\.[cm]?[jt]sx?)$/.exec(sib[0]) || [null, ".spec.js"])[1];
+  const pascal = found.name[0].toUpperCase() + found.name.slice(1);
+  return item("File name of the new spec?", "name", [
+    option(`${best.dir}/${pascal}${ext}`, sib.slice(0, 2)),
+    option(found.name + (found.ext || ""), [`${doc}:${found.line}`]),
+  ], "sibling specs use PascalCase");
+}
+
+// prep's `must_ask[]`: [{ q, kind, seen: [{ v, path?, at[] }], rec?, why? }] or [] (max 4, route first).
+function mustAsk(root, request, { doc, engine } = {}) {
+  try {
+    let docText = "";
+    if (doc) { try { docText = fs.readFileSync(path.resolve(root, doc), "utf8"); } catch (_) { docText = ""; } }
+    const all = `${request}\n${docText}`;
+    // Stems from the request; the doc only when the request has fewer than 2 (doc words are broad).
+    let words = stems(request);
+    if (words.length < 2) words = stems(`${request} ${docText.slice(0, 4000)}`);
+    const items = [];
+    const router = engine && engine.detail && engine.detail.graph ? engine.detail.graph.router : null;
+    if (router && addsRoute(all, engine)) {
+      const seen = routeHints(root, router, words).map((h) => ({ v: h.path, path: h.path, at: h.at }));
+      items.push(item(`route path of the new page (router ${router})`, "route", seen));
+    }
+    if (namesSteps(all, engine)) {
+      try { const s = stepsItem(root, words); if (s) items.push(s); } catch (_) { /* no item */ }
+    }
+    if (docText) {
+      try { items.push(...fieldItems(root, doc, docText)); } catch (_) { /* no item */ }
+      try { const n = nameItem(root, doc, docText); if (n) items.push(n); } catch (_) { /* no item */ }
+    }
+    return items.slice(0, 4);
+  } catch (_) { return []; }
+}
+
+module.exports = { mustAsk, routeHints, definedPaths, stems, addsRoute, weightOf, namesSteps, stepsItem, payloadKeys, dataKeys, fieldItems, nameItem };

@@ -1,4 +1,5 @@
 "use strict";
+// lorc owns this file since 0.4.0 (forked from ORC 2.3.0 @ ae47a4a, vendor/graph). Change it here, not in ORC.
 // ── orc graph — EXTRACTION (v1.8.0 W2 · v1.8.2 W1) ──────────────────────────
 //
 // One source file in, one record out: imports, symbols (with line ranges and a
@@ -603,6 +604,29 @@ function argPieces(c, open, close) {
       const id = !p.req && !p.inc && !p.id ? IDENT_PIECE.exec(body) : null;
       if (id && !KW.has(id[1]) && !/^\d/.test(id[1])) p.id = id[1].replace(/\s+/g, "").replace(/->|::/g, ".");
     }
+    // W19d (F3): `LIST + "/" + id` — the terms of a concatenation that starts
+    // with a name. `urlOf` puts the file constant's text in for a known name.
+    if (p.s == null && /^\s*[A-Za-z_$][\w$]*\s*\+/.test(body)) {
+      const terms = [];
+      let d = 0;
+      let a = 0;
+      for (let k = 0; k <= body.length; k++) {
+        const ch = body[k];
+        if (ch === "(" || ch === "[" || ch === "{") d++;
+        else if (ch === ")" || ch === "]" || ch === "}") d--;
+        if (k < body.length && !(ch === "+" && d === 0)) continue;
+        const raw = body.slice(a, k);
+        const tt = raw.trim();
+        const off = bodyStart + a + (raw.length - raw.trimStart().length);
+        if (/^[A-Za-z_$][\w$]*$/.test(tt)) terms.push({ id: tt });
+        else if (/^(["'])\s*\1$/.test(tt)) {
+          const sp = strAt.get(off + 1);
+          terms.push({ s: sp ? src.slice(sp.start, sp.end) : "" });
+        } else terms.push({});
+        a = k + 1;
+      }
+      if (terms.length >= 2) p.plus = terms;
+    }
     return p;
   }
 }
@@ -674,6 +698,25 @@ function braceDefs(c, lang) {
       if (!body) continue;
       add({ name: x[2], qname: x[2], kind: "function", from: x.index, to: body.end, exported: !!x[1] });
     }
+    // W19d (F4): a declaration list, `const a = () => …, b = () => …;`. ARROW
+    // reads only the first name when it is on the keyword's line. Each other
+    // name with a function value is a function here. A constant in the list
+    // is left to the export pass.
+    for (const dl of declLists(c)) {
+      if (dl.n === 0 && dl.sameLine) continue;
+      const v = dl.v;
+      const y = /^(?:async[ \t]+)?(function\b[^(\n]*\(|\(|[A-Za-z_$][\w$]*[ \t]*=>)/.exec(m.slice(v, v + 200));
+      if (!y) continue;
+      const end = v + y[0].length;
+      let body;
+      if (y[1].endsWith("(")) {
+        const paren = end - 1;
+        body = bodyAfter(m, matchPair(m, paren, "(", ")") + 1, !y[1].startsWith("function"));
+        if (body) defParens.add(paren);
+      } else body = bodyAfter(m, m.lastIndexOf("=>", end), true);
+      if (!body) continue;
+      add({ name: dl.name, qname: dl.name, kind: "function", from: dl.from, to: body.end, exported: dl.exported });
+    }
     // Route handlers (Express, Koa, Fastify, Hono): `router.get("/path", mw,
     // (req, res) => { … })`. The handler is anonymous, so without this a route
     // file has NO symbol and its card is an import list — W9 measured 6 files,
@@ -697,6 +740,43 @@ function braceDefs(c, lang) {
       if (!fnArg && !namedHandler) continue;
       regParens.add(paren);
       add({ kind: "route", method: VERB_OF(x[2]), path: routePath, head: x[1], name: "route", from: x.index, to: close, exported: false });
+    }
+    // W19d (F6): a test block, `describe("title", () => { … })` (also
+    // `context` / `suite`, with `.only` / `.skip` / `.each(…)`). Its callback
+    // is anonymous, so without this every call of a spec file goes to
+    // `<module>`. The block is a symbol of kind "test", named by its title,
+    // and owns the calls inside it. `it` / `test` blocks are not symbols.
+    const TEST_BLOCK = /^[ \t]*(describe|context|suite)\b[ \t]*(?:\.[ \t]*(only|skip|each)\b[ \t]*)?/gm;
+    while ((x = TEST_BLOCK.exec(m))) {
+      let k = x.index + x[0].length;
+      if (x[2] === "each") {
+        if (m[k] !== "(") continue;
+        const e = matchPairQuiet(m, k, "(", ")");
+        if (e < 0) continue;
+        k = e + 1;
+        while (k < m.length && (m[k] === " " || m[k] === "\t")) k++;
+      }
+      if (m[k] !== "(") continue;
+      const paren = k;
+      k++;
+      while (k < m.length && /\s/.test(m[k])) k++;
+      const q = m[k];
+      if (q !== "'" && q !== '"' && q !== "`") continue;
+      const sp = c.strAt.get(k + 1);
+      const close = sp ? sp.end : k + 1;
+      if (m[close] !== q) continue;
+      const title = sp ? src.slice(sp.start, sp.end).trim() : "";
+      if (!title || /[\r\n]/.test(title)) continue;
+      k = close + 1;
+      while (k < m.length && /\s/.test(m[k])) k++;
+      if (m[k] !== ",") continue;
+      k++;
+      while (k < m.length && /\s/.test(m[k])) k++;
+      if (!fnValueAt(m, k)) continue;
+      const end = matchPairQuiet(m, paren, "(", ")");
+      if (end < 0) continue;
+      const name = title.slice(0, 80);
+      add({ kind: "test", name, qname: `${x[1]} ${name}`, from: x.index, to: end, exported: false });
     }
     // Members: scanned inside each class body, skipping every member body it
     // finds, so a statement inside a method is never read as a member.
@@ -1075,7 +1155,8 @@ function basesOf(tail) {
 // `this.submit()` resolves LOCAL through `classOf`, and a mixin member is
 // reached through `inheritedMember`, exactly as a class method is.
 const OBJ_SECTIONS = new Set(["methods", "computed", "watch", "getters", "mutations", "actions", "filters", "provide"]);
-const DEFAULT_OBJECT = /\bexport[ \t]+default[ \t]+(?:(?:defineComponent|Vue[ \t]*\.[ \t]*extend)[ \t]*\([ \t\r\n]*)?\{/g;
+// W19d (F1): an optional `(` before the object: `export default ({ state })`.
+const DEFAULT_OBJECT = /\bexport[ \t]+default[ \t]+(\([ \t\r\n]*)?(?:(?:defineComponent|Vue[ \t]*\.[ \t]*extend)[ \t]*\([ \t\r\n]*)?\{/g;
 const IDENT_RE = /^[A-Za-z_$][\w$]*$/;
 // A value that is a function: `function (…)`, `async function`, `(…) =>`,
 // `x =>`. The arrow's parameter list may span lines, so it is matched by pair.
@@ -1201,6 +1282,121 @@ function valueEnd(m, v) {
   return m.length - 1;
 }
 
+// W19d (F4): the end of ONE declarator's value: the `,` or the `;` at depth 0,
+// a closing bracket of the outer scope, or a line break that ends the
+// statement. Returns the last character of the value that is not a space.
+function declEnd(m, v) {
+  let d = 0;
+  let tpl = false;
+  const back = (k) => {
+    while (k > v && /\s/.test(m[k])) k--;
+    return k;
+  };
+  for (let k = v; k < m.length; k++) {
+    const ch = m[k];
+    if (ch === "`") tpl = !tpl;
+    if (tpl) continue;
+    if (ch === "(" || ch === "[" || ch === "{") d++;
+    else if (ch === ")" || ch === "]" || ch === "}") {
+      if (d === 0) return back(k - 1);
+      d--;
+    } else if (d === 0 && (ch === "," || ch === ";")) return back(k - 1);
+    else if (d === 0 && ch === "\n") {
+      const p = back(k - 1);
+      let n = k + 1;
+      while (n < m.length && /\s/.test(m[n])) n++;
+      if (!/[=+\-*/(?:&|>]/.test(m[p]) && !/[.?:+\-*/&|,]/.test(m[n] || "")) return p;
+    }
+  }
+  return back(m.length - 1);
+}
+
+// W19d (F3, F4): each declarator of every `const` / `let` / `var` statement
+// that starts a line: { name, from, v, end, n, sameLine, exported, top }.
+// `n` is the index in the list, `sameLine` = the name is on the keyword's
+// line, `top` = the statement is at brace depth 0. Computed once per file.
+function declLists(c) {
+  if (c._decls) return c._decls;
+  const { m } = c;
+  const out = [];
+  const RE = /^[ \t]*(export[ \t]+)?(?:const|let|var)[ \t\r\n]+/gm;
+  const skip = (j) => {
+    while (j < m.length && /\s/.test(m[j])) j++;
+    return j;
+  };
+  let x;
+  let depth = 0;
+  let at = 0;
+  while ((x = RE.exec(m))) {
+    for (; at < x.index; at++) {
+      if (m[at] === "{") depth++;
+      else if (m[at] === "}") depth--;
+    }
+    let k = x.index + x[0].length;
+    for (let n = 0; n < 500; n++) {
+      const id = /^([A-Za-z_$][\w$]*)[ \t]*(?::[^=,;\n]+)?(=(?![=>]))?[ \t]*/.exec(m.slice(k, k + 300));
+      if (!id) break;
+      const from = k;
+      if (!id[2]) {
+        const j = skip(k + id[1].length);
+        if (m[j] !== ",") break;
+        k = skip(j + 1);
+        continue;
+      }
+      const v = skip(k + id[0].length);
+      const end = declEnd(m, v);
+      out.push({ name: id[1], from, v, end, n, sameLine: !m.slice(x.index, from).includes("\n"), exported: !!x[1], top: depth === 0 });
+      const j = skip(end + 1);
+      if (m[j] !== ",") break;
+      k = skip(j + 1);
+    }
+  }
+  c._decls = out;
+  return out;
+}
+
+// W19d (F3): the text of each top-level string or template constant of the
+// file, NAME → text. In a template, `${X}` becomes the text of X when X is in
+// the table, else `{}`. A value that is more than one literal is not read.
+function fileConsts(c) {
+  if (c._consts) return c._consts;
+  const { m, src, strAt } = c;
+  const T = new Map();
+  for (const d of declLists(c)) {
+    if (!d.top) continue;
+    const q = m[d.v];
+    if (q !== "'" && q !== '"' && q !== "`") continue;
+    let text = "";
+    let k = d.v + 1;
+    let ok = false;
+    while (k < m.length && k <= d.end) {
+      const seg = strAt.get(k);
+      if (seg && seg.end > k) {
+        text += src.slice(seg.start, seg.end);
+        k = seg.end;
+        continue;
+      }
+      if (m[k] === q) {
+        ok = k === d.end;
+        break;
+      }
+      if (q === "`" && m[k] === "$" && m[k + 1] === "{") {
+        const e = matchPairQuiet(m, k + 1, "{", "}");
+        if (e < 0) break;
+        const expr = m.slice(k + 2, e).trim();
+        text += IDENT_RE.test(expr) && T.has(expr) ? T.get(expr) : "{}";
+        k = e + 1;
+        continue;
+      }
+      if (q !== "`" || m[k] === "\n") break;
+      k++;
+    }
+    if (ok && !/[\r\n]/.test(text) && text.length <= 500) T.set(d.name, text);
+  }
+  c._consts = T;
+  return T;
+}
+
 function objectDefs(c, have, sfc) {
   const { src, m, starts, rel } = c;
   const defs = [];
@@ -1248,85 +1444,105 @@ function objectDefs(c, have, sfc) {
     }
   };
 
+  // The class and the methods of an object literal with a component shape.
+  // `fixed` is the name of a declared object (W19d F2). A default object takes
+  // its `name:` member or the file stem.
+  const topOf = (open, close) => (close > open ? objectMembers(m, open, close).map(([a, b]) => ({ a, b, mem: memberOf(m, a, b) })).filter((x) => x.mem) : []);
+  const isShaped = (top, inSfc) =>
+    // W19d (F5): inside an SFC, the default object is always a component,
+    // also when it has only a `name:`.
+    inSfc ||
+    top.some(
+      (x) => x.mem.type === "fn" || (OBJ_SECTIONS.has(x.mem.name) && (x.mem.type === "obj" || x.mem.type === "short")) || x.mem.name === "mixins" || x.mem.name === "extends"
+    );
+  const objectClass = (open, close, from, fixed, top) => {
+    const nameMem = top.find((x) => x.mem.type === "val" && x.mem.name === "name");
+    const named = nameMem ? /^\s*(['"`])([A-Za-z_$][\w$]*)\1/.exec(src.slice(nameMem.mem.v, nameMem.mem.v + 120)) : null;
+    const oname = fixed || (named ? named[2] : ownerStem(rel));
+    const bases = [];
+    for (const x of top) {
+      if (x.mem.name === "mixins" && x.mem.type === "arr")
+        for (const w of m.slice(x.mem.open + 1, x.mem.close).split(",")) if (IDENT_RE.test(w.trim())) bases.push(w.trim());
+      if (x.mem.name === "extends" && x.mem.type === "val") {
+        const w = m.slice(x.mem.v, x.b).trim();
+        if (IDENT_RE.test(w)) bases.push(w);
+      }
+    }
+    const cls = add({ name: oname, qname: oname, kind: "class", from, to: close, exported: true, ...(bases.length ? { bases: bases.slice(0, 8) } : {}) });
+    // v2.2.0 T3: the component CONTRACT — `props`, `emits`, `inject`. Each
+    // member is a name-only symbol; like a `const`, it owns no call.
+    for (const x of top) {
+      const kind = CONTRACT_OF[x.mem.name];
+      if (!kind || x.mem.close == null || x.mem.close <= x.mem.open) continue;
+      if (x.mem.type === "arr") {
+        const STR = /(['"`])([A-Za-z_$][\w$-]*)\1/g;
+        const body = src.slice(x.mem.open, x.mem.close);
+        let q;
+        while ((q = STR.exec(body))) {
+          const at = x.mem.open + q.index;
+          if (m[at] !== src[at]) continue;
+          add({ name: q[2], qname: `${oname}.${q[2]}`, kind, from: at, to: at + q[0].length - 1, exported: false });
+        }
+      } else if (x.mem.type === "obj") {
+        for (const [a, b] of objectMembers(m, x.mem.open, x.mem.close)) {
+          const mem = memberOf(m, a, b);
+          if (mem && mem.name) add({ name: mem.name, qname: `${oname}.${mem.name}`, kind, from: a, to: trim(b), exported: false });
+        }
+      }
+    }
+    const method = (name, from, to, paren) => {
+      if (paren != null) defParens.add(paren);
+      add({ name, qname: `${oname}.${name}`, kind: "method", from, to, exported: false });
+    };
+    const section = (open2, close2) => {
+      for (const [a, b] of objectMembers(m, open2, close2)) {
+        const mem = memberOf(m, a, b);
+        if (!mem) continue;
+        if (mem.type === "fn") method(mem.name, a, trim(b), mem.paren);
+        else if (mem.type === "obj" && mem.close > mem.open) {
+          // `label: { get() {…}, set(v) {…} }` and a watcher's `{ handler() {…} }`
+          // are ONE member whose behaviour sits in its inner functions.
+          const inner = objectMembers(m, mem.open, mem.close).map(([p, q]) => memberOf(m, p, q)).filter(Boolean);
+          if (inner.some((i) => i.type === "fn" && /^(get|set|handler)$/.test(i.name))) {
+            for (const i of inner) if (i.type === "fn" && i.paren != null) defParens.add(i.paren);
+            method(mem.name, a, trim(b), null);
+          }
+        }
+      }
+    };
+    for (const x of top) {
+      if (x.mem.type === "fn") method(x.mem.name, x.a, trim(x.b), x.mem.paren);
+      else if (OBJ_SECTIONS.has(x.mem.name) && x.mem.type === "obj" && x.mem.close > x.mem.open) section(x.mem.open, x.mem.close);
+      else if (OBJ_SECTIONS.has(x.mem.name) && x.mem.type === "short") {
+        // `const mutations = { … }; export default { mutations }` — the section
+        // is declared above and named here.
+        const d = declOf(x.mem.name);
+        if (d && m[d.v] === "{") section(d.v, matchPairQuiet(m, d.v, "{", "}"));
+      }
+    }
+    return cls;
+  };
+
   // ── E1: the default-exported object ──
   let owner = null;
   DEFAULT_OBJECT.lastIndex = 0;
-  const dx = DEFAULT_OBJECT.exec(m);
+  let dx = DEFAULT_OBJECT.exec(m);
+  if (dx && dx[1]) {
+    // W19d (F1): `export default ({ a }) => …` is an arrow function with a
+    // destructured parameter, not an object. The object must close the paren.
+    const o = dx.index + dx[0].length - 1;
+    const cl = matchPairQuiet(m, o, "{", "}");
+    const after = cl > o ? m.slice(cl + 1, cl + 80).replace(/^\s+/, "") : "";
+    if (!after.startsWith(")") || /^\)\s*=>/.test(after)) dx = null;
+    // The paren is a wrapper, never a call to `default`.
+    else defParens.add(dx.index + dx[0].indexOf("("));
+  }
   if (dx) {
     const open = dx.index + dx[0].length - 1;
     const close = matchPairQuiet(m, open, "{", "}");
-    const top = close > open ? objectMembers(m, open, close).map(([a, b]) => ({ a, b, mem: memberOf(m, a, b) })).filter((x) => x.mem) : [];
-    const shaped = top.some(
-      (x) => x.mem.type === "fn" || (OBJ_SECTIONS.has(x.mem.name) && (x.mem.type === "obj" || x.mem.type === "short")) || x.mem.name === "mixins" || x.mem.name === "extends"
-        // v2.2.0 T3: inside an SFC, a props-only component is still a component.
-        || (sfc && /^(props|emits|inject|components)$/.test(x.mem.name))
-    );
-    if (shaped) {
-      const nameMem = top.find((x) => x.mem.type === "val" && x.mem.name === "name");
-      const named = nameMem ? /^\s*(['"`])([A-Za-z_$][\w$]*)\1/.exec(src.slice(nameMem.mem.v, nameMem.mem.v + 120)) : null;
-      const oname = named ? named[2] : ownerStem(rel);
-      const bases = [];
-      for (const x of top) {
-        if (x.mem.name === "mixins" && x.mem.type === "arr")
-          for (const w of m.slice(x.mem.open + 1, x.mem.close).split(",")) if (IDENT_RE.test(w.trim())) bases.push(w.trim());
-        if (x.mem.name === "extends" && x.mem.type === "val") {
-          const w = m.slice(x.mem.v, x.b).trim();
-          if (IDENT_RE.test(w)) bases.push(w);
-        }
-      }
-      owner = add({ name: oname, qname: oname, kind: "class", from: dx.index, to: close, exported: true, ...(bases.length ? { bases: bases.slice(0, 8) } : {}) });
-      // v2.2.0 T3: the component CONTRACT — `props`, `emits`, `inject`. Each
-      // member is a name-only symbol; like a `const`, it owns no call.
-      for (const x of top) {
-        const kind = CONTRACT_OF[x.mem.name];
-        if (!kind || x.mem.close == null || x.mem.close <= x.mem.open) continue;
-        if (x.mem.type === "arr") {
-          const STR = /(['"`])([A-Za-z_$][\w$-]*)\1/g;
-          const body = src.slice(x.mem.open, x.mem.close);
-          let q;
-          while ((q = STR.exec(body))) {
-            const at = x.mem.open + q.index;
-            if (m[at] !== src[at]) continue;
-            add({ name: q[2], qname: `${oname}.${q[2]}`, kind, from: at, to: at + q[0].length - 1, exported: false });
-          }
-        } else if (x.mem.type === "obj") {
-          for (const [a, b] of objectMembers(m, x.mem.open, x.mem.close)) {
-            const mem = memberOf(m, a, b);
-            if (mem && mem.name) add({ name: mem.name, qname: `${oname}.${mem.name}`, kind, from: a, to: trim(b), exported: false });
-          }
-        }
-      }
-      const method = (name, from, to, paren) => {
-        if (paren != null) defParens.add(paren);
-        add({ name, qname: `${oname}.${name}`, kind: "method", from, to, exported: false });
-      };
-      const section = (open2, close2) => {
-        for (const [a, b] of objectMembers(m, open2, close2)) {
-          const mem = memberOf(m, a, b);
-          if (!mem) continue;
-          if (mem.type === "fn") method(mem.name, a, trim(b), mem.paren);
-          else if (mem.type === "obj" && mem.close > mem.open) {
-            // `label: { get() {…}, set(v) {…} }` and a watcher's `{ handler() {…} }`
-            // are ONE member whose behaviour sits in its inner functions.
-            const inner = objectMembers(m, mem.open, mem.close).map(([p, q]) => memberOf(m, p, q)).filter(Boolean);
-            if (inner.some((i) => i.type === "fn" && /^(get|set|handler)$/.test(i.name))) {
-              for (const i of inner) if (i.type === "fn" && i.paren != null) defParens.add(i.paren);
-              method(mem.name, a, trim(b), null);
-            }
-          }
-        }
-      };
-      for (const x of top) {
-        if (x.mem.type === "fn") method(x.mem.name, x.a, trim(x.b), x.mem.paren);
-        else if (OBJ_SECTIONS.has(x.mem.name) && x.mem.type === "obj" && x.mem.close > x.mem.open) section(x.mem.open, x.mem.close);
-        else if (OBJ_SECTIONS.has(x.mem.name) && x.mem.type === "short") {
-          // `const mutations = { … }; export default { mutations }` — the section
-          // is declared above and named here.
-          const d = declOf(x.mem.name);
-          if (d && m[d.v] === "{") section(d.v, matchPairQuiet(m, d.v, "{", "}"));
-        }
-      }
-    } else if (close > open) constantsOf(open, close);
+    const top = topOf(open, close);
+    if (isShaped(top, !!sfc)) owner = objectClass(open, close, dx.index, null, top);
+    else if (close > open) constantsOf(open, close);
   }
 
   // ── E2: exported constants ──
@@ -1339,16 +1555,78 @@ function objectDefs(c, have, sfc) {
     constant(x[1], x.index, valueEnd(m, v), v);
   }
   const EXPORTS_DOT = /^[ \t]*(?:module[ \t]*\.[ \t]*)?exports[ \t]*\.[ \t]*([A-Za-z_$][\w$]*)[ \t]*=[ \t]*/gm;
+  // W19d (F7): a function value assigned to an export is a function. Its body
+  // is found as ARROW / FN find it; a value with no body is not a symbol.
+  const fnDef = (name, from, v) => {
+    if (!IDENT_RE.test(name) || taken.has(name)) return;
+    const f = fnValueAt(m, v);
+    if (!f) return;
+    let body = null;
+    if (f.paren != null) {
+      if (f.paren < 0) return;
+      body = bodyAfter(m, matchPairQuiet(m, f.paren, "(", ")") + 1, false);
+      if (body) defParens.add(f.paren);
+    } else {
+      const arrow = m.indexOf("=>", v);
+      if (arrow >= 0) body = bodyAfter(m, arrow, true);
+    }
+    if (!body || m[body.open] === ";") return;
+    taken.add(name);
+    add({ name, qname: name, kind: "function", from, to: body.end, exported: true });
+  };
   while ((x = EXPORTS_DOT.exec(m))) {
     const v = x.index + x[0].length;
-    if (fnValueAt(m, v) || /^[A-Za-z_$][\w$]*[ \t]*[;\n]/.test(m.slice(v, v + 80))) continue;
+    if (fnValueAt(m, v)) {
+      fnDef(x[1], x.index, v);
+      continue;
+    }
+    if (/^[A-Za-z_$][\w$]*[ \t]*[;\n]/.test(m.slice(v, v + 80))) continue;
     constant(x[1], x.index, valueEnd(m, v), v);
   }
   const MODULE_OBJECT = /^[ \t]*module[ \t]*\.[ \t]*exports[ \t]*=[ \t]*\{/gm;
   while ((x = MODULE_OBJECT.exec(m))) {
     const open = x.index + x[0].length - 1;
     const close = matchPairQuiet(m, open, "{", "}");
-    if (close > open) constantsOf(open, close);
+    if (close <= open) continue;
+    constantsOf(open, close);
+    // W19d (F7): `module.exports = { a: function () {…} }` — `a` is a function.
+    for (const [a, b] of objectMembers(m, open, close)) {
+      const mem = memberOf(m, a, b);
+      if (!mem || mem.type !== "fn" || !IDENT_RE.test(mem.name) || taken.has(mem.name)) continue;
+      if (mem.paren != null) defParens.add(mem.paren);
+      taken.add(mem.name);
+      add({ name: mem.name, qname: mem.name, kind: "function", from: a, to: trim(b), exported: true });
+    }
+  }
+
+  // ── W19d (F2): a local declaration exported by name ──
+  // `const X = …; export { X, Y as Z }` and `export default X`. An object with
+  // a component shape is a class with its methods. Another value that is not a
+  // function is a constant. A name with no local declaration (an import) is
+  // left to the re-export pass.
+  const named = [];
+  for (const e of m.matchAll(/^[ \t]*export[ \t]*\{([^}]*)\}([ \t]*from\b)?/gm)) {
+    if (e[2]) continue;
+    for (const p of e[1].split(",")) {
+      const mm = /^\s*([A-Za-z_$][\w$]*)/.exec(p);
+      if (mm) named.push(mm[1]);
+    }
+  }
+  for (const e of m.matchAll(/\bexport[ \t]+default[ \t]+([A-Za-z_$][\w$]*)[ \t]*(?:;|$)/gm)) named.push(e[1]);
+  for (const name of named) {
+    if (taken.has(name) || KW.has(name)) continue;
+    const d = declOf(name);
+    if (!d || fnValueAt(m, d.v)) continue;
+    if (m[d.v] === "{") {
+      const close = matchPairQuiet(m, d.v, "{", "}");
+      const top = topOf(d.v, close);
+      if (close > d.v && isShaped(top, false)) {
+        taken.add(name);
+        objectClass(d.v, close, d.from, name, top);
+        continue;
+      }
+    }
+    constant(name, d.from, valueEnd(m, d.v), d.v);
   }
 
   // ── E3: a component with no object to name ──
@@ -2172,7 +2450,9 @@ function reexportsFor(lang, src, m, rel, imports) {
         const mm = /^\s*([\w$]+)(?:\s+as\s+([\w$]+))?\s*$/.exec(p);
         if (!mm) continue;
         for (const imp of imports || [])
-          for (const b of imp.bindings || []) if (b.local === mm[1] && b.kind === "named") out.push({ at: x.index, from: imp.from, names: [{ local: mm[2] || mm[1], orig: b.orig }] });
+          // W19d (F8): a default import exported by name is a re-export too:
+          // `import A from "./A"; export { A };`.
+          for (const b of imp.bindings || []) if (b.local === mm[1] && (b.kind === "named" || b.kind === "default")) out.push({ at: x.index, from: imp.from, names: [{ local: mm[2] || mm[1], orig: b.orig }] });
       }
     }
     // Source order, whatever shape found them.
@@ -2432,7 +2712,7 @@ function urlText(s) {
 const GO_METHOD = /^http\.Method(Get|Post|Put|Patch|Delete|Head|Options)$/;
 
 // The URL an HTTP-shaped call names, with its method — or null.
-function urlOf(lang, call) {
+function urlOf(lang, call, consts) {
   const args = call.args;
   if (!args || !args.length) return null;
   const parts = call.name.split(".");
@@ -2441,9 +2721,25 @@ function urlOf(lang, call) {
   const pos = args.filter((a) => !a.kw);
   const kw = {};
   for (const a of args) if (a.kw) kw[a.kw] = a;
+  // W19d (F3): a name or a `NAME + …` concatenation whose NAME is a string
+  // constant of this file gives the constant's text. An unknown term is `{}`.
+  const viaConst = (p) => {
+    if (!consts || !consts.size || !p) return null;
+    if (p.id != null && consts.has(p.id)) return consts.get(p.id);
+    if (!p.plus || p.plus[0].id == null || !consts.has(p.plus[0].id)) return null;
+    return p.plus.map((t) => (t.s != null ? t.s : t.id != null && consts.has(t.id) ? consts.get(t.id) : "{}")).join("");
+  };
   // `BASE + "/p"` is one piece whose tail is known: it becomes `{}/p`, which
   // `urlText` reads as a SUFFIX.
-  const strArg = (i) => (pos[i] && pos[i].s != null ? pos[i].s : pos[i] && pos[i].cat != null ? "{}" + pos[i].cat : null);
+  const strArg = (i) => {
+    if (pos[i] && pos[i].s != null) return pos[i].s;
+    const v = viaConst(pos[i]);
+    // A relative path (`dashboard/x/` under a client's base URL) is read from
+    // the root. A text that is still not a URL leaves the old rule to answer.
+    if (v != null && urlText(v)) return v;
+    if (v != null && /^[\w.-]+\//.test(v) && urlText("/" + v)) return "/" + v;
+    return pos[i] && pos[i].cat != null ? "{}" + pos[i].cat : null;
+  };
   let method = null;
   let raw = null;
   if (last === "open" && !(kw.method && kw.method.s)) return null;
@@ -2535,6 +2831,20 @@ const joinPath = (prefix, p) => {
   const out = (a + b).replace(/\/{2,}/g, "/");
   return out || "/";
 };
+
+// W19d (F6b): test code and the test-framework helpers it calls.
+const TEST_PATH = /(^|\/)(tests?|__tests__|spec|e2e)\/|\.(spec|test|e2e)\.[cm]?[jt]sx?$/;
+const TEST_BARE = /^(expect|it|test|describe|context|suite|beforeEach|afterEach|beforeAll|afterAll|within|waitFor\w*|act|mount|shallowMount|render|createLocalVue|flushPromises|nextTick|\$nextTick|setImmediate|setTimeout|spyOn|querySelector\w*|(?:get|getAll|query|queryAll|find|findAll)By\w+|mockClear|mockReset|mockRestore)$/;
+const TEST_HEAD = /^(jest|vi|sinon|cy|fireEvent|screen|userEvent|wrapper|container|localVue|expect|it|test|describe|context|suite)$/;
+const TEST_LAST = /^(find|findAll|findComponent|trigger|setValue|setData|setProps|emitted|exists|text|html|attributes|classes|isVisible|toBe\w*|toEqual|toHaveBeenCalled\w*|toContain|toMatch\w*|mockResolvedValue\w*|mockReturnValue\w*|mockImplementation\w*|only|skip|each|nextTick|\$nextTick|spyOn|querySelector\w*|(?:get|getAll|query|queryAll|find|findAll)By\w+|mockClear|mockReset|mockRestore)$/;
+const TEST_MATCHER = /^(toBe\w*|toEqual|toHaveBeenCalled\w*|toContain|toMatch\w*|mockResolvedValue\w*|mockReturnValue\w*|mockImplementation\w*)$/;
+function testHelper(name) {
+  const parts = String(name).split(".");
+  // `expect(x).toBe(1)` is read as a bare `toBe` call after a call.
+  if (parts.length === 1) return TEST_BARE.test(parts[0]) || TEST_MATCHER.test(parts[0]);
+  if (TEST_HEAD.test(parts[0]) || parts.includes("vm")) return true;
+  return TEST_LAST.test(parts[parts.length - 1]);
+}
 
 // ── assembly ────────────────────────────────────────────────────────────────
 function finalize(c, lang, defs, calls, imports, exportsSet, extractor) {
@@ -2719,7 +3029,17 @@ function finalize(c, lang, defs, calls, imports, exportsSet, extractor) {
     const was = cutAt.get(t);
     if (was === undefined || line < was) cutAt.set(t, line);
   };
+  // W19d (F6b): in TEST code — a "test" symbol, or the `<module>` of a test
+  // file — a call to a test-framework helper is noise. It is dropped before
+  // the cap, so the calls to source names (the links a test gives) stay.
+  const testFile = TEST_PATH.test(rel || "");
   for (const cc of calls) {
+    if (cc.ref) continue;
+    const t = at(cc.line);
+    if ((t.kind === "test" || (t === mod && testFile)) && testHelper(cc.name)) cc.drop = true;
+  }
+  for (const cc of calls) {
+    if (cc.drop) continue;
     // A ref is kept when its head is defined here or imported. Go's package
     // scope is the DIRECTORY, so a bare Go identifier is kept too and the
     // package rung on read decides (`mux.HandleFunc("/p", listOrders)`).
@@ -2739,7 +3059,7 @@ function finalize(c, lang, defs, calls, imports, exportsSet, extractor) {
       });
     else cut(t, cc.line);
     if (cc.ref || !cc.args) continue;
-    const u = cc.reg ? null : urlOf(lang, cc);
+    const u = cc.reg ? null : urlOf(lang, cc, lang === "js" || lang === "ts" ? fileConsts(c) : null);
     if (u) {
       if (!t.urls) t.urls = [];
       if (t.urls.length < MAX_URLS_PER_SYMBOL) t.urls.push(u);
@@ -2871,7 +3191,61 @@ function sfcSource(src) {
   return { src: out.join(""), lang, blocks: keep, setup };
 }
 
+// W19d (F9): a locale JSON file (lang "i18n") gives a key table, not symbols.
+// One scan with a container stack: each object key gives [dottedKey, line],
+// a leaf key AND a key whose value is an object (its line is the line of its
+// `{`). Items of an array are not keys. Invalid JSON gives the keys the scan
+// found, never an error.
+const MAX_I18N_KEYS = 20000;
+function i18nKeys(src) {
+  const keys = [];
+  const stack = []; // { t: "{" | "[", key: string | null }
+  let pending = null;
+  let inArray = 0;
+  let line = 1;
+  const n = src.length;
+  for (let i = 0; i < n && keys.length < MAX_I18N_KEYS; i++) {
+    const ch = src[i];
+    if (ch === "\n") line++;
+    else if (ch === '"') {
+      const at = line;
+      let j = i + 1;
+      while (j < n && src[j] !== '"' && src[j] !== "\n") j += src[j] === "\\" ? 2 : 1;
+      const raw = src.slice(i + 1, j);
+      // An unclosed string stops at the line end; the line break is counted.
+      i = src[j] === "\n" ? j - 1 : j;
+      const top = stack[stack.length - 1];
+      if (!top || top.t !== "{") continue;
+      let k = j + 1;
+      while (k < n && (src[k] === " " || src[k] === "\t" || src[k] === "\r" || src[k] === "\n")) k++;
+      if (src[k] !== ":") continue;
+      let key = raw;
+      if (raw.includes("\\")) {
+        try {
+          key = JSON.parse(`"${raw}"`);
+        } catch (_) {}
+      }
+      pending = key;
+      if (inArray) continue;
+      const path = [];
+      for (const s of stack) if (s.key != null) path.push(s.key);
+      path.push(key);
+      keys.push([path.join("."), at]);
+    } else if (ch === "{" || ch === "[") {
+      stack.push({ t: ch, key: pending });
+      if (ch === "[") inArray++;
+      pending = null;
+    } else if (ch === "}" || ch === "]") {
+      const s = stack.pop();
+      if (s && s.t === "[") inArray--;
+      pending = null;
+    } else if (ch === ",") pending = null;
+  }
+  return keys;
+}
+
 function extractOne(item, borrowed) {
+  if (item.lang === "i18n") return { symbols: [], imports: [], keys: i18nKeys(String(item.src || "")) };
   let { lang, src } = item;
   const raw = src;
   resetCoverage();
@@ -2903,7 +3277,8 @@ function extractOne(item, borrowed) {
       const reg = new Set();
       const { defs: rdefs, regParens, exportsSet: hexports } = braceDefs(c, lang);
       resetCoverage();
-      for (const d of rdefs) if (d.kind === "route") defs.push({ ...d, s: lineOf(c.starts, d.from), e: lineOf(c.starts, Math.max(d.from, d.to)) });
+      // W19d (F6): a test block is not in the AST walk either.
+      for (const d of rdefs) if (d.kind === "route" || d.kind === "test") defs.push({ ...d, s: lineOf(c.starts, d.from), e: lineOf(c.starts, Math.max(d.from, d.to)) });
       // W5b: the walker records a method only inside a class. An object's
       // members, the constants and an SFC's component come from the same pass
       // the heuristic rung runs, so both rungs name the same symbols.
