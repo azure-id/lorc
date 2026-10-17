@@ -1,4 +1,5 @@
 "use strict";
+// lorc owns this file since 0.4.0 (forked from ORC 2.3.0 @ ae47a4a, vendor/graph). Change it here, not in ORC.
 // ── orc graph — D4: the RANKED REPOSITORY MAP (v1.8.2 W7) ───────────────────
 //
 // The question this answers is the one a planner asks FIRST, before it knows a
@@ -52,6 +53,8 @@ const DAMPING = 0.85;
 const ITERATIONS = 30;
 const SYMS_PER_FILE = 4;
 
+// Format 1 only (read for backward compatibility). Format 2 writes
+// `map-<sha8>.json` and `derived.json` names it.
 function mapPath(claudeDir) {
   return path.join(G.graphPaths(claudeDir).dir, "map.json");
 }
@@ -191,30 +194,35 @@ function build(claudeDir, model, callers) {
   try {
     const { files, edges } = buildEdges(model, callers);
     const base = pageRank(files.length, edges, null);
+    // Format 2: content-addressed, with no generation field. `derived.json`
+    // pins it to the generation.
     const out = {
       schema: MAP_SCHEMA,
       engine: G.ENGINE,
-      generation: model.meta.generation,
-      gen_id: model.meta.gen_id,
       files,
       edges,
       base: base.map((x) => Math.round(x * 1e9) / 1e9),
     };
-    G.atomicWrite(mapPath(claudeDir), JSON.stringify(out));
-    return { route: "full", files: files.length, edges: edges.length, ms: Date.now() - t0 };
+    const name = G.writeAddressed(G.graphPaths(claudeDir).dir, "map-", out);
+    return { route: "full", name, files: files.length, edges: edges.length, ms: Date.now() - t0 };
   } catch (e) {
-    try {
-      require("fs").rmSync(mapPath(claudeDir), { force: true });
-    } catch (_) {}
     return { route: "failed", reason: String((e && e.message) || e), ms: Date.now() - t0 };
   }
 }
 
-// Used ONLY when the generation matches — the same rule as `resolved.json`.
+// Used ONLY when the generation matches — the same rule as the callers cache.
 function load(claudeDir, meta) {
-  const m = readJson(mapPath(claudeDir));
-  if (!m || m.schema !== MAP_SCHEMA || m.engine !== G.ENGINE) return null;
-  if (!meta || !meta.generation || m.generation !== meta.generation) return null;
+  if (!meta || !meta.generation) return null;
+  if (G.isFormat1(meta)) {
+    const m = readJson(mapPath(claudeDir));
+    if (!m || m.schema !== MAP_SCHEMA || m.engine !== meta.engine) return null;
+    if (m.generation !== meta.generation) return null;
+    return m;
+  }
+  const d = require("./graph-resolve.js").loadDerived(claudeDir, meta);
+  if (!d || !d.map) return null;
+  const m = readJson(path.join(G.graphPaths(claudeDir).dir, d.map));
+  if (!m || m.schema !== MAP_SCHEMA) return null;
   return m;
 }
 

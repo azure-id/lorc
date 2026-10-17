@@ -5,7 +5,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { selectStore } = require("../bin/lib/graph-router.js");
-const { ENGINE, SCHEMA } = require("../vendor/graph/graph.js");
+const { ENGINE, SCHEMA } = require("../bin/lib/graph/graph.js");
 
 function tmp() {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), "lorc-gsel-"));
@@ -43,21 +43,15 @@ test("ORC 1.8.1 never delegates", () => {
   assert.notStrictEqual(selectStore(root, { home }).mode, "delegate");
 });
 
-test("no ORC, ORC store with the lorc engine → orc-store", () => {
-  const { root, home } = tmp();
-  meta(path.join(root, ".claude"), ENGINE);
-  const s = selectStore(root, { home });
-  assert.strictEqual(s.mode, "orc-store");
-  assert.strictEqual(s.claudeDir, path.join(root, ".claude"));
-});
-
-test("ORC store with another engine + matching copy → copy", () => {
-  const { root, home } = tmp();
-  meta(path.join(root, ".claude"), "graph@1");
-  meta(path.join(root, ".claude", "lorc", "copy"), ENGINE);
-  const s = selectStore(root, { home });
-  assert.strictEqual(s.mode, "copy");
-  assert.strictEqual(s.claudeDir, path.join(root, ".claude", "lorc", "copy"));
+test("0.4.0: an ORC store (any engine) → own; lorc never reads it", () => {
+  for (const eng of [ENGINE, "graph@7"]) {
+    const { root, home } = tmp();
+    meta(path.join(root, ".claude"), eng);
+    meta(path.join(root, ".claude", "lorc", "copy"), ENGINE);
+    const s = selectStore(root, { home });
+    assert.strictEqual(s.mode, "own");
+    assert.strictEqual(s.claudeDir, path.join(root, ".claude", "lorc"));
+  }
 });
 
 test("nothing → own", () => {

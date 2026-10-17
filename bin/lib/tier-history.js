@@ -191,22 +191,80 @@ function coChange(list, targets, { minSupport = 3, minConf = 0.6, max = 6 } = {}
   return [...best.values()].sort((a, b) => b.conf - a.conf || b.support - a.support || a.file.localeCompare(b.file)).slice(0, max);
 }
 
-// Past commits whose subject shares ≥ 2 content words with the request (cosine ≥ 0.3).
-// The analogy estimate: the median count of their source files.
-function similarCommits(list, request, { k = 7, min = 0.3 } = {}) {
+// IDF over the commit subjects: a rare word counts more than a word many subjects use.
+function idfOf(bags) {
+  const df = new Map();
+  for (const b of bags) for (const w of b) df.set(w, (df.get(w) || 0) + 1);
+  const N = bags.length || 1;
+  return (w) => Math.log(1 + N / (df.get(w) || 1));
+}
+
+// IDF-weighted set cosine: weight of the shared words / sqrt(weight of a · weight of b).
+// Two shared words at least, as `overlap`.
+function weightedOverlap(a, b, idf) {
+  let shared = 0;
+  let sw = 0;
+  for (const w of a) if (b.has(w)) { shared++; sw += idf(w); }
+  if (shared < 2) return { shared, score: 0 };
+  let wa = 0;
+  let wb = 0;
+  for (const w of a) wa += idf(w);
+  for (const w of b) wb += idf(w);
+  return { shared, score: sw / Math.sqrt(wa * wb) };
+}
+
+// The spread of a sample: IQR / median (lower = the neighbours agree).
+function spread(xs) {
+  const v = xs.slice().sort((a, b) => a - b);
+  const m = median(v);
+  if (!m) return Infinity;
+  const q = (p) => { const i = (v.length - 1) * p; const lo = Math.floor(i); return v[lo] + (v[Math.ceil(i)] - v[lo]) * (i - lo); };
+  return (q(0.75) - q(0.25)) / m;
+}
+
+// Past commits whose subject shares ≥ 2 content words with the request (IDF cosine ≥ 0.3).
+// The analogy estimate: the median count of their source files. k is dynamic: of 3, 5 and 7
+// neighbours, the one with the smallest spread (Kocaguneli et al., TSE 2012). Needs 3 hits.
+function similarCommits(list, request, { k, ks = [3, 5, 7], min = 0.3 } = {}) {
   const want = bag(request);
   if (!list || want.size < 2) return { n: 0, median_src: null, samples: [] };
+  const rows = list.filter((c) => c.files.length <= BIG).map((c, i) => ({ c, i, b: bag(c.s), src: c.files.filter(isSrc).length }));
+  const idf = idfOf(rows.map((r) => r.b));
   const hits = [];
-  list.forEach((c, i) => {
-    if (c.files.length > BIG) return;
-    const src = c.files.filter(isSrc).length;
-    if (!src) return;
-    const o = overlap(want, bag(c.s));
+  for (const { c, i, b, src } of rows) {
+    if (!src) continue;
+    const o = weightedOverlap(want, b, idf);
     if (o.score >= min) hits.push({ h: c.h, s: c.s.slice(0, 60), src, score: o.score, i });
-  });
+  }
   hits.sort((a, b) => b.score - a.score || a.i - b.i);
-  const top = hits.slice(0, k);
-  return { n: top.length, median_src: median(top.map((x) => x.src)), samples: top.slice(0, 3).map(({ h, s, src }) => ({ h, s, src })) };
+  let kk = k || ks[0];
+  if (!k && hits.length >= 3) {
+    let best = Infinity;
+    for (const x of ks) {
+      if (x > hits.length && x !== ks[0]) break;
+      const s = spread(hits.slice(0, x).map((y) => y.src));
+      if (s < best - 1e-9) { best = s; kk = x; }
+    }
+  }
+  const top = hits.slice(0, kk);
+  return { n: top.length, k: kk, median_src: median(top.map((x) => x.src)), samples: top.slice(0, 3).map(({ h, s, src }) => ({ h, s, src })) };
+}
+
+// A size prior from the repo's own history: the median source-file count of the last `max`
+// units whose subject has the same leading cue as the request (fix, add, refactor …). Needs 5.
+function cuePrior(list, request, { max = 200, min = 5 } = {}) {
+  const { leadCue } = require("./tier-text.js");
+  const cue = leadCue(request);
+  if (!list) return { cue, median: null, k: 0 };
+  const xs = [];
+  for (const c of list) {
+    if (xs.length >= max) break;
+    if (c.files.length > BIG) continue;
+    const src = c.files.filter(isSrc).length;
+    if (!src || leadCue(c.s) !== cue) continue;
+    xs.push(src);
+  }
+  return { cue, median: xs.length >= min ? median(xs) : null, k: xs.length };
 }
 
 function readRuns(root) {
@@ -277,5 +335,5 @@ function executorRecord(root, tier, { runs } = {}) {
 
 module.exports = {
   MAX_COMMITS, BIG, NOISE, TEST, LOCALE, kindOf, isSrc, bag, overlap, median, stem,
-  parseLog, unitSubject, commits, wiringRatio, coChange, similarCommits, readRuns, similarRuns, calibration, executorRecord, cacheFile, CACHE_V,
+  parseLog, unitSubject, commits, wiringRatio, coChange, similarCommits, cuePrior, idfOf, weightedOverlap, spread, readRuns, similarRuns, calibration, executorRecord, cacheFile, CACHE_V,
 };

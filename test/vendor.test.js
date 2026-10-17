@@ -20,20 +20,31 @@ test("vendor --check names a changed file", () => {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), "lorc-vendor-"));
   try {
     fs.cpSync(path.join(ROOT, "vendor"), path.join(d, "vendor"), { recursive: true });
-    const f = path.join(d, "vendor", "graph", "graph-map.js");
+    const f = path.join(d, "vendor", "core", "wiki-core.js");
     const buf = fs.readFileSync(f);
     buf[0] = buf[0] ^ 1;
     fs.writeFileSync(f, buf);
     const r = run("--check", "--root", d);
     assert.strictEqual(r.status, 1);
-    assert.match(r.stderr, /vendor\/graph\/graph-map\.js/);
+    assert.match(r.stderr, /vendor\/core\/wiki-core\.js/);
   } finally {
     fs.rmSync(d, { recursive: true, force: true });
   }
 });
 
-test("vendored engine loads", () => {
-  const G = require("../vendor/graph/graph.js");
-  require("../vendor/graph/graph-query.js");
-  assert.ok(G.ENGINE);
+test("lorc owns the graph engine in bin/lib/graph", () => {
+  assert.strictEqual(fs.existsSync(path.join(ROOT, "vendor", "graph")), false);
+  const G = require("../bin/lib/graph/graph.js");
+  require("../bin/lib/graph/graph-query.js");
+  assert.strictEqual(G.ENGINE, "lgraph@1");
+});
+
+test("graph-router loads the engine from bin/lib/graph", () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "lorc-engine-"));
+  try {
+    const sel = require("../bin/lib/graph-router.js").selectStore(d, { home: d });
+    assert.strictEqual(sel.engine.engine, "lgraph@1");
+  } finally {
+    fs.rmSync(d, { recursive: true, force: true });
+  }
 });

@@ -27,16 +27,16 @@ fewer calls win. Run L0 → L6 in order. Do not add steps. Run every `lorc` comm
 
 ## L0 PREP — one call
 `lorc prep "<the request in English, ≤ 25 words>" [--doc <path>] --json`
-It starts the run and returns `slug`, `usage`, `graph` (store + `focus[]` rows with file:line),
-`rules.card` (a path), `wiki` (tier, ≤ 3 page paths, build/test/lint commands), `pattern`
-(langs + path), `extra.slots[]`, `settings`, `tier_engine`, `tier_judge`, `ask_judge`, `resume` (+ `tier_hint` when `by = table`).
+It starts the run and returns `slug`, `usage`, `graph` (`focus[]` file:line rows), `context`
+(`path`: anchored ranges for the request/doc names, change targets, exemplars, test setup),
+`rules.card`, `wiki` (≤ 3 pages, build/test/lint commands), `pattern`, `extra.slots[]`,
+`settings`, `tier_engine`, `tier_judge`, `ask_judge`, `must_ask`, `resume` (+ `tier_hint` when `by = table`).
 `resume` set → ask in L3 whether to continue it (yes → read its RESUME.md and follow it).
 
-## L1 DIG — at most 4 tool calls
-- Start with ONE `lorc graph ctx <sym1> <sym2> … --anchors --json` for the focus symbols you
-  need (one call takes several symbols). Then `Read` only the anchored ranges (offset + limit).
-- At most 1 wiki page. The pattern file only
-  when the work is in its language.
+## L1 DIG — at most 3 tool calls
+- After prep: `lorc read --run <slug>` (ONE call: the doc, the targets, the must_ask evidence
+  and context.md). Then dig only what it lacks (≤ 2 calls). Never cat a whole file.
+- At most 1 wiki page. The pattern file only when the work is in its language.
 
 ## L2 TIER
 The tier is `tier_judge.tier` (`by`: jev or engine). Raise it one row only when L1 found a fact
@@ -60,7 +60,7 @@ the same time, all in ONE message. Never more groups than the cap. Print ONE lin
 2. **Every open question at once.** Each: `❓ <question> (<file:line>)`, options `a)` `b)` …,
    and `➡️ <recommended> — <reason>`. `ask_judge.how` set → do it first; show each `p` as
    `(NN %)`; ➡️ on `rec` (`rec` null or `by = self` → your pick).
-   prep `must_ask[]` → one ❓ each, never your own pick: ➡️ on its first `seen` path, cite `at`.
+   prep `must_ask[]` → one ❓ each: options = its `seen[].v`, ➡️ on the first, cite `at`; never your own pick.
 3. **Executor menu** — only when you will dispatch AND `settings.executor = ask`:
    `1 lorc-executor-haiku-5-high · 2 lorc-executor-sonnet-5-med · 3 lorc-executor-opus-5-low ·
    4 lorc-executor-opus-5-med` (+ `5 extra:<slot>` for each `extra.slots[]`). Put ONE `➡️` on
@@ -80,11 +80,9 @@ A new unknown in the answer → one more round. Otherwise go to L4.
   {"title":"…","files":["a","b"],"refs":["<file:range> — <why>"],"focus":"<3-6 words>","accept":["…"],"notes":"<answers that matter>","facts":["<what you learned in L1: paths, names, keys, shapes>"]}
   EOF
   ```
-  refs = the 2–4 existing files (with line ranges) you found in L1 that the new code should
-  copy its structure and style from. facts = every fact from L1 the executor needs (file paths,
-  function and key names, API shapes, i18n keys, decisions). The executor must not re-read what
-  you already read. Put the requirement doc in refs. Long JSON → Write it to a file, then
-  `lorc slice --run <slug> --task <n> - < <file>`.
+  The slice adds the task's context items and the requirement doc by itself: refs = only extra
+  ranges you read in L1; facts = decisions, answers, shapes. Long JSON → Write it to a file,
+  then `lorc slice --run <slug> --task <n> - < <file>`.
   It prints the slice path. Dispatch the chosen `lorc-executor-*` with exactly:
   `Read <slice path>. Do exactly that task. Return the JSON at its end.`
   Disjoint tasks → all dispatches in ONE message. Never paste file content into a prompt.

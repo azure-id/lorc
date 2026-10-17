@@ -301,3 +301,167 @@ test("evaluate returns a calibration object", () => {
   assert.ok(o.calibration && typeof o.calibration === "object", JSON.stringify(o));
   assert.strictEqual(typeof o.calibration.factor, "number");
 });
+
+// ── 0.4.0: a smarter tier engine ───────────────────────────────────────────────
+test("layerOf: a client router is ui; an express router under server/routes is api", () => {
+  const rels = ["client/package.json", "client/src/router/index.js", "client/src/views/A.vue", "server/routes/orders.js", "server/app.js"];
+  const ctx = { root: tmp(), rels };
+  assert.strictEqual(T.layerOf("client/src/router/index.js", ctx), "ui");
+  assert.strictEqual(T.layerOf("server/routes/orders.js", ctx), "api");
+  // A router that imports a views path is ui (no UI files needed).
+  const model = { byFile: { "web/router/index.js": { imports: [{ from: "../views/Home.js" }] } } };
+  assert.strictEqual(T.layerOf("web/router/index.js", { root: tmp(), rels: ["web/router/index.js"], model }), "ui");
+  // Server routers in other languages stay api; with no context the old rule holds.
+  assert.strictEqual(T.layerOf("shop/urls.py", ctx), "api");
+  assert.strictEqual(T.layerOf("client/src/router/index.js"), "api");
+});
+
+test("featureFolder: the parent of a constants folder, else the folder with the most request words", () => {
+  const core = ["src/views/pay/outward/components/A.vue", "src/views/pay/outward/constants/keys.js"];
+  assert.strictEqual(T.featureFolder(core, "x"), "src/views/pay/outward");
+  assert.strictEqual(T.featureFolder(["src/a/payout/X.vue", "src/b/Y.vue"], "add a payout card"), "src/a/payout");
+  assert.strictEqual(T.featureFolder(["src/x.js"], "x"), null);
+});
+
+const UI_RELS = ["client/package.json", "client/src/router/index.js", "client/src/views/rate/RateList.vue", "client/src/api/rate.api.js",
+  "client/src/views/rate/constants/rateKeys.js", "client/static/i18n/en.json", "client/static/i18n/id.json", "client/tests/unit/api/rate.api.spec.js"];
+
+test("split: a page + API function → UI group with the router, API group with the api file and its spec", () => {
+  const g = {
+    ok: true, rels: UI_RELS, core: ["client/src/views/rate/RateList.vue", "client/src/views/rate/constants/rateKeys.js"],
+    feature: "client/src/views/rate", constants: ["client/src/views/rate/constants/rateKeys.js"],
+    localeFiles: ["client/static/i18n/en.json", "client/static/i18n/id.json"],
+    router: "client/src/router/index.js", api: "client/src/api/rate.api.js", layers: ["ui"], projects: ["client"],
+  };
+  const r = run("add a rate page with a rate form and a summary card that calls the rate api", g);
+  assert.strictEqual(r.tier, "high");
+  const ui = r.split.find((x) => x.layer === "ui");
+  const api = r.split.find((x) => x.layer === "api");
+  assert.ok(ui && api, JSON.stringify(r.split));
+  assert.ok(ui.units.includes("client/src/router/index.js"), JSON.stringify(ui));
+  assert.ok(ui.units.includes("client/src/views/rate/constants/rateKeys.js"));
+  assert.ok(ui.units.includes("client/static/i18n/en.json"));
+  assert.deepStrictEqual(api.units, ["client/src/api/rate.api.js", "client/tests/unit/api/rate.api.spec.js"]);
+  // Real files and new units only: no placeholders.
+  for (const s of r.split) for (const u of s.units) assert.ok(!/^(edit: |wiring \d|element \d|api client|router$)/.test(u), u);
+  const b = T.brief(r);
+  assert.strictEqual(b.api, "rate.api.js");
+  assert.strictEqual(b.feature, "rate");
+});
+
+test("split: a small UI group takes the API module in", () => {
+  const g = { ok: true, rels: UI_RELS, api: "client/src/api/rate.api.js", router: "client/src/router/index.js", layers: ["ui"], projects: ["client"] };
+  const r = run("add a rate form and a summary card that call the rate api", g);
+  assert.strictEqual(r.tier, "high");
+  assert.ok(!r.split.some((x) => x.layer === "api"), JSON.stringify(r.split));
+  assert.ok(r.split.some((x) => x.units.includes("client/src/api/rate.api.js")), JSON.stringify(r.split));
+});
+
+test("doc endpoint → g.api is the real API file (no 'api client' placeholder)", () => {
+  const e = repo({
+    "client/package.json": "{\"name\":\"c\"}\n",
+    "client/src/api/user.api.js": "const BASE = '/dashboard/user';\nexport const getUser = () => BASE;\n",
+    "client/src/api/remittance.api.js": "const BASE = '/dashboard/remittance';\nexport const getRecipients = () => BASE + '/recipients';\n",
+    "client/src/views/remittance/Remittance.vue": "<template><div></div></template>\n",
+    "rate.md": "# Rate\n\nAfter the user picks a method, call POST /dashboard/remittance/rate and show the rate.\n",
+  });
+  const r = e.lorc(["tier", "add a remittance rate page", "--doc", "rate.md", "--json", "--no-history"]);
+  assert.strictEqual(r.status, 0, r.stderr);
+  const o = JSON.parse(r.stdout);
+  assert.deepStrictEqual(o.detail.text.doc.endpoints, ["POST /dashboard/remittance/rate"]);
+  assert.strictEqual(o.detail.graph.api, "client/src/api/remittance.api.js");
+  assert.ok(o.detail.estimate.changed.includes("client/src/api/remittance.api.js"), JSON.stringify(o.detail.estimate.changed));
+  assert.ok(!o.detail.estimate.changed.includes("api client"));
+});
+
+test("API module: an endpoint it already calls makes it a reference, not a change", () => {
+  const e = repo({
+    "client/package.json": "{\"name\":\"c\"}\n",
+    "client/src/api/remittance.api.js": "const BASE = '/dashboard/remittance';\nexport const getRate = () => post('/dashboard/remittance/rate');\n",
+    "client/src/views/remittance/Remittance.vue": "<template><div></div></template>\n",
+    "rate.md": "# Rate\n\nCall POST /dashboard/remittance/rate (register into remittance.api.js) and show the rate.\n",
+  });
+  const o = JSON.parse(e.lorc(["tier", "add a remittance rate page", "--doc", "rate.md", "--json", "--no-history"]).stdout);
+  assert.strictEqual(o.detail.graph.api, "client/src/api/remittance.api.js");
+  assert.ok(!o.detail.estimate.changed.includes("client/src/api/remittance.api.js"), JSON.stringify(o.detail.estimate.changed));
+  assert.ok(o.why.some((w) => /^api: remittance\.api\.js \(endpoint exists: /.test(w)), JSON.stringify(o.why));
+});
+
+test("doc-only names: a change verb before the name counts it; 'same as X' does not", () => {
+  const g = { ok: true, named: { "keys.js": ["src/f/keys.js"], "Box.vue": ["src/f/Box.vue"] }, feature: "src/f" };
+  const TT = require("../bin/lib/tier-text.js");
+  const req = "add a recipient card component";
+  const text = Object.assign(TT.parse(req), { raw: req, doc: { names: ["keys.js", "Box.vue"], changes: ["keys.js"] } });
+  const h = { similar: { n: 0 }, runs: { n: 0 }, cochange: [], wiring: { ratio: 2 }, calibration: { factor: 1, learned: false } };
+  const e = T.estimate(text, Object.assign({ core: [], blast: [], hosts: [], reuse: {} }, g), h);
+  assert.ok(e.changed.includes("src/f/keys.js"));
+  assert.ok(!e.changed.includes("src/f/Box.vue"));
+});
+
+test("placeholders are absorbed by a feature file; an existing container takes 1 host", () => {
+  const g = { ok: true, core: ["src/f/Shell.vue", "src/f/Sib.vue"], hosts: ["src/f/Shell.vue", "src/f/keys.js", "src/f/Sib.vue"], feature: "src/f" };
+  const req = "Build step 2 of the transfer flow. Step 1 already exists: step 2 shows the data step 1 collected.";
+  const r = run(req, g);
+  assert.strictEqual(r.detail.estimate.hosts, 1);
+  assert.ok(!r.detail.estimate.changed.some((f) => /^(edit: |state holder)/.test(f)), JSON.stringify(r.detail.estimate.changed));
+  assert.ok(has(r, /^absorbed: \d placeholder\(s\) into Shell\.vue/), JSON.stringify(r.why));
+  // No feature file and no existing container: the placeholder counts as before.
+  assert.ok(run("change the label in the payout form", { ok: true }).detail.estimate.changed.some((f) => f.startsWith("edit: ")));
+});
+
+test("opts.loaded: the caller's graph is used, loadGraph is not called", () => {
+  const e = repo(SHOP);
+  assert.strictEqual(e.lorc(["graph", "update", "--json"]).status, 0);
+  const loaded = T.loadGraph(e.root);
+  assert.ok(loaded && loaded.model);
+  const orig = T.loadGraph;
+  let called = 0;
+  T.loadGraph = () => { called++; throw new Error("must not load"); };
+  try {
+    const r = T.compute(e.root, RENAME, { loaded: { Q: loaded.Q, model: loaded.model, claudeDir: loaded.claudeDir }, history: false });
+    assert.strictEqual(called, 0);
+    assert.strictEqual(r.detail.graph.ok, true);
+    assert.deepStrictEqual(r.detail.graph.blast, ["shop/views.py"]);
+    const s = T.compute(e.root, RENAME, { history: false });
+    assert.strictEqual(called, 1);
+    assert.strictEqual(s.detail.graph.source, "git");
+  } finally { T.loadGraph = orig; }
+});
+
+test("structural analog: the closest flow and its own-folder imports", () => {
+  const rels = ["src/views/pay/outward/constants/keys.js", "src/views/pay/recipients/CreateRecipientFlow.vue", "src/views/pay/recipients/Step1.vue",
+    "src/views/pay/recipients/Step2.vue", "src/views/pay/recipients/constants/r.js", "src/views/shared/Stepper.vue", "src/views/other/OrderFlow.vue"];
+  const imports = { "src/views/pay/recipients/CreateRecipientFlow.vue": ["src/views/pay/recipients/Step1.vue", "src/views/pay/recipients/Step2.vue", "src/views/pay/recipients/constants/r.js", "src/views/shared/Stepper.vue"] };
+  const Q = { importsOf: (m, f) => ({ files: imports[f] || [] }) };
+  const TT = require("../bin/lib/tier-text.js");
+  const req = "build the create transfer flow with a recipient step and an amount step";
+  const text = Object.assign(TT.parse(req), { raw: req });
+  const a = T.structuralAnalog(text, { feature: "src/views/pay/outward", rels, Q, model: {}, reuse: {} });
+  assert.deepStrictEqual(a, { file: "src/views/pay/recipients/CreateRecipientFlow.vue", files: 4 });
+  // Through compute: the analog blends the estimate and gives a why line.
+  const r = run(req, { ok: true, analog: a });
+  assert.ok(has(r, /^analog: .*CreateRecipientFlow\.vue \(4 files\)/), JSON.stringify(r.why));
+  assert.strictEqual(T.structuralAnalog(Object.assign(TT.parse("fix the typo"), { raw: "fix the typo" }), { feature: "src/views/pay/outward", rels }), null);
+});
+
+test("history prior: a short request leans on the cue median (0.25), a unit request less (0.1)", () => {
+  const TT = require("../bin/lib/tier-text.js");
+  const h = { similar: { n: 0 }, runs: { n: 0 }, cochange: [], wiring: { ratio: 2 }, calibration: { factor: 1, learned: false }, prior: { cue: "fix", median: 8, k: 40 } };
+  const g = { ok: true, core: [], named: {}, blast: [], hosts: [], reuse: {} };
+  const short = Object.assign(TT.parse("Payout list sorting"), { raw: "Payout list sorting" });
+  const e1 = T.estimate(short, g, h);
+  assert.ok(e1.why.includes("history prior: fix median 8 (40 commits)"), JSON.stringify(e1.why));
+  assert.strictEqual(e1.est, Math.round(Math.exp(0.75 * Math.log(1) + 0.25 * Math.log(8))));
+  const unit = Object.assign(TT.parse("add a payout card component"), { raw: "add a payout card component" });
+  const e2 = T.estimate(unit, g, h);
+  assert.strictEqual(e2.est, Math.round(Math.exp(0.9 * Math.log(e2.structural) + 0.1 * Math.log(8))));
+});
+
+test("confidence: estimates that agree add 0.1, a wide spread takes 0.1", () => {
+  const req = "add a recipient card component";
+  const base = run(req, { ok: true });
+  const s = base.detail.estimate.structural;
+  const agree = run(req, { ok: true, analog: { file: "src/a/XFlow.vue", files: s } });
+  const wide = run(req, { ok: true, analog: { file: "src/a/XFlow.vue", files: s * 4 } });
+  assert.ok(agree.conf > wide.conf, `${agree.conf} ${wide.conf}`);
+});

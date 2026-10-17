@@ -1,4 +1,5 @@
 "use strict";
+// lorc owns this file since 0.4.0 (forked from ORC 2.3.0 @ ae47a4a, vendor/graph). Change it here, not in ORC.
 // ── orc graph — RESOLUTION and the READ commands (v1.8.0 W3) ────────────────
 //
 // `ctx`, `impact` and `path` answer from the stored records. Resolution is
@@ -62,8 +63,9 @@ function readJson(file) {
 function loadModel(claudeDir, root, opts) {
   const p = G.graphPaths(claudeDir);
   const meta = readJson(p.meta);
-  // S2: the writer hands over the index it holds; a reader parses the file.
-  const index = (opts && opts.index) || readJson(p.index);
+  // S2: the writer hands over the index it holds; a reader reads the store.
+  // W19b: format 2 reads every listed index bucket, format 1 reads index.json.
+  const index = (opts && opts.index) || G.readIndex(claudeDir, meta);
   if (!meta || !index || !index.by_file) return null;
   // The stored resolution, and ONLY when it names this exact generation.
   // Anything else — a crash between two writes, an older engine, a hand
@@ -171,8 +173,17 @@ function aliasTable(model, dir) {
   if (model.aliasTables.has(dir)) return model.aliasTables.get(dir);
   const out = [];
   const at = (name) => path.join(model.root || "", dir, name);
+  // W19c: ONE directory listing, then read only the names that are there. A
+  // failed read per config name per directory cost ~130 ms on each resolve.
+  let present = null;
+  try {
+    present = new Set(fs.readdirSync(path.join(model.root || "", dir)).map((n) => n.toLowerCase()));
+  } catch (_) {
+    present = new Set();
+  }
+  const readAt = (name) => (present.has(name) ? readText(at(name)) : null);
   for (const name of ALIAS_JSON) {
-    const t = readText(at(name));
+    const t = readAt(name);
     if (t === null) continue;
     let j = null;
     try {
@@ -196,12 +207,12 @@ function aliasTable(model, dir) {
     while ((m = rx.exec(t))) out.push({ prefix: m[1] + "/", target: cleanRel(posix.join(dir, m[2])), exact: false });
   };
   for (const name of ALIAS_BUNDLER) {
-    const t = readText(at(name));
+    const t = readAt(name);
     if (t === null) continue;
     scan(t, ALIAS_RX_RESOLVE);
     scan(t, ALIAS_RX_URL);
   }
-  const jt = readText(at("jest.config.js"));
+  const jt = readAt("jest.config.js");
   if (jt !== null) scan(jt, ALIAS_RX_JEST);
   model.aliasTables.set(dir, out);
   return out;
@@ -412,9 +423,50 @@ function fileBindings(model, rel) {
 }
 
 // ── resolution ──────────────────────────────────────────────────────────────
+// W19c: memoised per symbol object (pure on `qname`).
+const CLASS_OF = new WeakMap();
 function classOf(sym) {
+  const hit = CLASS_OF.get(sym);
+  if (hit !== undefined && hit.q === sym.qname) return hit.c;
   const q = sym.qname.split(".");
-  return q.length > 1 ? q.slice(0, -1).join(".") : null;
+  const c = q.length > 1 ? q.slice(0, -1).join(".") : null;
+  CLASS_OF.set(sym, { q: sym.qname, c });
+  return c;
+}
+
+// W19c: per-model tables that `resolveCall` used to rebuild on every call.
+// Built once per model; the same arrays, in the same order, as the filters.
+function memoOf(model) {
+  return model._memo || (model._memo = { locals: new Map(), cands: new Map() });
+}
+// The non-module symbols of `rel` named `name`, in symbol order.
+function localsNamed(model, rel, name) {
+  const m = memoOf(model).locals;
+  let byName = m.get(rel);
+  if (!byName) {
+    byName = new Map();
+    for (const s of (model.byFile[rel] || {}).symbols || []) {
+      if (s.kind === "module") continue;
+      const a = byName.get(s.name);
+      if (a) a.push(s);
+      else byName.set(s.name, [s]);
+    }
+    m.set(rel, byName);
+  }
+  return byName.get(name) || [];
+}
+// The repository-wide candidates for a bare name (the last rung).
+function candsNamed(model, name, testCaller, member) {
+  const m = memoOf(model).cands;
+  const key = `${name}\0${testCaller ? 1 : 0}\0${member ? 1 : 0}`;
+  let v = m.get(key);
+  if (!v) {
+    const named = model.byName.get(name) || [];
+    const all = testCaller ? named : named.filter((s) => !TEST_FILE.test(s.file));
+    v = member ? all : all.filter((s) => !classOf(s));
+    m.set(key, v);
+  }
+  return v;
 }
 
 // ── W2 (G4): barrels ────────────────────────────────────────────────────────
@@ -516,12 +568,6 @@ function routeNameIndex(model) {
 }
 
 function resolveRouteCall(model, rel, call) {
-  // The sharded fast model holds no symbol table to search for route names,
-  // so it DECLINES and the full model answers.
-  if (model.fast) {
-    const S = require("./graph-shard.js");
-    throw new S.FastUnavailable("route-call");
-  }
   let rname = call.name;
   if (call.via) {
     const parts = String(call.name).split(".");
@@ -553,18 +599,23 @@ function resolveRouteCall(model, rel, call) {
 
 function resolveCall(model, rel, caller, call) {
   const cls = caller ? classOf(caller) : null;
-  const key = `${rel}\0${cls || ""}\0${call.name}\0${call.self ? 1 : 0}\0${call.ref ? 1 : 0}\0${call.sup ? 1 : 0}\0${call.alias ? 1 : 0}\0${call.route ? (call.via ? 2 : 1) : 0}`;
+  // W19c: the memo is per file (`model.resolved`: rel → Map), so the key to
+  // hash is short. The key parts are the same as before.
+  const key = `${cls || ""}\0${call.name}\0${call.self ? 1 : 0}${call.ref ? 1 : 0}${call.sup ? 1 : 0}${call.alias ? 1 : 0}${call.route ? (call.via ? 2 : 1) : 0}`;
+  let memo = model.resolved.get(rel);
+  if (!memo) model.resolved.set(rel, (memo = new Map()));
   if (call.route) {
     const rr = resolveRouteCall(model, rel, call);
-    model.resolved.set(key, rr);
+    memo.set(key, rr);
     return rr;
   }
-  if (model.resolved.has(key)) return model.resolved.get(key);
+  const known = memo.get(key);
+  if (known !== undefined) return known;
   const parts = call.name.split(".");
   const last = parts[parts.length - 1];
   const head = parts.length > 1 ? parts[0] : null;
   const f = model.byFile[rel] || {};
-  const locals = (f.symbols || []).filter((s) => s.kind !== "module" && s.name === last);
+  const locals = localsNamed(model, rel, last);
   const { map: binds, includes } = fileBindings(model, rel);
   const lang = f.lang;
   let r = null;
@@ -666,9 +717,7 @@ function resolveCall(model, rel, caller, call) {
     // resolved UNIQUE to the only method named `get` in the repository.
     // v2.2.0 (D5): a source file never resolves into a test helper. A test
     // caller keeps every candidate.
-    const named = model.byName.get(last) || [];
-    const all = TEST_FILE.test(rel) ? named : named.filter((s) => !TEST_FILE.test(s.file));
-    const cands = head || call.self ? all : all.filter((s) => !classOf(s));
+    const cands = candsNamed(model, last, TEST_FILE.test(rel), !!(head || call.self));
     if (head) {
       const hl = head.toLowerCase();
       const byClass = cands.filter((s) => {
@@ -690,7 +739,7 @@ function resolveCall(model, rel, caller, call) {
   // A name passed as an argument is only an edge when this file defines it or
   // imports it. `res.json(order)` must never find a repo function named `order`.
   if (call.ref && r.state !== "LOCAL" && r.state !== "IMPORT") r = { state: "UNRESOLVED" };
-  model.resolved.set(key, r);
+  memo.set(key, r);
   return r;
 }
 
@@ -935,33 +984,11 @@ function stableCallers(rows) {
 function calleesOf(model, sym) {
   const out = [];
   const seen = new Set();
-  // S1 (v1.8.2 W8): on the sharded fast path the resolutions were computed by
-  // the update and stored, so this loop reads instead of resolving. The DEDUPE
-  // and the order are unchanged — the rows are keyed by the call's INDEX, so
-  // the same calls survive in the same order and the card is the same bytes.
-  const fwd = model.callsFor ? model.callsFor(sym) : null;
-  const stored = fwd ? new Map((fwd.r || []).map((row) => [row[0], row])) : null;
   const calls = sym.calls || [];
   for (let i = 0; i < calls.length; i++) {
     const c = calls[i];
     if (seen.has(c.name)) continue;
     seen.add(c.name);
-    if (stored) {
-      // v2.2.0: a route call is answered by the full model only (its
-      // UNRESOLVED answer names the missing route, which no shard stores).
-      if (c.route) throw new (require("./graph-shard.js").FastUnavailable)("route-call");
-      const row = stored.get(i);
-      const S = require("./graph-shard.js");
-      out.push({
-        call: c,
-        res: row
-          ? row[1] === S.STATE_CODE.AMBIGUOUS
-            ? { state: "AMBIGUOUS", target: null, candidates: (fwd.cands || [])[row[4]] || [] }
-            : { state: S.CODE_STATE[row[1]], target: row[2], ...(row[3] === 1 ? { inherited: true } : {}) }
-          : { state: "UNRESOLVED", target: null, candidates: [] },
-      });
-      continue;
-    }
     out.push({ call: c, res: resolveCall(model, sym.file, sym, c) });
   }
   return out;
@@ -2324,11 +2351,6 @@ function importsOf(model, rel) {
 // exact size of the Grep the card replaced. The graph knows it for free: every
 // call site is already in the call index, and every definition in `byName`.
 function nameHits(model, name) {
-  // S1 (v1.8.2 W8): the sharded model holds a dozen files, not the repository,
-  // so it CANNOT count the lines a grep would have returned. It says so rather
-  // than returning a confident zero — K2's whole rule is that the
-  // counterfactual is written down, and a made-up basis is worse than none.
-  if (model.fast) return null;
   const bare = String(name || "").split(".").pop();
   const calls = (callIndex(model).get(bare) || []).length;
   const defs = (model.byName.get(bare) || []).length;

@@ -52,7 +52,7 @@ function changedNow(root) {
   try { return require("./check.js").changedFiles(root); } catch (_) { return null; }
 }
 
-function startRun(root, { request, store, settings, now } = {}) {
+function startRun(root, { request, doc, store, settings, now } = {}) {
   const t = nowMs(now);
   const base = makeSlug(request, t);
   let slug = base;
@@ -60,7 +60,7 @@ function startRun(root, { request, store, settings, now } = {}) {
   const u = usageNow(root);
   const s = settings || {};
   const run = {
-    slug, request: String(request || ""), started_at: iso(t),
+    slug, request: String(request || ""), doc: doc ? String(doc) : null, started_at: iso(t),
     session_id: sessionOf(u),
     store: { mode: (store && store.mode) || null, dir: (store && store.dir) || null },
     settings: { dispatch: s.dispatch ?? null, dispatch_max: s.dispatch_max ?? null, executor: s.executor ?? null, review: s.review ?? null },

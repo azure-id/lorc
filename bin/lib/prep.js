@@ -37,6 +37,25 @@ function keywords(request) {
   return out;
 }
 
+// Words for the graph map (no pack): every content word, verbs dropped, ≤ 12.
+const VERBS = new Set("build create add wire make implement update fix change use show fetch open new".split(" "));
+function mapWords(request) {
+  const out = [];
+  for (const w of String(request || "").toLowerCase().split(/[^a-z0-9_]+/)) {
+    if (w.length < 3 || STOP.has(w) || VERBS.has(w) || out.includes(w)) continue;
+    out.push(w);
+    if (out.length >= 12) break;
+  }
+  return out;
+}
+
+// Focus rows from the context pack: targets first, then exemplars; ≤ 6.
+function packRows(pack) {
+  if (!pack) return [];
+  return [...(pack.targets || []), ...(pack.exemplars || [])].slice(0, 6)
+    .map((i) => ({ sym: String(i.what || "").slice(0, 40), file: i.file, line: i.start }));
+}
+
 function part(fn) {
   try { return fn(); } catch (e) { return { error: String((e && e.message) || e).slice(0, 120) }; }
 }
@@ -74,28 +93,41 @@ function focusRows(map) {
   return rows;
 }
 
-// Build the graph when there is none, else update the changed files (and copy ORC's
-// store when it is older than 24 h). `lorc tier` calls this too.
+// Build the graph when there is none, else update the changed files. In process
+// (no child). `lorc tier` calls this too.
 function healGraph(root) {
-  if (fs.existsSync(path.join(root, ".claude", "orc", "graph", "meta.json"))) {
-    lorcJson(root, ["graph", "sync", "--if-older", "24"], 60000);
+  try { return require("./graph-router.js").heal(root); } catch (e) {
+    return { error: String((e && e.message) || e).slice(0, 120) };
   }
-  return lorcJson(root, ["graph", "status", "--heal"], 120000);
 }
 
-function graphPart(root, words) {
-  const sel = require("./graph-router.js").selectStore(root);
+// Heal, then load the own store ONCE (`loaded`). Delegate mode or a load failure → null.
+function graphPart(root) {
+  const R = require("./graph-router.js");
+  const sel = R.selectStore(root);
   const out = { mode: sel.mode, reason: sel.reason, state: null, focus: [] };
   const st = healGraph(root);
   out.state = st.error ? "unknown" : st.state || null;
   if (st.error) out.error = st.error;
-  if (words.length) {
-    const m = lorcJson(root, ["graph", "map", `--focus=${words.join(",")}`, "--budget", "600"], 60000);
-    if (m.error) out.error = m.error;
-    else out.focus = focusRows(m);
+  out.loaded = null;
+  if (sel.mode === "own") {
+    try {
+      const Q = require("./graph/graph-query.js");
+      const model = Q.loadModel(sel.claudeDir, root);
+      if (model) out.loaded = { Q, model, claudeDir: sel.claudeDir };
+    } catch (_) { out.loaded = null; }
   }
   out.store_dir = path.join(sel.claudeDir, "orc", "graph");
   return out;
+}
+
+// No pack: the graph map rows (a child), with the better words.
+function mapFocus(root, g, request) {
+  const words = mapWords(request);
+  if (!words.length) return [];
+  const m = lorcJson(root, ["graph", "map", `--focus=${words.join(",")}`, "--budget", "600"], 60000);
+  if (m.error) { g.error = m.error; return []; }
+  return focusRows(m);
 }
 
 function wikiPart(root, request) {
@@ -121,9 +153,15 @@ function tierHint(request, focus) {
   };
 }
 
-// lorc's own tier engine (`lorc tier`, a child). `tier_engine: off` → null, no child.
-function enginePart(root, request, sv, doc) {
+// lorc's own tier engine: in process with the loaded graph; delegate mode or no
+// graph → `lorc tier` (a child). `tier_engine: off` → null.
+function enginePart(root, request, sv, doc, loaded) {
   if (sv.tier_engine === "off") return null;
+  if (loaded) {
+    const r = require("./tier.js").compute(root, request, { doc, loaded });
+    if (r && r.tier && r.detail) return r;
+    return { error: (r && r.error) || "no answer" };
+  }
   // prep healed the graph already: the engine child must not do it again.
   const r = lorcJson(root, ["tier", request, "--no-heal", ...(doc ? ["--doc", doc] : [])], 30000);
   if (r && r.tier && r.detail) return r;
@@ -200,20 +238,33 @@ function fit(out) {
   if (bytes(out) > MAX_BYTES && out.tier_engine) delete out.tier_engine.split;
   if (bytes(out) > MAX_BYTES && out.tier_engine && out.tier_engine.why) out.tier_engine.why = out.tier_engine.why.slice(0, 1);
   // must_ask stays (it is a gate); only its evidence lists get shorter.
-  if (bytes(out) > MAX_BYTES && Array.isArray(out.must_ask)) for (const m of out.must_ask) for (const s of m.seen || []) s.at = s.at.slice(0, 1);
+  if (bytes(out) > MAX_BYTES && Array.isArray(out.must_ask)) for (const m of out.must_ask) for (const s of m.seen || []) if (Array.isArray(s.at)) s.at = s.at.slice(0, 1);
+  // context stays; at the end it keeps only its path.
+  if (bytes(out) > MAX_BYTES && out.context && out.context.path) out.context = { path: out.context.path };
   return out;
 }
 
 function prep(root, request, { start = true, doc } = {}) {
   const s = part(() => require("./settings.js").load(root).values);
   const sv = s && !s.error ? s : require("./settings.js").DEFAULTS;
-  const words = keywords(request);
   const out = {};
   out.usage = part(() => usagePart(root, sv));
-  const g = part(() => graphPart(root, words));
+  const g = part(() => graphPart(root));
   const storeDir = g.store_dir;
+  const loaded = g.loaded || null;
   delete g.store_dir;
+  delete g.loaded;
   out.graph = g;
+  const engine = part(() => enginePart(root, request, sv, doc, loaded));
+  const eng = engine && engine.tier ? engine : null;
+  // The context pack: request/doc names, change targets, exemplars, tests.
+  const pack = part(() => require("./context.js").build(root, request, { doc, loaded, engine: eng }));
+  const packOk = Boolean(pack && !pack.error);
+  const nItems = packOk ? ["targets", "exemplars", "tests", "reuse"].reduce((n, k) => n + (pack[k] || []).length, 0) +
+    (pack.entities || []).reduce((n, e) => n + (e.at || []).length, 0) : 0;
+  const rows = packOk ? packRows(pack) : [];
+  if (!g.error) g.focus = rows.length ? rows : part(() => mapFocus(root, g, request));
+  if (!Array.isArray(g.focus)) g.focus = [];
   const focusFiles = [...new Set((g.focus || []).map((r) => r.file))];
   out.rules = part(() => {
     const rules = require("./rules.js");
@@ -232,7 +283,6 @@ function prep(root, request, { start = true, doc } = {}) {
     review: sv.review, pattern_miss: sv.pattern_miss, limit_pct: sv.limit_pct,
   };
   const hint = tierHint(request, g.focus);
-  const engine = part(() => enginePart(root, request, sv, doc));
   if (engine) out.tier_engine = engine.tier ? require("./tier.js").brief(engine) : { error: String(engine.error).slice(0, 80) };
   const judge = part(() => judgePart(root, request, hint, focusFiles, sv, engine));
   out.tier_judge = decideTier(judge, engine);
@@ -246,11 +296,18 @@ function prep(root, request, { start = true, doc } = {}) {
   let runDir = null;
   if (start) {
     const r = part(() => require("./runs.js").startRun(root, {
-      request, store: { mode: g.mode || null, dir: storeDir || null }, settings: sv,
+      request, doc, store: { mode: g.mode || null, dir: storeDir || null }, settings: sv,
     }));
     if (r.error) out.slug = r;
     else { out.slug = r.slug; out.run_dir = r.dir; runDir = r.dir; }
   }
+  if (packOk) {
+    out.context = { items: nItems, bytes: pack.bytes };
+    if (runDir) {
+      const w = part(() => require("./context.js").write(runDir, pack));
+      if (w && !w.error) out.context = { path: w.md, items: nItems, bytes: pack.bytes };
+    }
+  } else if (pack && pack.error) out.context = { error: String(pack.error).slice(0, 80) };
   // jev rates the L3 options: prep says HOW, so the skill does not carry the format.
   out.ask_judge = ask ? { how: askHow(typeof out.slug === "string" ? out.slug : "<slug>") } : false;
   if (!out.rules.error) {
@@ -315,4 +372,4 @@ function cmd(argv = []) {
   return 0;
 }
 
-module.exports = { prep, fit, keywords, focusRows, tierHint, healGraph, enginePart, evidenceOf, judgePart, decideTier, judgeOut, askOn, askHow, lorcJson, RISKY, MAX_BYTES, cmd };
+module.exports = { prep, fit, keywords, mapWords, packRows, focusRows, tierHint, healGraph, enginePart, evidenceOf, judgePart, decideTier, judgeOut, askOn, askHow, lorcJson, RISKY, MAX_BYTES, cmd };

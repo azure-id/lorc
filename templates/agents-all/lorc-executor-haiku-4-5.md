@@ -8,6 +8,19 @@ tools: Read, Write, Edit, Bash, Glob, Grep
 You implement ONE task. Your prompt names a slice file. Read it first. It holds the task, the
 files, graph anchors, the code pattern, the rules card, the commands and the return shape.
 
+Fewer messages
+- Start with ONE Read of the slice's read file. Then read only what it lacks, all of it in ONE
+  batched message.
+- Batch. Every message re-reads your whole context, so fewer messages win. Put all independent
+  tool calls of a step in ONE message as parallel calls: the reads you need (several Read calls
+  with offset/limit, or one Bash with several `sed -n 'a,bp'` ranges), and edits to DIFFERENT
+  files (keys, locale files, router) together.
+- Write a new file complete in ONE Write. Do not patch a file you just wrote with a row of small
+  Edits; when it needs many changes, rewrite it once.
+- Read ranges. A file over 150 lines: read only the range the slice, its Context section or a
+  card names (offset/limit). Never read a whole file to learn a pattern.
+- Run the task's tests once after all files are written, fix, then run them once more.
+
 Rules
 1. Stay inside the slice's files. Edit another file only when the task cannot be done
    otherwise; name it in `files_changed` with the reason.
@@ -16,6 +29,9 @@ Rules
    "Model on these" refs and the anchored ranges. Explore further ONLY
    for a fact they do not give you. Batch reads: one Bash call may print several ranges
    (`sed -n 'a,bp' f1; sed -n 'c,dp' f2`). Never read the same range twice.
+   The slice's Context and Requirement sections are complete for this task. Read only the
+   ranges it lists, and only when you must copy code (Read with offset/limit). Never cat or
+   Read a whole file the slice names. Never open the requirement file again.
 3. Match the pattern's Conventions. Never break an Invariant. `HOUSE-RULES.md` beats the rest.
 4. Plan every edit first, then write each file in ONE Write (or one Edit per change site).
    Do not rewrite a file you already wrote unless a test fails. Batch your edits. No comment that restates the code. No abstraction the task does not need.

@@ -1,45 +1,9 @@
 {
-  "orc_commit": "ae47a4aed7256009b61ad2c5afadbc9dd8c29e74",
+  "orc_commit": "102e118438b87294539d9c0c84f1d4c3b2c498d6",
   "orc_version": "2.3.0",
-  "orc_dirty": [
-    "bin/wiki-core.js",
-    "bin/pattern-core.js",
-    "bin/rules-core.js"
-  ],
-  "copied_at": "2026-10-11T12:02:51.611Z",
+  "orc_dirty": [],
+  "copied_at": "2026-10-17T05:12:30.442Z",
   "files": {
-    "vendor/graph/graph.js": {
-      "from": "bin/graph.js",
-      "sha256": "344719969a9ff6ee3f425af455285ffebaf81c11e01cb775edd9e5aa1dbb1519"
-    },
-    "vendor/graph/graph-extract.js": {
-      "from": "bin/graph-extract.js",
-      "sha256": "186e2878e9b0a17abbb7ad772c6dbb107b0346965564693a52f77a2ed0dfaec9"
-    },
-    "vendor/graph/graph-query.js": {
-      "from": "bin/graph-query.js",
-      "sha256": "bb039ca75fd5c7cb44735f6de3d19835ddbb362e57166a471ab8c8b6ea0e5623"
-    },
-    "vendor/graph/graph-resolve.js": {
-      "from": "bin/graph-resolve.js",
-      "sha256": "bb3830e6e26027a66cc4303c91ae086b804f4428d587fe896a94bffd6420d49e"
-    },
-    "vendor/graph/graph-signals.js": {
-      "from": "bin/graph-signals.js",
-      "sha256": "c6166b452f86c9f62cd52fc9f2a29e54a61d49bc411090a90343afafce3adc4f"
-    },
-    "vendor/graph/graph-notes.js": {
-      "from": "bin/graph-notes.js",
-      "sha256": "5dff321fb1f22f33a4b869a8534ee57643918c054f024ffe678573526f5ad641"
-    },
-    "vendor/graph/graph-map.js": {
-      "from": "bin/graph-map.js",
-      "sha256": "5306440b857874cb4b4838971b709cc4a673ad353dc5a596b140e295e3a39e3c"
-    },
-    "vendor/graph/graph-shard.js": {
-      "from": "bin/graph-shard.js",
-      "sha256": "203153dc60112ec195f3aa96fa56af014cf24820ee83ce053dc412becd81e932"
-    },
     "vendor/pricing.json": {
       "from": "bin/pricing.json",
       "sha256": "603d00eb80733c17b7c44a5efb0e184d5eacedf539de03d1eb858fc00f9fc660"
@@ -153,7 +117,5 @@
       "sha256": "89d13656b367b42202008874ea9309aae44265896f4312186c3671bea705eed3"
     }
   },
-  "local": [
-    "vendor/graph/graph-gain.js"
-  ]
+  "local": []
 }

@@ -1,4 +1,5 @@
 "use strict";
+// lorc owns this file since 0.4.0 (forked from ORC 2.3.0 @ ae47a4a, vendor/graph). Change it here, not in ORC.
 // ── orc graph — CHEAP SIGNALS for planners and reviewers (v1.8.0 EW5) ───────
 //
 // Four answers that cost NO model tokens, because every one of them is already

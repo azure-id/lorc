@@ -37,7 +37,9 @@ test("own mode: update, status, ctx --anchors, map, changes, heal", () => {
   let r = lorc(env, "update", "--json");
   assert.strictEqual(r.status, 0, r.stderr + r.stdout);
   assert.strictEqual(r.json.store.mode, "own");
-  assert.ok(fs.existsSync(path.join(env.root, ".claude", "lorc", "orc", "graph", "meta.json")));
+  const meta = JSON.parse(fs.readFileSync(path.join(env.root, ".claude", "lorc", "orc", "graph", "meta.json"), "utf8"));
+  assert.strictEqual(meta.format, 2);
+  assert.ok(!fs.existsSync(path.join(env.root, ".claude", "lorc", "orc", "graph", "index.json")));
 
   r = lorc(env, "status", "--json");
   assert.strictEqual(r.json.state, "fresh", r.stdout);

@@ -1,6 +1,6 @@
 {
   "name": "@azure-id/lorc",
-  "version": "0.3.5",
+  "version": "0.4.3",
   "description": "Light ORC — one lean coding skill (/lorc) for Claude Code: code graph, house rules, wiki, code pattern, cheapest-capable executors, review, wait on limit. Works alone or on top of ORC.",
   "bin": {
     "lorc": "bin/lorc.js"

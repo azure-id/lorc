@@ -175,3 +175,35 @@ test("Indonesian: step once, state cue", () => {
 test("Indonesian: plural reduplication", () => {
   assert.deepStrictEqual(nouns(parse("tambah halaman-halaman laporan")), ["page"]);
 });
+
+test("doc names: known file names and code names join text.names; endpoints in text.doc", () => {
+  const d = tmp();
+  fs.writeFileSync(path.join(d, "req.md"), "Fetch POST /dashboard/remittance/rate (register into remittance.api.js).\nThe GetRate() result fills the TransferFund view. Use the DownArrow icon. See notes.md.\n");
+  const known = (n) => ["remittance.api.js", "TransferFund"].includes(n);
+  const r = parse("build the rate step", { root: d, doc: "req.md", known });
+  assert.ok(r.names.includes("remittance.api.js") && r.names.includes("TransferFund"), JSON.stringify(r.names));
+  assert.ok(!r.names.includes("GetRate") && !r.names.includes("DownArrow") && !r.names.includes("notes.md"));
+  assert.deepStrictEqual(r.doc.endpoints, ["POST /dashboard/remittance/rate"]);
+  assert.deepStrictEqual(r.doc.names, ["remittance.api.js", "TransferFund"]);
+  // No known-names check (not a git repo, no graph): no doc names.
+  assert.deepStrictEqual(parse("build the rate step", { root: d, doc: "req.md" }).names, []);
+});
+
+test("docChanged: a change verb within 6 words in the same sentence", () => {
+  const { docChanged } = require("../bin/lib/tier-text.js");
+  assert.strictEqual(docChanged("fetch POST /x (register into remittance.api.js)", "remittance.api.js"), true);
+  assert.strictEqual(docChanged("tambahkan ke keys.js", "keys.js"), true);
+  assert.strictEqual(docChanged("the same as remittance.api.js", "remittance.api.js"), false);
+  assert.strictEqual(docChanged("Update the box. It looks like Box.vue", "Box.vue"), false);
+  assert.strictEqual(docChanged("update one two three four five six seven Box.vue", "Box.vue"), false);
+});
+
+test("docNames: at most 8; endpointsOf; leadCue", () => {
+  const { docNames, endpointsOf, leadCue } = require("../bin/lib/tier-text.js");
+  const many = Array.from({ length: 12 }, (_, i) => `fooBar${i}`).join(" ");
+  assert.strictEqual(docNames(many, () => true).length, 8);
+  assert.deepStrictEqual(endpointsOf("GET /a/b and DELETE /a/{id}."), ["GET /a/b", "DELETE /a/{id}"]);
+  const cues = ["feat(pay): add payout card", "Fix crash on login", "chore(deps): bump lodash", "[PAY-12] Remove old banner",
+    "PAY-3 update the copy", "refactor: extract hook", "Payout list sorting", "tambah halaman laporan"].map(leadCue);
+  assert.deepStrictEqual(cues, ["add", "fix", "bump", "remove", "update", "refactor", "other", "add"]);
+});

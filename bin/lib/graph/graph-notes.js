@@ -1,4 +1,5 @@
 "use strict";
+// lorc owns this file since 0.4.0 (forked from ORC 2.3.0 @ ae47a4a, vendor/graph). Change it here, not in ORC.
 // ── orc graph — NOTES (v1.8.0 W4) ───────────────────────────────────────────
 //
 // Layer 2: one sentence per function or method, written by
@@ -43,7 +44,8 @@ function clampInt(v, lo, hi, def) {
 
 function readIndex(claudeDir) {
   try {
-    return JSON.parse(fs.readFileSync(G().graphPaths(claudeDir).index, "utf8"));
+    // W19b: both store formats (format 2 = the index buckets).
+    return G().readIndex(claudeDir);
   } catch (_) {
     return null;
   }
