@@ -17,11 +17,20 @@
 - the closest exemplars with cards (props, emits, methods, children);
 - the test setup to copy, and 1-hop reuse.
 
+Back ends get the same sections (0.5.1): source-file exemplars with symbol ranges, the server route group + an insert hint, and wiring targets (the files that import the module). Big spec files give sections, not the full file.
+
+Back ends also get (0.5.2):
+- **Mirror**: the closest existing feature. It lists the files of that feature that the ticket does not name yet (for example its DI container) and its unit tests as the first test exemplars.
+- **Reuse** rows for code that already holds the exact text of the ticket, and for the code that uses a named constant.
+- Narrow ranges (the main symbol, ≤ 40 lines) instead of whole files. In Go, a reuse row comes only from a file whose symbols an exemplar uses (no rows for a whole package).
+
+The slice and the executor read plan carry the Mirror rows. Front-end packs do not change.
+
 Eval repo (RMT1): changed files 5 of 5 with their regions, 15 of the 20 files that executors read in 0.3.3 runs, precision 0.71, 8 KB.
 
 **Slice sections.** A slice holds the task, the known facts, the context items of the task, the reference code, the requirement doc inline (≤ 8 KB, with "do not open it again") and the commands. Cap: 32 KB. The executor reads only the listed ranges and never opens the requirement file again.
 
-**The read plan.** `lorc slice` writes the task read plan to `<run>/read-<n>.md` (≤ 20 KB, high-precision ranges only). The slice says `Read <path> (ONE Read call, <bytes> B)`. The executor does one Read of that file first. Then it reads only what the file lacks, all in one batched message.
+**The read plan.** `lorc slice` writes the task read plan to `<run>/read-<n>.md` (≤ 20 KB, high-precision ranges only). The slice says `Read <path> (ONE Read call, <bytes> B)`. The executor does one Read of that file first. Then it reads only what the file lacks, all in one batched message. The executor creates a file with one Write (never a shell heredoc). It sends all edits of a step in one message. Before it writes tests, it reads the fields of the thrown error and one test of the same layer. For a back-end task, the read plan also holds the definition of an error class that the ticket names (≤ 40 lines), so the tests assert the correct error fields. The read plan shows the schema block of TypeScript types generated from OpenAPI (`components['schemas'][…]` aliases). At the end, the executor runs the lint command once on every file that it changed or created. eslint runs with a cache, so the final check lints again only the changed files. The slice lint line lists every declared task file, also new files and test files. The executor never waits in a loop for a file that another group creates.
 
 **The hard gate.** lorc never assumes. A fact that the code, the prep output or you did not give is a question in L3.
 lorc asks until nothing is assumed. No code is written before your answer.

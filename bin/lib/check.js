@@ -68,11 +68,18 @@ function fullTestCmd(root, commands) {
   return p && p.scripts.test ? "npm test" : null;
 }
 
-function lintCmd(root, files, commands) {
+// 0.5.2: opts.planned keeps the files that do not exist yet (the slice lists every declared task file).
+function lintCmd(root, files, commands, opts = {}) {
   const p = pkgOf(root);
-  const code = files.filter((f) => /\.(m?[jt]sx?|cjs|vue|svelte)$/i.test(f) && fs.existsSync(path.join(root, f)));
+  const code = files.filter((f) => /\.(m?[jt]sx?|cjs|vue|svelte)$/i.test(f) && (opts.planned || fs.existsSync(path.join(root, f))));
   const hasEslint = (p && p.deps.eslint) || fs.existsSync(path.join(root, "node_modules", ".bin", "eslint"));
-  if (hasEslint) return code.length ? `npx eslint ${code.map(q).join(" ")}` : null;
+  // lorc 0.5.2: an eslint cache, so `lorc check` lints again only the files that changed after the executor's lint.
+  if (hasEslint) {
+    if (!code.length) return null;
+    const nm = fs.existsSync(path.join(root, "node_modules"));
+    const cache = path.join(root, nm ? "node_modules/.cache/lorc-eslint/" : ".claude/lorc/eslintcache/").replace(/\\/g, "/");
+    return `npx eslint --cache --cache-location ${q(cache.endsWith("/") ? cache : cache + "/")} ${code.map(q).join(" ")}`;
+  }
   return commands && commands.lint ? commands.lint : null;
 }
 
@@ -321,4 +328,4 @@ function cmdInner(argv) {
   return out.ok ? 0 : 1;
 }
 
-module.exports = { covDir, projectDir, groupByProject, coverageOn, coverageArgs, readCoverage, changedFiles, runner, affectedTests, failedNames, lintCmd, isTest, check, cmd, fit, MAX_BYTES };
+module.exports = { covDir, projectDir, groupByProject, coverageOn, coverageArgs, readCoverage, changedFiles, runner, affectedTests, failedNames, lintCmd, typecheckCmd, isTest, check, cmd, fit, MAX_BYTES };

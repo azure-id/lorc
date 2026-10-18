@@ -142,3 +142,14 @@ test("endRun reads prep.json: engine_tier, est_files, est_raw, jev_tier", () => 
   const l2 = JSON.parse(fs.readFileSync(path.join(root2, ".claude", "lorc", "runs.jsonl"), "utf8").trim());
   assert.deepStrictEqual([l2.engine_tier, l2.est_files, l2.est_raw, l2.jev_tier], [null, null, null, null]);
 });
+
+test("W33: run end uses update --if-exists; no store → none is built", () => {
+  const src = fs.readFileSync(require.resolve("../bin/lib/runs.js"), "utf8");
+  assert.ok(src.includes('"graph", "update", "--if-exists", "--json", "--dir", root'));
+  const { repo } = require("./prep-fixture.js");
+  const e = repo();
+  const r = e.lorc(["graph", "update", "--if-exists", "--json"]);
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(JSON.parse(r.stdout).skipped, true);
+  assert.ok(!fs.existsSync(path.join(e.root, ".claude", "lorc", "orc", "graph", "meta.json")));
+});

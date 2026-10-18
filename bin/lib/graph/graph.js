@@ -42,11 +42,13 @@ const SCHEMA = 2;
 const FORMAT = 2;
 // The extractor version per language. A record keeps it as `xv` (no `xv` = 1).
 // A record with another `xv` than this table is parsed again on the next update.
-const EXTRACTORS = { js: 2, ts: 2, vue: 2, svelte: 2, i18n: 1, py: 1, go: 1, java: 1, cs: 1, php: 1, rb: 1, rs: 1, kt: 1, c: 1 };
+const EXTRACTORS = { js: 3, ts: 3, vue: 3, svelte: 3, i18n: 1, env: 1, sql: 1, py: 2, go: 2, java: 2, cs: 2, php: 2, rb: 2, rs: 2, kt: 2, c: 2 };
 const BUCKETS = 64;
 // A file that no meta or derived file lists is deleted only when it is older
 // than this. A reader that started before the update still finds its files.
 const GRACE_MS = 10 * 60 * 1000;
+// lorc 0.5.0: a `.env` / `.env.*` file. Its record holds KEYS only, never a value.
+const ENV_FILE = /(^|\/)\.env(\.[\w.-]+)?$/;
 const I18N = /(^|\/)(i18n|l10n|locales?|lang|langs|translations?)\/[^/]+\.json$/i;
 // Bumped whenever the record shape or extraction changes. A record made by an
 // older engine is re-extracted, and status reads DRIFTED until it is.
@@ -60,6 +62,7 @@ const I18N = /(^|\/)(i18n|l10n|locales?|lang|langs|translations?)\/[^/]+\.json$/
 //     symbols, and a `<script setup>` component is one `class`. No record FIELD
 //     changed: a 1.9.0 store reads DRIFTED and the next `status --heal`
 //     re-extracts once, the same path 1.8.1 → 1.8.2 took.
+// lorc 0.5.0: framework links (graph-links*.js) — js/ts/vue/svelte records parse again once.
 const ENGINE = "lgraph@1";
 const GIT_MAX_BUFFER = 256 * 1024 * 1024;
 const MAX_BYTES = 512 * 1024;
@@ -84,6 +87,7 @@ const LANG_BY_EXT = {
   ".ts": "ts", ".tsx": "ts", ".mts": "ts", ".cts": "ts",
   ".py": "py",
   ".go": "go",
+  ".sql": "sql",
   ".java": "java",
   ".cs": "cs",
   ".php": "php",
@@ -101,12 +105,28 @@ const LANG_BY_EXT = {
 
 // Never part of the map, whatever git says: ORC's own tree, installed or
 // vendored dependencies (sometimes committed), build output, caches, minified
-// or bundled JS, generated files, and `.d.ts` declarations (v1.8.2 W2 — a
-// declaration file duplicates every symbol of its module and made each one
-// AMBIGUOUS). `dist/` and `build/` are skipped at the ROOT only: `pkg/build/`
+// or bundled JS, and generated files. `dist/` and `build/` are skipped at the ROOT only: `pkg/build/`
 // is a package name in more than one real repository. A skipped path has no
 // record, so `coverage` reports it `excluded`, never silently.
-const ALWAYS_SKIP = /^(\.claude\/|dist\/|build\/|out\/|target\/(debug|release)\/)|(^|\/)(node_modules|vendor|__pycache__|\.next|\.nuxt|\.venv|venv|target\/classes)\/|\.(min|bundle|chunk)\.js$|\.d\.ts$|\.generated\.[A-Za-z]+$|\.pb\.go$|_pb2\.py$/;
+const ALWAYS_SKIP = /^(\.claude\/|dist\/|build\/|out\/|target\/(debug|release)\/)|(^|\/)(node_modules|vendor|__pycache__|\.next|\.nuxt|\.venv|venv|target\/classes)\/|\.(min|bundle|chunk)\.js$|\.generated\.[A-Za-z]+$|\.pb\.go$|_pb2\.py$/;
+
+// lorc 0.5.0 (W32d, C13): a `.d.ts` file is lang `ts` when a person wrote it
+// (`src/interfaces/user.d.ts`). A `.d.ts` under `lib/` at the root or under
+// `@types/` is generated or installed, so it is skipped. A `.d.ts` beside a code
+// file with the same stem duplicates every symbol of that module (v1.8.2 W2),
+// so `detect` removes it (`dropPairedDts`).
+const DTS_SKIP = /^lib\/.*\.d\.ts$|(^|\/)@types\/.*\.d\.ts$/;
+const DTS_PAIR = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
+function dropPairedDts(files, langs) {
+  for (const rel of [...files.keys()]) {
+    if (!/\.d\.ts$/.test(rel)) continue;
+    const stem = rel.slice(0, -5);
+    if (DTS_PAIR.some((e) => files.has(stem + e))) {
+      files.delete(rel);
+      langs.delete(rel);
+    }
+  }
+}
 
 function graphPaths(claudeDir) {
   const dir = path.join(claudeDir, "orc", "graph");
@@ -145,7 +165,9 @@ function makeFilter(ignore) {
   const res = (Array.isArray(ignore) ? ignore : []).filter(Boolean).map(globRe);
   return (rel) => {
     if (ALWAYS_SKIP.test(rel)) return null;
+    if (DTS_SKIP.test(rel)) return null;
     if (res.some((re) => re.test(rel))) return null;
+    if (ENV_FILE.test(rel)) return "env";
     if (I18N.test(rel)) return "i18n";
     return LANG_BY_EXT[path.extname(rel).toLowerCase()] || null;
   };
@@ -244,6 +266,11 @@ function readIndex(claudeDir, meta) {
   return null;
 }
 
+// lorc 0.5.0 (W34e): the bytes that this process wrote into the store.
+// `graphUpdate` sets it to 0 at its start and reports it as `written_bytes`.
+// A content-addressed file that exists already is not written, so it adds 0.
+let writtenBytes = 0;
+
 // Windows can refuse a rename for a moment while another process has the
 // target open (a reader mid-parse). A short retry is the whole remedy.
 function atomicWrite(file, text) {
@@ -252,6 +279,7 @@ function atomicWrite(file, text) {
   for (let i = 0; ; i++) {
     try {
       fs.renameSync(tmp, file);
+      writtenBytes += Buffer.byteLength(text);
       return;
     } catch (e) {
       if (i >= 5 || (e.code !== "EPERM" && e.code !== "EBUSY" && e.code !== "EACCES")) {
@@ -462,6 +490,7 @@ function detect(root, opts) {
       if (shas[i]) files.set(rel, shas[i]);
     });
   }
+  dropPairedDts(files, langs);
   let headSha = g ? readGitHead(g) : undefined;
   if (headSha === undefined) {
     const head = git(root, ["rev-parse", "HEAD"]);
@@ -720,9 +749,9 @@ function extractAll(items, root) {
   const t0 = Date.now();
   const main = [];
   const rest = [];
-  // i18n items take the fast key scan: cheap, but large in bytes, so they
+  // i18n, env and sql items take the fast key scan: cheap, but large in bytes, so they
   // would skew the byte balance. They stay here with py/go.
-  for (const it of items) (it.lang === "py" || it.lang === "go" || it.lang === "i18n" ? main : rest).push(it);
+  for (const it of items) (it.lang === "py" || it.lang === "go" || it.lang === "i18n" || it.lang === "env" || it.lang === "sql" ? main : rest).push(it);
   let k = workerCount(rest.length);
   if (k && X._findTypeScript(root) && !process.env.ORC_GRAPH_NO_BORROW) k = 0;
   if (!k) return { out: X.extractBatch(items, { root }), workers: 0, ms: Date.now() - t0 };
@@ -750,6 +779,7 @@ function extractAll(items, root) {
 // reader that holds the old meta still reads the old buckets.
 function graphUpdate(claudeDir, root, opts) {
   const t0 = Date.now();
+  writtenBytes = 0;
   const ph = phaser();
   const say = opts.say || (() => {});
   if (!opts.enabled && opts.ifEnabled) return { ok: true, enabled: false, state: "off", exit: 3 };
@@ -825,6 +855,7 @@ function graphUpdate(claudeDir, root, opts) {
         state: "unchanged",
         files: d.files.size,
         symbols: prevMeta.symbols || 0,
+        modules: prevMeta.modules || 0,
         generation: prevMeta.generation,
         gen_id: prevMeta.gen_id,
         route: route.route,
@@ -837,6 +868,7 @@ function graphUpdate(claudeDir, root, opts) {
         skipped: Object.values(prev).filter((f) => f && f.skipped).length,
         engine_upgrade: false,
         head_commit: d.head,
+        written_bytes: writtenBytes,
         ms: Date.now() - t0,
         ...(PHASES ? { phases: { ...ph.all, ...(route.phases || {}), noop: ph("noop") } } : {}),
         exit: 0,
@@ -942,8 +974,16 @@ function graphUpdate(claudeDir, root, opts) {
     }
     const index = { schema: SCHEMA, engine: ENGINE, by_file: byFile };
 
+    // lorc 0.5.0 (W34e): `symbols` does NOT count the `module` records (one
+    // per file that has one). `modules` is that count, so all = symbols + modules.
     let symbols = 0;
-    for (const v of Object.values(byFile)) symbols += (v.symbols || []).filter((s) => s.kind !== "module").length;
+    let modules = 0;
+    for (const v of Object.values(byFile)) {
+      for (const x of v.symbols || []) {
+        if (x.kind === "module") modules++;
+        else symbols++;
+      }
+    }
 
     ph("index_buckets");
     const meta = {
@@ -955,6 +995,7 @@ function graphUpdate(claudeDir, root, opts) {
       updated_at: stamp(new Date()),
       files: d.files.size,
       symbols,
+      modules,
       // The number goes up only when the index on disk changes, so a reader
       // that saw generation N is looking at exactly the index that wrote N.
       generation: ((prevMeta && prevMeta.generation) || 0) + 1,
@@ -994,6 +1035,7 @@ function graphUpdate(claudeDir, root, opts) {
       ...(migrate ? { from: prevMeta.engine || null } : {}),
       files: d.files.size,
       symbols,
+      modules,
       generation: meta.generation,
       gen_id: meta.gen_id,
       route: resolveRoute.route,
@@ -1008,6 +1050,7 @@ function graphUpdate(claudeDir, root, opts) {
       skipped,
       engine_upgrade: migrate,
       head_commit: d.head,
+      written_bytes: writtenBytes,
       ms: Date.now() - t0,
       ...(PHASES ? { phases: { ...ph.all, ...(resolveRoute.phases || {}), ...(ex.detail ? { extract_detail: ex.detail } : {}) } } : {}),
       exit: 0,
@@ -1154,6 +1197,7 @@ module.exports = {
   isFormat1,
   writeAddressed,
   namesIn,
+  _makeFilter: makeFilter,
   _gitDirOf: gitDirOf,
   _readGitIndex: readGitIndex,
   readIndex,

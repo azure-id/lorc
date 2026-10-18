@@ -519,6 +519,38 @@ function countedNamed(text, g) {
   return [...new Set(out)];
 }
 
+// Back ends: the layer of a path by its folders and its name (api · data · worker · wiring · logic).
+const WIRE_STEMS = /^(init|app|main|server|wiring|container|bootstrap|module|di|routes|router)$/i;
+const WORKER_NOUN = /^(jobs?|workers?|consumers?|queues?|schedulers?|crons?)$/i;
+const stemOf = (f) => path.posix.basename(String(f)).replace(/\.[^.]+$/, "");
+function beKey(f) {
+  const parts = String(f).replace(/\\/g, "/").split("/");
+  const dirs = parts.slice(0, -1);
+  const stem = stemOf(f);
+  if (dirs.some((x) => /^(workers?|jobs?|queues?|consumers?|processors?|schedulers?|crons?)$/i.test(x)) || /(worker|processor|consumer|job|queue|scheduler)s?$/i.test(stem)) return "worker";
+  if (dirs.some((x) => /^(controllers?|handlers?|routes?|routers?|middlewares?|validators?|endpoints?|resolvers?)$/i.test(x)) || /(controller|handler|router|routes?)$/i.test(stem)) return "api";
+  if (dirs.some((x) => /^(repositor(y|ies)|models?|entit(y|ies)|migrations?|dao|db|database|persistence)$/i.test(x))) return "data";
+  if (WIRE_STEMS.test(stem) || dirs.some((x) => /^(container|app|di)$/i.test(x))) return "wiring";
+  return "logic";
+}
+
+// The repo paths the doc names: new files (not in the repo) and existing wiring / worker files.
+// Tests, docs, .sql and .proto files do not count. A short path ("schemas/common.ts") that ends
+// a repo path is an existing file.
+function docFiles(root, text, g) {
+  const out = { newPaths: [], wirePaths: [] };
+  const rels = g.rels || [];
+  const relSet = new Set(rels);
+  for (const p of (text.doc && text.doc.paths) || []) {
+    if (TEST_PATH.test(p) || TH.kindOf(p) === "doc" || /\.(sql|proto|md|txt|rst)$/i.test(p)) continue;
+    let exists = relSet.has(p) || rels.some((r) => r.endsWith("/" + p));
+    if (!exists) { try { exists = fs.existsSync(path.join(root || ".", p)); } catch (_) { exists = false; } }
+    if (!exists) out.newPaths.push(p);
+    else if (WIRE_STEMS.test(stemOf(p)) || beKey(p) === "worker") out.wirePaths.push(p);
+  }
+  return out;
+}
+
 // Weighted geometric mean: counts are skewed, so blend them on a log scale.
 function blend(a, b, w) { return Math.exp((1 - w) * Math.log(Math.max(1, a)) + w * Math.log(Math.max(1, b))); }
 
@@ -557,13 +589,14 @@ function estimate(text, g, h) {
   const container = text.creates.some((c) => /^(page|screen|view|flow|wizard|shell|layout|dashboard)$/.test(c.noun));
   const pieces = text.creates.filter((c) => c.layer === "ui" || c.layer === "logic").length;
   let hosts = 0;
+  const hostAdded = [];
   // The request extends an EXISTING container ("step 2 of the flow; step 1 already exists").
   const extendsExisting = !container && /\b(flow|shell|page|wizard|stepper|screen|view)\b/i.test(text.raw || "")
     && /\b(already exists?|already built|existing|sudah ada)\b/i.test(text.raw || "");
   if (pieces && !container && g.hosts.length) {
     const ratio = (h.wiring && h.wiring.ratio) || 2;
     const want = Math.min(extendsExisting ? 1 : 3, g.hosts.length, Math.max(1, Math.round(pieces * ratio)));
-    for (const f of g.hosts) { if (hosts >= want) break; if (!changed.has(f)) { changed.add(f); hosts++; } }
+    for (const f of g.hosts) { if (hosts >= want) break; if (!changed.has(f)) { changed.add(f); hostAdded.push(f); hosts++; } }
   }
   // Placeholders (an unresolved edit, the state holder, elements) are absorbed by a real file of
   // the feature, or by the existing container the request extends: they add 0 files.
@@ -605,7 +638,20 @@ function estimate(text, g, h) {
   const cal = h.calibration || { factor: 1, learned: false };
   if (cal.learned && Math.abs(cal.factor - 1) >= 0.1) { est *= cal.factor; parts.push(`calibrated ×${cal.factor} from ${cal.n} runs`); }
   est = Math.max(1, Math.round(est));
+  // Back end with a doc: the new files and the wiring / worker files the doc names are a floor.
+  let df = null;
+  let docLine = null;
+  if (g.uiRepo === false) {
+    df = docFiles(g.root, text, g);
+    const n = df.newPaths.length + df.wirePaths.length;
+    if (n > 0) {
+      const floor = Math.min(12, n);
+      est = Math.max(est, floor);
+      docLine = `doc: ${df.newPaths.length} new file(s), ${df.wirePaths.length} wiring / worker file(s) named → ≥ ${floor} files`;
+    }
+  }
   why.push(`~${est} source files (${parts.join(", ")})${newUnits.length ? `: ${newUnits.slice(0, 3).join(", ")}` : ""}`);
+  if (docLine) why.push(docLine);
   if (an) why.push(`analog: ${an.file} (${an.files} files)`);
   if (pr) why.push(`history prior: ${pr.cue} median ${pr.median} (${pr.k} commits)`);
   if (blast) why.push(`${blast} caller file(s) must change (${text.cues.signature ? "signature" : text.cues.mechanical ? "rename" : "refactor"})`);
@@ -613,14 +659,20 @@ function estimate(text, g, h) {
   if (docUnits) why.push(`requirement doc ${text.doc.lines} lines → +${docUnits} sub-component(s)`);
   if (hosts) why.push(`+${hosts} feature file(s) wire the new piece in (${path.posix.basename(g.feature)}/, ratio ${h.wiring.ratio}${h.wiring.learned ? " from git" : ""})`);
   if (ripple) why.push(`co-change: +${ripple} file(s) that changed together before`);
-  return { est, raw, structural, added, changed: [...changed], blast, ripple, hosts, calibration: cal.learned ? cal : null, why };
+  return { est, raw, structural, added, changed: [...changed], blast, ripple, hosts, calibration: cal.learned ? cal : null, why,
+    ...(df ? { newPaths: df.newPaths, wirePaths: df.wirePaths, hostAdded } : {}) };
 }
 
 // Independent areas: project folders (a monorepo's client and server), or the server-side
 // layers (ui · api · data) the work reaches. Client-side API calls are not an area.
-function areasOf(text, g) {
+function areasOf(text, g, e) {
   const layers = new Set();
   for (const l of [...text.layers, ...g.layers]) if (l === "ui" || l === "data" || (l === "api" && (text.server || g.layers.includes("api")))) layers.add(l);
+  // Back end: a worker / job / queue entry point is an area too.
+  if (g.uiRepo === false) {
+    const ps = [...((e && e.newPaths) || []), ...((e && e.wirePaths) || []), ...text.names.filter((n) => n.includes("/"))];
+    if (ps.some((p) => beKey(p) === "worker") || text.creates.some((c) => WORKER_NOUN.test(c.noun))) layers.add("worker");
+  }
   const projects = g.projects.filter((p) => p !== ".").length || 1;
   return { n: Math.max(projects, layers.size || 1), layers: [...layers], projects: g.projects };
 }
@@ -634,7 +686,7 @@ function decide(text, g, h, e) {
   const nc = fresh.length - types + Math.ceil(types / 2);
   if (nc === 1) rows.push({ s: 37, why: `1 new component (${fresh[0].noun})` });
   if (nc >= 2) rows.push({ s: Math.min(70, 50 + nc * 4), why: `${nc} new components` });
-  const a = areasOf(text, g);
+  const a = areasOf(text, g, e);
   if (a.n > 3) rows.push({ s: 80, why: `${a.n} independent areas` });
   else if (a.n >= 2) rows.push({ s: 52 + a.n * 3, why: `${a.n} independent areas (${(a.projects.length > 1 ? a.projects : a.layers).join(", ")})` });
   // Migration and ordered steps: complex only with evidence beyond a word in the text.
@@ -726,9 +778,51 @@ function testsOf(g, files) {
   return [...out].slice(0, 3);
 }
 
+// Back-end split: units keyed api · logic · data · worker · wiring. A group with no substantive
+// unit (only DI, app mount or route registration) merges into the smallest group that has one.
+function splitBe(text, g, e, max) {
+  const items = [];
+  const seen = new Set();
+  const add = (unit, key, sub) => { if (seen.has(unit)) return; seen.add(unit); items.push({ unit, key, sub }); };
+  const newPaths = e.newPaths || [];
+  const wirePaths = e.wirePaths || [];
+  const hostAdded = new Set(e.hostAdded || []);
+  const docN = newPaths.length + wirePaths.length;
+  for (const p of newPaths) add(p, beKey(p), true);
+  for (const p of wirePaths) { const k = beKey(p); add(p, k, k === "worker"); }
+  for (const f of e.changed) {
+    if (PLACEHOLDER.test(f) || !f.includes("/")) continue;
+    if (docN && hostAdded.has(f)) continue;
+    add(f, beKey(f), !hostAdded.has(f));
+  }
+  for (const c of newOnes(text, g)) add(c.text || c.noun, WORKER_NOUN.test(c.noun) ? "worker" : c.layer === "api" ? "api" : c.layer === "data" ? "data" : "logic", true);
+  const groups = new Map();
+  for (const it of items) (groups.get(it.key) || groups.set(it.key, []).get(it.key)).push(it);
+  const all = [...groups.entries()].map(([key, its]) => ({ key, its }));
+  const list = all.filter((x) => x.its.some((it) => it.sub));
+  if (list.length < 2) return [];
+  for (const x of all.filter((y) => !list.includes(y))) {
+    const small = list.reduce((a, b) => (b.its.length < a.its.length ? b : a));
+    small.its.push(...x.its);
+  }
+  list.sort((a, b) => b.its.length - a.its.length);
+  while (list.length > max) {
+    const last = list.pop();
+    list[list.length - 1].its.push(...last.its);
+  }
+  if (list.length < 2) return [];
+  return list.map((x, i) => {
+    const units = x.its.map((it) => it.unit).slice(0, 8);
+    const files = units.filter((u) => u.includes("/") && TH.isSrc(u));
+    const tests = testsOf(g, files).filter((t) => !units.includes(t));
+    return { g: `G${i + 1}`, layer: x.key, units, ...(tests.length ? { tests } : {}) };
+  });
+}
+
 function split(text, g, e, tier) {
   if (tier !== "high" && tier !== "complex") return [];
   const max = Math.min(3, CAP[tier]);
+  if (g.uiRepo === false) return splitBe(text, g, e, max);
   const items = [];
   const fresh = newOnes(text, g);
   for (const c of fresh) items.push({ unit: c.text || c.noun, key: c.layer === "logic" ? "ui" : c.layer, page: CONTAINER.test(c.noun) && c.noun !== "dashboard", fresh: true });
@@ -797,21 +891,55 @@ function executor(root, text, g, e, d, conf, groups, opts) {
   const fan = 5 * Math.min(Math.ceil(e.blast / 4), 3);
   const U = conf >= 0.7 ? 0 : conf >= 0.45 ? 6 : 12;
   let raw = B + N + L + T + fan + U;
-  const risk = g.risky.length ? text.risk.concat(["path"]) : (text.risk.length && (text.server || text.data) ? text.risk : []);
+  // A risky file counts only when the work changes it (an existing table definition the work
+  // only reads is not a risk): a changed file, a counted named file or a new doc path.
+  const touched = new Set([...e.changed, ...countedNamed(text, g)]);
+  const riskFile = g.risky.find((f) => touched.has(f)) || (e.newPaths || []).find((f) => RISKY.test(f)) || null;
+  const risk = riskFile ? text.risk.concat(["path"]) : (text.risk.length && (text.server || text.data) ? text.risk : []);
   const floor = risk.length ? 70 : 0;
-  const score = Math.max(raw, floor);
+  // High work is never haiku.
+  const tierFloor = (d.tier === "high" || d.tier === "complex") && !d.mechanical ? 30 : 0;
+  const score = Math.max(raw, floor, tierFloor);
   let pick = score < 30 ? "haiku-5-high" : score < 65 ? "sonnet-5-med" : score < 90 ? "opus-5-low" : "opus-5-med";
-  const out = { pick, score, formula: `${B}+${N}+${L}+${T}+${fan}+${U} = ${raw}${floor && raw < floor ? " → risk floor 70" : ""}`, risk };
+  const note = floor && raw < floor ? " → risk floor 70" : tierFloor && raw < tierFloor ? " → tier floor 30" : "";
+  const out = { pick, score, formula: `${B}+${N}+${L}+${T}+${fan}+${U} = ${raw}${note}`, risk, ...(riskFile ? { riskFile } : {}) };
   if (opts.history !== false) {
     const rec = TH.executorRecord(root, d.tier, { runs: opts.runs });
     const cheaper = EXECUTORS.slice(0, EXECUTORS.indexOf(pick)).find((x) => rec[x] && rec[x].n >= 3 && rec[x].lb >= 0.55);
-    if (cheaper && !floor) { out.pick = cheaper; out.record = `${cheaper}: ${rec[cheaper].ok} of ${rec[cheaper].n} clean at ${d.tier}`; }
+    if (cheaper && !floor && !(tierFloor && cheaper === "haiku-5-high")) { out.pick = cheaper; out.record = `${cheaper}: ${rec[cheaper].ok} of ${rec[cheaper].n} clean at ${d.tier}`; }
   }
   if (d.tier === "low") out.inline = true;
   return out;
 }
 
 // The engine. opts: { doc, history (false = no git, no runs), cache, runs, graph }.
+// The repo has UI files: >= 3 tracked UI files (not tests), or a source folder for views
+// (views, pages, screens, components, templates) with >= 3 files or with a UI file. The graph file set is used
+// when it is there, else `git ls-files`. No file list gives null (unknown: change nothing).
+const UI_EXT = /\.(vue|jsx|tsx|svelte|html|erb|cshtml|razor|xaml|storyboard|xib)$/i;
+const UI_DIR = /(^|\/)(views|pages|screens|components|templates)\//;
+const TEST_PATH = /(^|\/)(tests?|__tests__|spec|e2e)\/|[._-](test|spec)\.[a-z]+$/i;
+function uiRepoOf(root, model) {
+  let files = model && model.fileSet && model.fileSet.size ? [...model.fileSet] : null;
+  if (!files) {
+    const ls = gitOut(root, ["ls-files", "-z"]);
+    if (ls === null) return null;
+    files = ls.split("\0").filter(Boolean);
+    if (!files.length) return null;
+  }
+  files = files.map((f) => f.replace(/\\/g, "/")).filter((f) => !TEST_PATH.test(f));
+  if (files.filter((f) => UI_EXT.test(f)).length >= 3) return true;
+  const dirs = new Map();
+  for (const f of files) {
+    const m = UI_DIR.exec(f);
+    if (!m) continue;
+    const k = f.slice(0, m.index + m[0].length);
+    dirs.set(k, (dirs.get(k) || 0) + 1);
+    if (UI_EXT.test(f)) return true;
+  }
+  return [...dirs.values()].some((n) => n >= 3);
+}
+
 function compute(root, request, opts = {}) {
   const t0 = Date.now();
   // The graph is loaded once: opts.loaded (prep's graph), else loadGraph. An injected graph part
@@ -827,6 +955,12 @@ function compute(root, request, opts = {}) {
   };
   const text = TT.parse(request, { root, doc: opts.doc, known });
   text.raw = String(request || "");
+  // No UI files in the repo: UI nouns (such as "card") count as logic, before areas, score, cap and split.
+  const uiRepo = uiRepoOf(root, model);
+  if (uiRepo === false) {
+    for (const c of text.creates) if (c.layer === "ui") c.layer = "logic";
+    text.layers = text.layers.filter((l) => l !== "ui");
+  }
   // The git log is read once (cached by HEAD) and shared by the git part and the history part.
   let list;
   const commits = () => (list !== undefined ? list : (list = opts.history === false ? null : TH.commits(root, { cache: opts.cache !== false })));
@@ -845,6 +979,7 @@ function compute(root, request, opts = {}) {
   }
   const g = Object.assign({ ok: false, source: "graph", core: [], named: {}, blast: [], hosts: [], reuse: {}, feature: null, tests: 0, locales: 0, router: null, api: null, layers: [], projects: [], risky: [] }, part);
   g.root = root;
+  g.uiRepo = uiRepo;
   const anchors = [...new Set([...countedNamed(text, g), ...(g.router ? [g.router] : []), ...(g.api ? [g.api] : []), ...g.core.slice(0, 2)])];
   const h = opts.history === false
     ? { commits: 0, cochange: [], similar: { n: 0, median_src: null, samples: [] }, runs: { n: 0 }, wiring: TH.wiringRatio(null), calibration: { factor: 1, n: 0, learned: false } }
@@ -857,21 +992,29 @@ function compute(root, request, opts = {}) {
   const why = [...d.why, ...e.why];
   if (d.areas.n >= 2 && !why.some((w) => /areas/.test(w))) why.push(`${d.areas.n} areas`);
   if (g.locales && text.layers.includes("ui")) why.push(`+ tests and up to ${Math.min(g.locales, 6)} locale file(s), not counted`);
-  if (ex.risk.length) why.push(`risk: ${ex.risk.filter((r) => r !== "path").join(", ") || "path"}${g.risky.length ? ` (${g.risky[0]})` : ""}`);
+  if (ex.risk.length) why.push(`risk: ${ex.risk.filter((r) => r !== "path").join(", ") || "path"}${ex.riskFile ? ` (${ex.riskFile})` : ""}`);
+  if (uiRepo === false) why.push("no UI files: UI nouns count as logic");
   if (!g.ok) why.push(`no graph: ${g.reason || "?"}`);
   else if (g.source === "git") why.push(`no graph (${g.graph_reason || "?"}): related files from git paths`);
   return {
     tier: d.tier, score: d.score, conf, cap: CAP[d.tier], groups: sp.length || (d.tier === "low" ? 0 : 1),
     est_files: e.est, executor: ex.pick, why: why.slice(0, 6), split: sp,
     detail: {
-      text: { words: text.words, creates: text.creates, elements: text.elements, modifies: text.modifies, wires: text.wires, names: text.names, layers: text.layers, cues: Object.keys(text.cues).filter((k) => text.cues[k]), risk: text.risk, ui_states: text.ui_states, doc: text.doc },
+      text: { words: text.words, creates: text.creates, elements: text.elements, modifies: text.modifies, wires: text.wires, names: text.names, layers: text.layers, cues: Object.keys(text.cues).filter((k) => text.cues[k]), risk: text.risk, ui_states: text.ui_states, doc: docOut(text.doc, uiRepo) },
       graph: { ok: g.ok, source: g.source, reason: g.reason, store: g.store, files: g.files, core: g.core, feature: g.feature, hosts: g.hosts, named: g.named, blast: g.blast, router: g.router, api: g.api, layers: g.layers, projects: g.projects, tests: g.tests, locales: g.locales, risky: g.risky, specific: g.specific, analog: g.analog || null },
       history: { commits: h.commits, cochange: h.cochange, similar: h.similar, prior: h.prior, runs: h.runs, wiring: h.wiring, calibration: h.calibration },
-      estimate: { raw: e.raw, structural: e.structural, added: e.added, changed: e.changed, blast: e.blast, ripple: e.ripple, hosts: e.hosts, calibration: e.calibration },
-      areas: d.areas, history_shift: d.history, mechanical: d.mechanical, executor: ex,
+      estimate: { raw: e.raw, structural: e.structural, added: e.added, changed: e.changed, blast: e.blast, ripple: e.ripple, hosts: e.hosts, calibration: e.calibration, ...(e.newPaths ? { newPaths: e.newPaths, wirePaths: e.wirePaths, hostAdded: e.hostAdded } : {}) },
+      ui_repo: uiRepo, areas: d.areas, history_shift: d.history, mechanical: d.mechanical, executor: ex,
     },
     ms: Date.now() - t0,
   };
+}
+
+// The doc facts in the JSON. `paths` is a back-end fact: a repo with UI files does not show it.
+function docOut(doc, uiRepo) {
+  if (!doc || uiRepo === false) return doc;
+  const { paths: _p, ...rest } = doc;
+  return rest;
 }
 
 // The compact form prep puts in its JSON (the full answer goes to prep.json).
@@ -969,4 +1112,4 @@ function cmd(argv = []) {
   return 0;
 }
 
-module.exports = { TIERS, CAP, fileScore, tierOf, sizeTier, layerOf, loadGraph, featureFolder, structuralAnalog, graphPart, historyPart, estimate, decide, confidence, split, executor, compute, brief, evaluate, cmd };
+module.exports = { TIERS, CAP, fileScore, tierOf, sizeTier, layerOf, loadGraph, featureFolder, structuralAnalog, beKey, docFiles, graphPart, historyPart, estimate, decide, confidence, split, executor, compute, brief, evaluate, cmd };

@@ -10,12 +10,14 @@ You implement ONE task. Your prompt names a slice file. Read it first. It holds 
 files, graph anchors, the code pattern, the rules card, the commands and the return shape.
 
 Fewer messages
+- Files: create each new file with ONE Write. Never `cat > f <<EOF`, `>>` or `tee` (a quote breaks the command).
 - Start with ONE Read of the slice's read file. Then read only what it lacks, all of it in ONE
   batched message.
 - Batch. Every message re-reads your whole context, so fewer messages win. Put all independent
   tool calls of a step in ONE message as parallel calls: the reads you need (several Read calls
   with offset/limit, or one Bash with several `sed -n 'a,bp'` ranges), and edits to DIFFERENT
-  files (keys, locale files, router) together.
+  files (keys, locale files, router) together. Put all the Edits of a step in ONE message, also
+  several Edits to the same file.
 - Write a new file complete in ONE Write. Do not patch a file you just wrote with a row of small
   Edits; when it needs many changes, rewrite it once.
 - Read ranges. A file over 150 lines: read only the range the slice, its Context section or a
@@ -24,7 +26,8 @@ Fewer messages
 
 Rules
 1. Stay inside the slice's files. Edit another file only when the task cannot be done
-   otherwise; name it in `files_changed` with the reason.
+   otherwise; name it in `files_changed` with the reason. A typecheck error only in a file that another group creates is
+   not yours: do not wait (no sleep loop); name it in `tests.note`; `passed` follows your own tests.
 2. Read the slice. Its Known facts are true — do not re-read files to learn them again.
    Its Reference code is verbatim — do not re-read those ranges. Then read the other
    "Model on these" refs and the anchored ranges. Explore further ONLY
@@ -33,6 +36,8 @@ Rules
    The slice's Context and Requirement sections are complete for this task. Read only the
    ranges it lists, and only when you must copy code (Read with offset/limit). Never cat or
    Read a whole file the slice names. Never open the requirement file again.
+   The slice's Mirror rows show the files of the closest feature: follow that layout (where the
+   DI goes, how the tests start).
 3. Match the pattern's Conventions. Never break an Invariant. `HOUSE-RULES.md` beats the rest.
 4. Plan every edit first, then write each file in ONE Write (or one Edit per change site).
    Do not rewrite a file you already wrote unless a test fails. Batch your edits. No comment that restates the code. No abstraction the task does not need.
@@ -40,9 +45,12 @@ Rules
    python or perl string replacement (a scripted replace once broke a SCSS line and the app did
    not boot). After you edit a `<style>` block or a style file, read that block once and check
    every variable it uses is defined.
-5. Tests: write or update them, then run the slice's test command. At most **3 test runs in
-   total**. Before a re-run, read the WHOLE failure and fix every cause at once. Run the build or
-   typecheck once, at the end. Never delete, skip or weaken a failing test to get green: fix
+5. Before you write a test, read the fields of the error type the code throws and the setup of
+   one existing test of the same layer (Tests to copy or Mirror).
+   Tests: write or update them, then run the slice's test command. At most **3 test runs in
+   total**. Before a re-run, read the WHOLE failure and fix every cause at once. At the end, run the
+   build or typecheck once and the slice's lint command once on every file you changed or created
+   (tests too); fix what lint reports. Never delete, skip or weaken a failing test to get green: fix
    the cause, or return `partial` and name the test.
    Coverage: run the slice's coverage command, then `lorc cov --bar <n> --json` (not a test
    run). Judge the bar on `lines` and `src_branches` — `branches` also counts arms that a

@@ -18,7 +18,7 @@ const VENDOR = path.join(__dirname, "graph");
 const G = () => require(path.join(VENDOR, "graph.js"));
 
 const USAGE =
-  "Usage: lorc graph where | status [--heal] | update | upgrade | gc\n" +
+  "Usage: lorc graph where | status [--heal] | update [--if-exists] | scan | upgrade | gc\n" +
   "       lorc graph ctx <symbol…> [--anchors] [--focus=<w>] | ctx --for-slice <a,b> [--focus=<w>] [--anchors]\n" +
   "       lorc graph map --focus=<words> [--budget N] | changes [--files=<a,b>] [--base <ref>]\n" +
   "       [--json] [--brief] [--dir <path>]";
@@ -113,15 +113,19 @@ function finisher(a, store) {
 
 // ── own: the engine in bin/lib/graph ──────────────────────────────────────
 const NONE = "graph: none — no index yet (run: lorc graph update)";
+const SUGGEST = "lorc graph scan";
+const SUGGEST_LINE = "graph: none — run: lorc graph scan (builds the code graph once, zero tokens)";
+const SKIPPED = "graph: none — skipped (run: lorc graph scan)";
 const upgradedLine = (u) => `graph: upgraded ${u.from} → ${G().ENGINE} (${u.reused} reused, ${u.parsed} parsed, ${u.ms} ms)`;
 
 // `status [--heal]` → { r, line }. ORC's heal rule: a NONE or DRIFTED store
 // (a format-1 store too) is built, updated or upgraded first.
-function ownStatus(claudeDir, root, ignore, heal) {
+// buildNone false (lorc's own heal): a NONE store is not built; lorc suggests a scan.
+function ownStatus(claudeDir, root, ignore, heal, buildNone = true) {
   const E = G();
   let r = E.graphStatus(claudeDir, root, { enabled: true, ignore });
   let healed = null;
-  if (heal && (r.state === "none" || r.state === "drifted")) {
+  if (heal && ((buildNone && r.state === "none") || r.state === "drifted")) {
     const u = E.graphUpdate(claudeDir, root, { enabled: true, ifEnabled: true, ignore });
     healed = u.exit === 0
       ? { state: u.state, ...(u.from ? { from: u.from } : {}), added: u.added, changed: u.changed, deleted: u.deleted, parsed: u.parsed, reused: u.reused, engine_upgrade: u.engine_upgrade, ms: u.ms }
@@ -148,6 +152,7 @@ function ownStatus(claudeDir, root, ignore, heal) {
         `(${b.added || 0} added · ${b.changed || 0} changed · ${b.deleted || 0} deleted); hints only, code wins (run: lorc graph update)`,
   };
   let line = lines[r.state];
+  if (r.state === "none" && !buildNone) { r.suggest = SUGGEST; line = SUGGEST_LINE; }
   if (healed && healed.parsed !== undefined) {
     const moved = healed.added + healed.changed + healed.deleted;
     const size = `${plural(r.files, "file")} · ${plural(r.symbols, "symbol")}`;
@@ -192,6 +197,10 @@ function runOwn(argv, root, sel, extra = {}) {
   }
 
   if (a.sub === "update") {
+    // --if-exists (lorc's own automatic paths): no store → write nothing, exit 0.
+    if (a.has("--if-exists") && !metaNow()) {
+      return finish({ ok: true, state: "none", skipped: true, suggest: SUGGEST, exit: 0 }, SKIPPED);
+    }
     const r = E.graphUpdate(claudeDir, root, { enabled: true, ifEnabled: false, ignore, say: null });
     return finish(r, updateLine(r));
   }
@@ -377,6 +386,15 @@ function spawnOrc(argv, root, sel) {
 
 function runDelegate(argv, root, sel, _home) {
   const a = parse(argv);
+  // ORC does not know --if-exists. lorc handles it here: no ORC store → skip and
+  // do not call ORC; else call `orc graph update` without the flag.
+  if (a.sub === "update" && a.has("--if-exists")) {
+    const dir = path.join(root, ".claude", "orc", "graph");
+    if (!paths.readJson(path.join(dir, "meta.json"), null)) {
+      return finisher(a, { mode: "delegate", dir })({ ok: true, state: "none", skipped: true, suggest: SUGGEST, exit: 0 }, SKIPPED);
+    }
+    argv = argv.filter((x) => x !== "--if-exists");
+  }
   const { obj, why, status } = spawnOrc(argv, root, sel);
   if (!obj) {
     const own = { ...sel, mode: "own", claudeDir: path.join(root, ".claude", "lorc") };
@@ -394,7 +412,8 @@ function sync(_root, _opts) {
 }
 
 // ── heal: `lorc graph status --heal --json`, in process ───────────────────
-// It RETURNS the object that command prints, and prints nothing.
+// It RETURNS the object that command prints, and prints nothing. A NONE store
+// is not built: the result has `suggest: "lorc graph scan"` (the user runs it).
 function heal(root, { home } = {}) {
   const sel = selectStore(root, { home });
   if (sel.mode === "delegate") {
@@ -406,7 +425,7 @@ function heal(root, { home } = {}) {
   }
   const E = G();
   const ignore = list(orcConfig(root, "code_graph_ignore"));
-  const { r, line } = ownStatus(sel.claudeDir, root, ignore, true);
+  const { r, line } = ownStatus(sel.claudeDir, root, ignore, true, false);
   const out = shape(r, line, { mode: sel.mode, dir: E.graphPaths(sel.claudeDir).dir });
   return sel.fallback ? { ...out, fallback: sel.fallback } : out;
 }
@@ -417,6 +436,8 @@ function cmd(argv = [], _name, { home } = {}) {
   const dir = a.val("--dir");
   const root = dir ? path.resolve(dir) : paths.repoRoot();
   if (!a.sub || a.sub === "help") { process.stdout.write(USAGE + "\n"); return a.sub ? 0 : 1; }
+  // `scan` = `update`: the same handler and the same output, in both modes.
+  if (a.sub === "scan") return cmd(argv.map((x, i) => (i === argv.indexOf("scan") ? "update" : x)), _name, { home });
 
   if (a.sub === "where") {
     const sel = selectStore(root, { home });

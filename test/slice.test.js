@@ -213,3 +213,37 @@ test("0.4.1: a long ref with no range gets the card's range, or a read-a-range n
   assert.ok(md.includes("- src/small.js\n") || md.includes("- src/small.js\r\n"), md);
   assert.ok(!md.includes("// line 150"), "no inlined code");
 });
+
+test("0.5.2: a mirror row whose counterpart the task creates is in the Context", () => {
+  const e = repo({ "src/container/report.ts": "export interface ReportContainer {}\n" });
+  const pack = { mirror: [it("mirror", "src/container/report.ts", 1, 1, "symbols: ReportContainer 1 → src/container/va.ts (not in the doc)", { counterpart: "src/container/va.ts" })] };
+  const slug = withPack(e, pack);
+  const r = sliceLib.buildSlice(e.root, slug, "1", { title: "Add the va container", files: ["src/container/va.ts"] });
+  // The read plan prints the mirror range, thus the Context line for it drops (the 0.4.2 rule).
+  const md = fs.readFileSync(r.path, "utf8");
+  const plan = JSON.parse(fs.readFileSync(path.join(runs.runDir(e.root, slug), "plan-1.json"), "utf8")).plan;
+  assert.ok(plan.some((p) => p.file === "src/container/report.ts" && /mirror of src\/container\/va\.ts/.test(p.why)), JSON.stringify(plan));
+  assert.ok(/Read .+read-1.md/.test(md) && fs.readFileSync(path.join(runs.runDir(e.root, slug), "read-1.md"), "utf8").includes("ReportContainer"), md);
+  const other = sliceLib.buildSlice(e.root, slug, "2", { title: "Change add", files: ["src/math.js"] });
+  assert.ok(!fs.readFileSync(other.path, "utf8").includes("src/container/report.ts:1"));
+});
+
+test("0.5.2: a declared test file that does not exist yet is in the task's test line", () => {
+  const e = repo();
+  const slug = withPack(e, {});
+  const r = sliceLib.buildSlice(e.root, slug, "1", { title: "Add subtract", files: ["src/sub.js", "test/sub.test.js"] });
+  const md = fs.readFileSync(r.path, "utf8");
+  const line = (md.split(/\r?\n/).find((l) => l.startsWith("- tests for this task:")) || "");
+  assert.ok(line.includes("test/sub.test.js") && !/none found/.test(line), line);
+});
+
+test("0.5.2: a TS project with a tsconfig gets a typecheck line, not the build", () => {
+  const e = repo({
+    "package.json": JSON.stringify({ name: "fx", version: "1.0.0", scripts: { test: "node --test", build: "rimraf dist && tsc" }, devDependencies: { typescript: "5" } }, null, 2) + "\n",
+    "tsconfig.json": "{}\n",
+  });
+  const slug = withPack(e, {});
+  const md = fs.readFileSync(sliceLib.buildSlice(e.root, slug, "1", { title: "Change add", files: ["src/math.js"] }).path, "utf8");
+  assert.ok(/^- typecheck: npx tsc --noEmit\r?$/m.test(md), md);
+  assert.ok(!md.includes("rimraf"));
+});

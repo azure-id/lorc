@@ -10,8 +10,14 @@ const COMP_EXT = /\.(vue|jsx|tsx|svelte)$/i;
 const STYLE_EXT = /\.(scss|sass|css|less)$/i;
 const CLASS_GLOBS = ["*.vue", "*.scss", "*.sass", "*.css", "*.less", "*.svelte", "*.jsx", "*.tsx"];
 const LOCALE = /(^|\/)(i18n|l10n|locales?|lang|langs|translations?)\/[^/]+\.json$/i;
+// An env file holds secret values. The pack never reads it and never shows a line of it.
+const ENV_FILE = /(^|\/)\.env(\.[^/]*)?$/i;
 const TEST = /(^|\/)(tests?|__tests__|specs?)\/|\.(test|spec)\.[cm]?[jt]sx?$/i;
 const SRC = /\.([cm]?[jt]sx?|vue|svelte|py|go|rs|java|kt|rb|php|cs)$/i;
+// lorc 0.5.1: a Go test file (x_test.go) is a test too.
+const isTest = (f) => TEST.test(f) || /_test\.go$/i.test(f);
+const LAYER = /^(handlers?|services?|repositor(y|ies)|controllers?|models?|routes?|usecases?|domain|types?)$/i;
+const WIRE = /(wiring|container|init|app|main|server|bootstrap|routes?|module|di)\b/i;
 const STOP = new Set(("a an the and or of to in on at by for with from into onto as is are be been it its this that these those " +
   "there here then than so if else not no only all any each every some same like similar e g eg ie etc via per " +
   "i we you he she they them us our your their my me his her which what when where who how why also but too very " +
@@ -44,8 +50,10 @@ function makeCtx(root, loaded) {
   const ctx = { root, Q: loaded && loaded.Q, model: loaded && loaded.model, lines: new Map(), locales: new Map(), classUse: new Map() };
   ctx.files = git(root, ["ls-files"]).split("\n").map((s) => s.trim()).filter(Boolean);
   if (!ctx.files.length && ctx.model) ctx.files = [...ctx.model.fileSet];
+  ctx.files = ctx.files.filter((f) => !ENV_FILE.test(f));
   ctx.fileSet = new Set(ctx.files);
   ctx.read = (rel) => {
+    if (ENV_FILE.test(posix(rel))) return null;
     if (!ctx.lines.has(rel)) {
       let t = null;
       try { t = fs.readFileSync(path.join(root, rel), "utf8"); } catch (_) { t = null; }
@@ -135,6 +143,8 @@ function nounPhrases(text) {
       run = [];
     };
     for (const w of toks) {
+      // "top up" is one word. A file name writes it as "Topup" or "TopUp". Thus "up", "out" or "off" after a run word joins it.
+      if (run.length && (w === "up" || w === "out" || w === "off")) { run[run.length - 1] += "-" + w; continue; }
       if (!/^[a-z][a-z-]*$/.test(w) || STOP.has(w) || GENERIC.has(w) || w.length < 3) { flush(CUES.has(w)); continue; }
       run.push(w);
     }
@@ -173,16 +183,38 @@ function resolveSymbol(ctx, e) {
   if (!ctx.model) return [];
   const defs = (ctx.model.byName.get(e.name) || []).filter((s) => s.kind !== "module");
   if (!defs.length || defs.length > 6) return [];
-  return defs.slice(0, 3).map((s) => item("symbol", s.file, s.lines[0], Math.min(s.lines[1], s.lines[0] + 79), `${s.kind} ${s.name}`, `named "${e.name}"`, ctx, 6));
+  const s = defs[0];
+  if (defs.length === 1) return [item("symbol", s.file, s.lines[0], Math.min(s.lines[1], s.lines[0] + 79), `${s.kind} ${s.name}`, `named "${e.name}"`, ctx, 6)];
+  // lorc 0.5.1: the definitions of ONE name give ONE item. It lists every location and starts at the first.
+  const locs = defs.map((d) => `${path.posix.basename(d.file)}:${d.lines[0]}${d.lines[1] !== d.lines[0] ? "-" + d.lines[1] : ""}`);
+  const it = item("symbol", s.file, s.lines[0], Math.min(s.lines[1], s.lines[0] + 79), `${s.kind} ${s.name} → ${locs.join(", ")}`, `named "${e.name}"`, ctx, 6);
+  Object.defineProperty(it, "locs", { value: [...new Set(defs.map((d) => d.file))], enumerable: false });
+  return [it];
 }
 
 function resolveFile(ctx, e) {
   const n = posix(e.name).replace(/^\.\//, "");
   const hits = ctx.files.filter((f) => f === n || f.endsWith("/" + n)).slice(0, 3);
-  return hits.map((f) => {
+  return hits.flatMap((f) => {
     const ls = ctx.read(f) || [];
-    return item("file", f, 1, Math.max(1, ls.length), `file ${path.posix.basename(f)} (${ls.length} lines)`, `named "${e.name}"`, null, 7);
+    if (ls.length <= 400) return [item("file", f, 1, Math.max(1, ls.length), `file ${path.posix.basename(f)} (${ls.length} lines)`, `named "${e.name}"`, null, 7)];
+    // lorc 0.5.1: a big file gives no whole-file item. Give the lines that hold the URLs of the request, else a pointer.
+    const out = [];
+    for (const u of ctx.urlEnts || []) {
+      const re = urlRegex(u.name);
+      const i = ls.findIndex((l) => re.test(l));
+      if (i < 0 || out.some((x) => x.start === i + 1)) continue;
+      out.push(item("file", f, i + 1, Math.min(ls.length, i + 40), `section of ${path.posix.basename(f)} for ${u.name}`, `named "${e.name}"`, null, 7));
+      if (out.length >= 3) break;
+    }
+    if (out.length) return out;
+    return [item("file", f, 1, 1, `file ${path.posix.basename(f)} (${ls.length} lines) — read by section`, `named "${e.name}"`, null, 7)];
   });
+}
+// A URL as a regex: a ":param" or "{param}" segment matches any param form. The match stops at a segment end.
+function urlRegex(u) {
+  const segs = urlSegs(u).map((x) => (/^[:{*]/.test(x) ? "[:{]?[\\w-]+\\}?" : esc(x)));
+  return new RegExp("/" + segs.join("/") + "(?![\\w-])");
 }
 
 function resolveClasses(ctx, ents) {
@@ -270,17 +302,55 @@ function inStyle(ctx, rel, line) {
 const esc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 function urlSegs(u) { return String(u || "").split("?")[0].split("/").filter(Boolean); }
+const isParam = (x) => /^[:{*]/.test(x);
+// The count of leading path segments that match. A param segment matches any segment.
+function segMatch(want, have) {
+  let k = 0;
+  while (k < want.length && k < have.length && (want[k] === have[k] || isParam(want[k]) || isParam(have[k]))) k++;
+  return k;
+}
+// The server routes of the graph (the full path with the mounts when it is known). A test file has no routes.
+function serverRoutes(ctx) {
+  if (ctx.routes) return ctx.routes;
+  const out = [];
+  if (ctx.model) {
+    let rows = null;
+    if (ctx.Q && typeof ctx.Q.routeTable === "function") { try { rows = ctx.Q.routeTable(ctx.model); } catch (_) { rows = null; } }
+    if (rows) {
+      for (const r of rows) if (r.sym && !isTest(r.sym.file)) out.push({ file: r.sym.file, start: r.sym.lines[0], end: r.sym.lines[1], method: r.method, path: r.full || r.own, on: r.sym.on || "" });
+    } else {
+      for (const rel of Object.keys(ctx.model.byFile || {})) {
+        if (isTest(rel)) continue;
+        for (const s of ctx.syms(rel)) {
+          const m = s.kind === "route" && /^([A-Z]+) (.+)$/.exec(s.name);
+          if (m) out.push({ file: rel, start: s.lines[0], end: s.lines[1], method: m[1], path: m[2], on: s.on || "" });
+        }
+      }
+    }
+  }
+  ctx.routes = out;
+  return out;
+}
 function resolveUrl(ctx, e) {
   const want = urlSegs(e.name);
   const out = [];
+  // lorc 0.5.1: a URL resolves first to the server routes. The routes with the most shared segments win.
+  const routes = serverRoutes(ctx).map((r) => ({ r, k: segMatch(want, urlSegs(r.path)) })).filter((x) => x.k >= 2);
+  if (routes.length) {
+    const best = Math.max(...routes.map((x) => x.k));
+    for (const { r } of routes.filter((x) => x.k === best).slice(0, 3)) out.push(item("route", r.file, r.start, r.end, `route ${r.method} ${r.path}`, `URL "${e.name}"`, ctx, 6));
+    return out;
+  }
   if (ctx.model) {
     for (const rel of Object.keys(ctx.model.byFile || {})) {
+      // A test file sends requests too. Its URLs count only with 3 or more shared segments.
+      const min = isTest(rel) ? 3 : 2;
       for (const s of ctx.syms(rel)) {
         for (const u of s.urls || []) {
           const have = urlSegs(u.url);
           let k = 0;
           while (k < want.length && k < have.length && want[k] === have[k]) k++;
-          if (k >= 2 && out.length < 3) out.push(item("api", rel, s.lines[0], s.lines[1], `${s.name} · ${u.method || ""} ${u.url}`, `URL "${e.name}"`, ctx, 6));
+          if (k >= min && out.length < 3) out.push(item("api", rel, s.lines[0], s.lines[1], `${s.name} · ${u.method || ""} ${u.url}`, `URL "${e.name}"`, ctx, 6));
         }
       }
     }
@@ -347,19 +417,37 @@ function fileWords(ctx) {
   }
   return ctx.fw;
 }
+// A file name has no hyphen. The request word "top-up" is "Topup" or "TopUp" in a file name.
+// The request words "top up" can also be "Topup". Thus a hyphen word and a joined pair are the same word.
+// phraseUnits gives the count of phrase words after the joins, or -1 when a word is not covered.
+function phraseUnits(set, words) {
+  const one = (w) => w.includes("-")
+    ? set.has(stem(w.replace(/-/g, ""))) || w.split("-").filter(Boolean).every((p) => set.has(stem(p)))
+    : set.has(stem(w));
+  let n = 0;
+  for (let i = 0; i < words.length; i++) {
+    const a = words[i], b = words[i + 1];
+    if (b !== undefined && !a.includes("-") && !b.includes("-") && (!one(a) || !one(b)) && set.has(stem(a + b))) { n++; i++; continue; }
+    if (!one(a)) return -1;
+    n++;
+  }
+  return n;
+}
+function wordHit(fileWordSet, phraseWords) { return phraseUnits(fileWordSet, phraseWords) >= 0; }
+
 function resolveNoun(ctx, e) {
-  const words = e.name.split(" ").filter((w) => !VERBS.has(w) || e.name.split(" ").length > 2 || true).map(stem);
-  const hits = fileWords(ctx).filter((x) => words.every((w) => x.w.has(w)));
+  const words = e.name.split(" ").filter(Boolean);
+  const hits = fileWords(ctx).filter((x) => wordHit(x.w, words));
   if (!hits.length || hits.length > 8) return [];
   hits.sort((a, b) => (COMP_EXT.test(b.f) - COMP_EXT.test(a.f)) || (a.w.size - b.w.size) || a.f.localeCompare(b.f));
-  const exact = (x) => x.w.size === new Set(words).size;
+  const exact = (x) => x.w.size === phraseUnits(x.w, words);
   const pick = exact(hits[0]) ? hits.filter(exact) : hits;
   return pick.slice(0, 2).map((x) => {
     const ls = ctx.read(x.f) || [];
     const cls = ctx.syms(x.f).find((s) => s.kind === "class");
     const it = item("component", x.f, cls ? cls.lines[0] : 1, cls ? cls.lines[1] : Math.max(1, ls.length), `${path.posix.basename(x.f)}`, `phrase "${e.name}"`, null, 3);
     // exact: the basename words are the phrase words. The exemplar rank uses it.
-    Object.defineProperty(it, "weight", { value: (x.w.size === new Set(words).size ? 1 : 0.5) + (e.cue ? 3 : 0), enumerable: false });
+    Object.defineProperty(it, "weight", { value: (exact(x) ? 1 : 0.5) + (e.cue ? 3 : 0), enumerable: false });
     return it;
   });
 }
@@ -450,12 +538,136 @@ function regexRoutes(ls) {
   return out;
 }
 
+// lorc 0.5.1: true when the repo has a component file (.vue / .jsx / .tsx / .svelte) that is not a test.
+function hasComponents(ctx) {
+  if (ctx.hasComp === undefined) ctx.hasComp = ctx.files.some((f) => COMP_EXT.test(f) && !isTest(f));
+  return ctx.hasComp;
+}
+
+// lorc 0.5.1: server route targets (back end). The best route FILE for the URLs and the words of the request,
+// then the best GROUP in it (a run of adjacent route lines, with its `x := app.Group(...)` head).
+function serverRouteTargets(ctx, ents, reqStems) {
+  const routes = serverRoutes(ctx);
+  if (!routes.length) return [];
+  const urls = ents.filter((e) => e.type === "url").map((e) => urlSegs(e.name));
+  for (const r of routes) {
+    const segs = urlSegs(r.path);
+    const u = urls.length ? Math.max(...urls.map((w) => segMatch(w, segs))) : 0;
+    const w = [...new Set(segs.filter((x) => !isParam(x)).flatMap(splitWords).map(stem))].filter((x) => reqStems.has(x)).length;
+    r.score = u + w * 0.5;
+  }
+  const byFile = new Map();
+  for (const r of routes) {
+    if (!byFile.has(r.file)) byFile.set(r.file, []);
+    byFile.get(r.file).push(r);
+  }
+  let file = null;
+  let fileBest = -1;
+  for (const [f, rs] of byFile) {
+    const sc = Math.max(...rs.map((r) => r.score)) + Math.min(0.4, rs.reduce((a, r) => a + r.score, 0) / 1000);
+    if (sc > fileBest || (sc === fileBest && f < file)) { file = f; fileBest = sc; }
+  }
+  if (!file || fileBest < 1) return [];
+  const ls = ctx.read(file);
+  if (!ls) return [];
+  const rs = byFile.get(file).slice().sort((a, b) => a.start - b.start);
+  const groups = [];
+  for (const r of rs) {
+    const g = groups[groups.length - 1];
+    if (g && r.start - g[g.length - 1].end <= 1 && r.on === g[0].on) g.push(r); else groups.push([r]);
+  }
+  const gScore = (g) => Math.max(...g.map((r) => r.score)) * 100 + g.reduce((a, r) => a + r.score, 0);
+  const best = groups.reduce((a, b) => (gScore(b) > gScore(a) ? b : a));
+  const first = best[0].start;
+  const last = best[best.length - 1].end;
+  // The group head: `name := x.Group("/p")` (Go) or `const name = express.Router()`, on the line above the run.
+  let head = "";
+  let start = first;
+  for (let i = first - 2; i >= Math.max(0, first - 3); i--) {
+    const m = /^\s*(?:(?:const|let|var)\s+)?([\w$.]+)\s*:?=\s*[\w$.]+\.(?:Group|group|Router|router|route)\(/.exec(ls[i] || "");
+    if (m) { head = m[1]; start = i + 1; break; }
+  }
+  if (!head) head = best[0].on || "/" + segPrefix(best.map((r) => urlSegs(r.path))).join("/");
+  const end = Math.min(last, start + 14);
+  const paths = best.map((r) => `${r.method} ${r.path}`);
+  const out = [item("route", file, start, end, `route group ${head}: ${paths.slice(0, 8).join("; ")}${paths.length > 8 ? ` (+${paths.length - 8})` : ""}`, "route group that matches the request", ctx, 9)];
+  const hint = item("insert", file, last, last, `new route goes near ${file}:${last} (group ${head})`, "insertion point", null, 10);
+  out.push(hint);
+  return out;
+}
+function segPrefix(list) {
+  const out = [];
+  for (let k = 0; list.every((s) => k < s.length && s[k] === list[0][k] && !isParam(s[k])); k++) out.push(list[0][k]);
+  return out;
+}
+
+// lorc 0.5.1: wiring targets. The non-test files outside the module of the top exemplar that import it and
+// have a wiring name (wiring.go, app.ts, container.ts …): one `wire` item per file at the lines that use the module.
+function moduleDir(rel) {
+  let d = path.posix.dirname(rel);
+  const up = path.posix.dirname(d);
+  if (LAYER.test(path.posix.basename(d)) && up !== "." && up.split("/").length >= 2) d = up;
+  return d;
+}
+function wireTargets(ctx, top) {
+  if (!top) return [];
+  const mod = moduleDir(top);
+  if (!mod || mod === ".") return [];
+  const inMod = (p) => p === mod || p.startsWith(mod + "/");
+  const out = [];
+  for (const f of ctx.files) {
+    if (!SRC.test(f) || isTest(f) || inMod(f) || !WIRE.test(path.posix.basename(f).replace(/\.\w+$/, ""))) continue;
+    const ls = ctx.read(f);
+    if (!ls) continue;
+    // The imports of the module: the graph record, else the quoted import paths in the text.
+    const impLines = [];
+    const locals = new Set();
+    const rec = ctx.rec(f);
+    const hitsMod = (from) => {
+      from = posix(from);
+      if (/^\.{1,2}\//.test(from)) return inMod(path.posix.normalize(path.posix.join(path.posix.dirname(f), from)));
+      return from.endsWith("/" + mod) || from.includes("/" + mod + "/");
+    };
+    if (rec && rec.imports) {
+      for (const im of rec.imports) {
+        if (!hitsMod(im.from || "")) continue;
+        if (im.line) impLines.push(im.line);
+        for (const b of im.bindings || []) if (b.local) locals.add(b.local);
+      }
+    } else {
+      ls.forEach((l, i) => {
+        const m = /['"]([^'"]+)['"]/.exec(l);
+        if (!m || !/^\s*(import\b|[\w]+\s+['"]|['"]|.*require\()/.test(l) || !hitsMod(m[1])) return;
+        impLines.push(i + 1);
+        const b = /^\s*(?:import\s+(?:\*\s+as\s+)?)?([\w$]+)\s+(?:from\s+)?['"]/.exec(l);
+        if (b && b[1] !== "import") locals.add(b[1]);
+      });
+    }
+    if (!impLines.length) continue;
+    const res = [...locals].map((n) => new RegExp("(^|[^\\w$.])" + esc(n) + "\\b"));
+    const uses = [];
+    ls.forEach((l, i) => { if (!impLines.includes(i + 1) && res.some((re) => re.test(l))) uses.push(i + 1); });
+    const hits = uses.length ? uses : impLines;
+    const s = Math.max(1, hits[0] - 2);
+    let e = Math.min(ls.length, hits[0] + 2);
+    for (const h of hits) if (h + 2 <= s + 14 && h <= e + 3) e = Math.min(ls.length, h + 2);
+    const what = `wires ${mod}: imports at ${impLines.slice(0, 4).join(", ")}${uses.length ? `; uses ${[...locals].slice(0, 4).join(", ")} at ${uses.slice(0, 6).join(", ")}` : ""}`;
+    const it = item("wire", f, s, Math.min(e, s + 14), what, "wiring of the module", ctx, 8);
+    Object.defineProperty(it, "n", { value: hits.length, enumerable: false });
+    out.push(it);
+  }
+  return out.sort((a, b) => b.n - a.n || a.file.localeCompare(b.file)).slice(0, 3);
+}
+
 function apiTarget(ctx, ents, engine) {
   const named = ents.filter((e) => e.type === "file" && /(\.api\.[jt]s|(^|\/)api\/)/i.test(e.name)).flatMap((e) => (e.items || []).map((i) => i.file));
-  const urlHit = ents.filter((e) => e.type === "url").flatMap((e) => (e.items || []).map((i) => i.file));
+  const urlHit = ents.filter((e) => e.type === "url").flatMap((e) => (e.items || []).filter((i) => i.kind === "api").map((i) => i.file));
   const g = (engine && engine.detail && engine.detail.graph) || {};
-  const file = named[0] || urlHit[0] || g.api || null;
+  // lorc 0.5.1: a test file is never the API module.
+  const file = [...named, ...urlHit, g.api].find((f) => f && !isTest(f)) || null;
   if (!file) return [];
+  // A repo without component files: the file is an API module only when it sends requests.
+  if (!hasComponents(ctx) && !ctx.syms(file).some((s) => (s.urls || []).length)) return [];
   const ls = ctx.read(file) || [];
   let ex = ctx.syms(file).filter((s) => s.exported && s.kind !== "module").map((s) => ({ name: s.name, start: s.lines[0], end: s.lines[1], urls: s.urls || [] }));
   if (!ex.length) {
@@ -500,7 +712,8 @@ function constantTargets(ctx, engine, reqStems) {
   const featStems = new Set(featureDirs(engine).flatMap((d) => d.split("/").flatMap(splitWords)).map(stem));
   const dirs = featureDirs(engine).map((d) => d.replace(/\/(constants?|components?)$/, ""));
   const named = /(^|\/)(constants?|keys?|routes?)(\/|\.[jt]s$)|(Keys|Routes|Constants)\.[jt]s$/;
-  const cands = new Set((g.hosts || []).concat(g.core || []).filter((f) => named.test(f)));
+  // lorc 0.5.1: a repo without component files: only .js / .ts constants (not a Go routes.go as a whole file).
+  const cands = new Set((g.hosts || []).concat(g.core || []).filter((f) => named.test(f) && (hasComponents(ctx) || /\.[cm]?[jt]s$/.test(f))));
   for (const f of ctx.files) {
     if (!/\.[jt]s$/.test(f) || TEST.test(f) || !named.test(f)) continue;
     if (dirs.some((d) => f.startsWith(d + "/") && f.slice(d.length + 1).split("/").length <= 2)) cands.add(f);
@@ -523,6 +736,22 @@ function constantTargets(ctx, engine, reqStems) {
   return out;
 }
 
+// lorc 0.5.0: the code sites that use the keys of a locale block.
+function usedBy(ctx, k) {
+  if (!ctx.Q || !ctx.model || typeof ctx.Q.i18nUsers !== "function") return "";
+  const sites = [];
+  const walk = (n) => {
+    for (const c of n.children || []) {
+      let us = [];
+      try { us = ctx.Q.i18nUsers(ctx.model, c.path); } catch (_) { us = []; }
+      for (const u of us) { const v = `${u.sym.file}:${u.line}`; if (!sites.includes(v)) sites.push(v); }
+      walk(c);
+    }
+  };
+  walk(k);
+  if (!sites.length) return "";
+  return ` · used by: ${sites.slice(0, 3).join(", ")}${sites.length > 3 ? ` (+${sites.length - 3})` : ""}`;
+}
 function i18nTargets(ctx, request) {
   const req = String(request || "").toLowerCase().split(/[^a-z0-9]+/).filter((w) => w && !STOP.has(w) && !VERBS.has(w));
   const cands = new Set();
@@ -539,7 +768,7 @@ function i18nTargets(ctx, request) {
     }
     if (!best || (best.n < 2 && best.k.end - best.k.line > 200)) continue;
     const kids = best.k.children.slice(0, 12).map((c) => `${c.key} · ${c.line}`);
-    out.push(item("i18n", f, best.k.line, best.k.end, `${best.k.path} keys: ${kids.join("; ")}`, "locale block of the feature", ctx, 9));
+    out.push(item("i18n", f, best.k.line, best.k.end, `${best.k.path} keys: ${kids.join("; ")}${usedBy(ctx, best.k)}`, "locale block of the feature", ctx, 9));
   }
   return out;
 }
@@ -607,16 +836,58 @@ function cardOf(ctx, rel) {
   if (emits.length) parts.push(`emits: ${emits.slice(0, 8).join(", ")}`);
   if (methods.length) parts.push(`methods: ${methods.join(", ")}`);
   if (kids.length) parts.push(`uses: ${[...new Set(kids)].slice(0, 8).join(", ")}`);
+  parts.push(...linkParts(ctx, rel));
   let s = parts.join(" · ");
   if (s.length > 600) s = s.slice(0, 597) + "...";
   return { text: s, start: cls ? cls.lines[0] : 1, end: cls ? cls.lines[1] : Math.max(1, ls.length) };
+}
+// lorc 0.5.0: the framework links of a file (store, parents, i18n, events, tables, config).
+function linksFor(ctx, rel) {
+  if (!ctx.Q || !ctx.model || typeof ctx.Q.linksOf !== "function" || !ctx.rec(rel)) return null;
+  try { return ctx.Q.linksOf(ctx.model, rel); } catch (_) { return null; }
+}
+function linkParts(ctx, rel) {
+  const L = linksFor(ctx, rel);
+  if (!L) return [];
+  const out = [];
+  const store = [];
+  for (const st of L.store || []) {
+    if (store.length >= 4) break;
+    const t = st.target && ctx.model.symbols ? ctx.model.symbols.get(st.target) : null;
+    const v = t ? `${st.role} ${st.key}→${t.file}:${t.lines ? t.lines[0] : "?"}` : `${st.role} ${st.key}(missing)`;
+    if (!store.includes(v)) store.push(v);
+  }
+  if (store.length) out.push(`store: ${store.join(", ")}`);
+  const parents = (L.parents || []).slice(0, 3).map((p) => p.file);
+  if (parents.length) out.push(`parents: ${parents.join(", ")}`);
+  const i = L.i18n || {};
+  if (i.count) out.push(`i18n: ${i.count} keys${(i.missing || []).length ? ` missing: ${i.missing.slice(0, 3).join(", ")}` : ""}`);
+  const ev = [];
+  for (const e of L.emits || []) ev.push(`emit ${e.name}→${(e.listeners || []).length}`);
+  for (const e of L.events || []) ev.push(`${e.kind} ${e.name}→${e.peers || 0}`);
+  if (ev.length) out.push(`events: ${[...new Set(ev)].slice(0, 3).join(", ")}`);
+  return out;
+}
+function dataParts(ctx, rel) {
+  const L = linksFor(ctx, rel);
+  if (!L) return [];
+  const out = [];
+  const tables = [...new Set((L.tables || []).map((t) => t.table))].slice(0, 4);
+  if (tables.length) out.push(`tables: ${tables.join(", ")}`);
+  // Config: the KEY only. Never a value.
+  const keys = [...new Set((L.config || []).map((c) => c.key))].slice(0, 4);
+  if (keys.length) out.push(`config: ${keys.join(", ")}`);
+  return out;
 }
 function exportsCard(ctx, rel) {
   if (COMP_EXT.test(rel)) return cardOf(ctx, rel);
   const ls = ctx.read(rel) || [];
   let ex = ctx.syms(rel).filter((s) => s.exported && s.kind !== "module").map((s) => `${s.name} ${s.lines[0]}`);
   if (!ex.length) ls.forEach((l, i) => { const m = /^export\s+(?:default\s+)?(?:async\s+)?(?:function\*?|const|let|class)\s+([\w$]+)/.exec(l); if (m) ex.push(`${m[1]} ${i + 1}`); });
-  return { text: `exports: ${ex.slice(0, 8).join(", ") || "-"}`, start: 1, end: Math.max(1, ls.length) };
+  let text = [`exports: ${ex.slice(0, 8).join(", ") || "-"}`, ...dataParts(ctx, rel)].join(" · ");
+  if (text.length > 600) text = text.slice(0, 597) + "...";
+  if (ctx.be) { const [a, b] = narrowRange(ctx, rel, ls.length); return { text, start: a, end: b }; }
+  return { text, start: 1, end: Math.max(1, ls.length) };
 }
 function importsOf(ctx, rel) {
   if (ctx.Q && ctx.model && ctx.rec(rel)) {
@@ -651,6 +922,8 @@ function exemplars(ctx, ents, engine) {
   }
   // The engine names the generic component to reuse (Stepper.vue): the new code renders it.
   for (const f of reuseFiles(ctx, engine)) bump(f, 3);
+  // lorc 0.5.1: no component file in the scored set → score the SOURCE files (back-end work).
+  if (!score.size) backendScore(ctx, ents, g, score);
   const seeds = [...score.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map((x) => x[0]);
   const top = seeds.slice(0, 3);
   // Create unit nouns: files whose basename ends with the noun, near the feature.
@@ -674,7 +947,7 @@ function exemplars(ctx, ents, engine) {
   }
   const list = [...new Set([...top, ...extra])].slice(0, 4);
   const items = list.map((f, i) => {
-    const c = cardOf(ctx, f);
+    const c = COMP_EXT.test(f) ? cardOf(ctx, f) : backendCard(ctx, f);
     return item("exemplar", f, c.start, c.end, c.text, top.includes(f) ? "named by the request or the doc" : "same unit kind near the feature", null, 7 - i * 0.5);
   });
   // 1 hop: imported components / utils / api modules, ranked by how many exemplars import them.
@@ -689,11 +962,67 @@ function exemplars(ctx, ents, engine) {
       count.set(t, (count.get(t) || 0) + 1 + (own ? 0 : 0.5) + kindBonus);
     }
   }
+  // lorc 0.5.2: back end: a hop file stays only when an exemplar uses one of its exported names, and never a file > 600 lines.
+  if (ctx.be) {
+    const texts = list.map((f) => (ctx.read(f) || []).join("\n"));
+    for (const t of [...count.keys()]) {
+      const n = (ctx.read(t) || []).length;
+      const names = [...new Set(ctx.syms(t).filter((x) => x.exported && x.kind !== "module" && x.kind !== "route").map((x) => x.name))].filter((x) => /^[\w$]+$/.test(x));
+      // Go: another package uses a name as pkg.Name.
+      const res = names.map((x) => new RegExp((/\.go$/i.test(t) ? "\\." : "(^|[^\\w$])") + esc(x) + "(?![\\w$])"));
+      if (n > 600 || !res.some((re) => texts.some((tx) => re.test(tx)))) count.delete(t);
+    }
+  }
   const hop = [...count.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 6).map(([t, n], i) => {
     const c = exportsCard(ctx, t);
     return item("reuse", t, c.start, c.end, c.text, `imported by ${Math.floor(n)} exemplar(s)`, null, (Math.floor(n) >= 2 ? 5.5 : 3) - i * 0.2);
   });
   return { items, hop, list };
+}
+
+// lorc 0.5.1: the score of the source files for back-end work. An entity item gives 1 for each file it names;
+// a host / core file of the engine gives 0.5. A file with no function or method (types, models) gets 0.4 of its score.
+function backendScore(ctx, ents, g, score) {
+  const ok = (f) => SRC.test(f) && !isTest(f) && !/\.d\.ts$/i.test(f) && !COMP_EXT.test(f) && (ctx.read(f) || []).length <= 1500;
+  const raw = new Map();
+  const add = (f, n) => { if (ok(f)) raw.set(f, (raw.get(f) || 0) + n); };
+  for (const e of ents) {
+    const seen = new Set();
+    for (const it of e.items || []) {
+      if (!["symbol", "file", "component"].includes(it.kind)) continue;
+      for (const f of it.locs || [it.file]) if (!seen.has(f)) { seen.add(f); add(f, 1); }
+    }
+  }
+  for (const f of new Set([...(g.hosts || []), ...(g.core || [])])) add(f, 0.5);
+  if (g.feature && ctx.fileSet.has(g.feature)) add(g.feature, 0.5);
+  for (const [f, n] of raw) {
+    const code = ctx.syms(f).some((s) => /method|function/.test(s.kind));
+    score.set(f, code || !ctx.rec(f) ? n : n * 0.4);
+  }
+}
+// lorc 0.5.1: the card of a source file: its exported (else top-level) symbols with line ranges, then data / links.
+function backendCard(ctx, rel) {
+  const ls = ctx.read(rel) || [];
+  const all = ctx.syms(rel).filter((s) => s.kind !== "module" && s.kind !== "route");
+  let syms = all.filter((s) => s.exported);
+  if (!syms.length) syms = all;
+  let rows = syms.slice(0, 14).map((s) => `${s.name} ${s.lines[0]}${s.lines[1] !== s.lines[0] ? "-" + s.lines[1] : ""}`);
+  if (!rows.length) ls.forEach((l, i) => { const m = /^export\s+(?:default\s+)?(?:async\s+)?(?:function\*?|const|let|class)\s+([\w$]+)/.exec(l); if (m && rows.length < 14) rows.push(`${m[1]} ${i + 1}`); });
+  const parts = [`symbols: ${rows.join(", ") || "-"}`, ...dataParts(ctx, rel), ...linkParts(ctx, rel)];
+  let text = parts.join(" · ");
+  if (text.length > 600) text = text.slice(0, 597) + "...";
+  if (ctx.be) { const [a, b] = narrowRange(ctx, rel, ls.length); return { text, start: a, end: b }; }
+  return { text, start: 1, end: Math.max(1, ls.length) };
+}
+// lorc 0.5.2: the narrow range of a back-end card. A file of 60 lines or less keeps 1-N. A longer file gives the
+// first exported class / struct / interface / type (else the first exported function), max 40 lines.
+function narrowRange(ctx, rel, n) {
+  if (n <= 60) return [1, Math.max(1, n)];
+  const all = ctx.syms(rel).filter((s) => s.kind !== "module" && s.kind !== "route" && s.lines);
+  const ex = all.filter((s) => s.exported);
+  const pick = ex.find((s) => /^(class|struct|interface|type)$/.test(s.kind)) || ex.find((s) => /function|method/.test(s.kind)) || ex[0] || all[0];
+  if (!pick) return [1, 40];
+  return [pick.lines[0], Math.min(pick.lines[1], pick.lines[0] + 39)];
 }
 
 // Reused generic components: engine.detail.graph.reuse, else the "reuse: X.vue" line of engine.why.
@@ -709,6 +1038,198 @@ function reuseFiles(ctx, engine) {
     if (near.length || hit.length) out.push((near.length ? near : hit)[0]);
   }
   return [...new Set(out)];
+}
+
+// ---------- 4b. back end (0.5.2): mirror + reuse rows ----------
+const SUFFIX = /[-_.]?(handler|service|repository|controller|models?|errors?|routes?|test|spec)$/i;
+const baseStem = (f) => path.posix.basename(f).replace(/\.[^.]+$/, "");
+const noFences = (t) => String(t || "").replace(/```[\s\S]*?```/g, " ");
+// The doc's new source files and new dirs.
+function docNew(ctx, ents, docText) {
+  const exists = (n) => ctx.fileSet.has(n) || ctx.files.some((f) => f.endsWith("/" + n));
+  const files = [...new Set(ents.filter((e) => e.type === "file" && (e.from === "doc" || docText.includes(e.name)))
+    .map((e) => posix(e.name).replace(/^\.\//, ""))
+    .filter((n) => n.includes("/") && SRC.test(n) && !isTest(n) && !exists(n)))];
+  const dirs = [];
+  for (const m of noFences(docText).matchAll(/`([^`\n]+)`/g)) {
+    const raw = m[1].trim();
+    if (!/^[\w.-]+(\/[\w.-]+)+\/?$/.test(raw) || raw.startsWith("/")) continue;
+    const d = raw.replace(/\/$/, "");
+    const parent = path.posix.dirname(d);
+    if (/\.\w+$/.test(path.posix.basename(d)) || dirs.includes(d)) continue;
+    if (ctx.files.some((f) => f.startsWith(d + "/")) || !ctx.files.some((f) => f.startsWith(parent + "/"))) continue;
+    dirs.push(d);
+  }
+  return { files, dirs };
+}
+function featureWord(nw) {
+  if (nw.files.length) {
+    const n = new Map();
+    for (const f of nw.files) { const s = baseStem(f).replace(SUFFIX, "") || baseStem(f); n.set(s, (n.get(s) || 0) + 1); }
+    return [...n.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  }
+  if (nw.dirs.length) return path.posix.basename(nw.dirs.slice().sort((a, b) => a.length - b.length || a.localeCompare(b))[0]);
+  return null;
+}
+// A path as a regex: the feature word (a whole segment or the basename start) is ONE capture, then a backreference.
+function shapeRegex(p, w) {
+  const segs = p.split("/");
+  let used = false;
+  const cap = () => { const r = used ? "\\1" : "([\\w-]+)"; used = true; return r; };
+  const out = segs.map((s, i) => {
+    if (s === w) return cap();
+    if (i === segs.length - 1 && s.startsWith(w) && /^[-_.]/.test(s.slice(w.length))) return cap() + esc(s.slice(w.length));
+    return esc(s);
+  });
+  return used ? new RegExp("^" + out.join("/") + "$") : null;
+}
+const swapPath = (f, x, w) => {
+  const segs = f.split("/").map((s) => (s === x ? w : s));
+  const b = segs[segs.length - 1];
+  if (b.startsWith(x) && /^[-_.]/.test(b.slice(x.length))) segs[segs.length - 1] = w + b.slice(x.length);
+  return segs.join("/");
+};
+// The setup range of a test file: Go → up to the first Test func; else up to the first describe.
+function testItem(ctx, f) {
+  const ls = ctx.read(f);
+  if (!ls) return null;
+  if (/_test\.go$/i.test(f)) {
+    const t = ls.findIndex((l) => /^func\s+Test\w*\(/.test(l));
+    const end = t > 0 ? Math.min(t, 80) : Math.min(ls.length, 80);
+    return item("test", f, 1, Math.max(1, end), `setup 1-${end}${t >= 0 ? `; first test ${t + 1}` : ""}`, "test exemplar", null, 6);
+  }
+  const d = ls.findIndex((l) => /^\s*describe(\.\w+)?\(/.test(l));
+  const firstIt = ls.findIndex((l, i) => i > d && /^\s*(it|test)(\.\w+)?\(/.test(l));
+  const end = d > 0 ? Math.min(d, 80) : Math.min(ls.length, 80);
+  return item("test", f, 1, Math.max(1, end), `setup 1-${end}${d >= 0 ? `; first describe ${d + 1}` : ""}${firstIt >= 0 ? `; first it ${firstIt + 1}` : ""}`, "test exemplar", null, 6);
+}
+// C1: the closest existing feature with the same path shape as the doc's new files (or the same parent as a new dir).
+function mirrorOf(ctx, ents, docText, targets) {
+  const none = { x: null, rows: [], tests: [] };
+  const nw = docNew(ctx, ents, docText);
+  const w = featureWord(nw);
+  if (!w) return none;
+  const src = ctx.files.filter((f) => SRC.test(f) && !isTest(f));
+  const score = new Map();
+  const fileCase = nw.files.length > 0;
+  if (fileCase) {
+    for (const p of nw.files) {
+      const re = shapeRegex(p, w);
+      if (!re) continue;
+      const xs = new Set();
+      for (const f of src) { const m = re.exec(f); if (m && m[1] !== w) xs.add(m[1]); }
+      for (const x of xs) score.set(x, (score.get(x) || 0) + 1);
+    }
+  } else {
+    for (const d of nw.dirs) {
+      const parent = path.posix.dirname(d);
+      const xs = new Set(ctx.files.filter((f) => f.startsWith(parent + "/")).map((f) => f.slice(parent.length + 1).split("/")).filter((s) => s.length > 1).map((s) => s[0]));
+      for (const x of xs) if (x !== w) score.set(x, (score.get(x) || 0) + 1);
+    }
+  }
+  if (!score.size) return none;
+  const rt = targets.find((t) => t.kind === "route" && t.why === "route group that matches the request");
+  const norm = (s) => String(s).toLowerCase().replace(/_/g, "-");
+  const doc = norm(noFences(docText));
+  const has = (f, x) => baseStem(f) === x || f.split("/").slice(0, -1).includes(x);
+  const sc = (x) => score.get(x) + (rt && has(rt.file, x) ? 0.5 : 0)
+    + (new RegExp("(^|[^\\w-])" + esc(norm(x)) + "(?![\\w-])").test(doc) ? 0.25 : 0)
+    + 0.01 * ctx.files.filter((f) => has(f, x)).length;
+  const x = [...score.keys()].map((k) => ({ k, s: sc(k) })).sort((a, b) => b.s - a.s || a.k.localeCompare(b.k))[0].k;
+  const newSet = new Set(nw.files);
+  const rows = [];
+  const add = (f, cp, why) => {
+    if (rows.length >= 6 || ctx.fileSet.has(cp) || newSet.has(cp)) return;
+    const ls = ctx.read(f) || [];
+    if (!ls.length || ls.length > 1500) return;
+    const c = backendCard(ctx, f);
+    const tail = ` → ${cp} (not in the doc)`;
+    const it = item("mirror", f, c.start, c.end, c.text.slice(0, 600 - tail.length) + tail, why, ctx, 6.6);
+    Object.defineProperty(it, "counterpart", { value: cp, enumerable: false });
+    rows.push(it);
+  };
+  let tests = [];
+  if (fileCase) {
+    for (const f of src.filter((f) => baseStem(f) === x).sort()) {
+      const dir = path.posix.dirname(f);
+      add(f, swapPath(dir, x, w) + "/" + w + path.posix.extname(f), `the closest feature ${x} has this file`);
+    }
+    const layers = new Set(nw.files.flatMap((p) => path.posix.dirname(p).split("/")).filter((s) => LAYER.test(s)));
+    tests = ctx.files.filter((f) => isTest(f) && new RegExp("^" + esc(x) + "(\\.(test|spec)\\.[\\w]+|_test\\.go)$", "i").test(path.posix.basename(f)))
+      .map((f) => ({ f, s: path.posix.dirname(f).split("/").filter((s) => layers.has(s)).length }))
+      .sort((a, b) => b.s - a.s || a.f.localeCompare(b.f)).map((t) => t.f);
+  } else {
+    const parent = path.posix.dirname(nw.dirs.find((d) => path.posix.basename(d) === w) || nw.dirs[0]);
+    const root = parent + "/" + x + "/";
+    const under = src.filter((f) => f.startsWith(root) && f.slice(root.length).split("/").length <= 2);
+    const byDir = new Map();
+    for (const f of under) { const d = path.posix.dirname(f); if (!byDir.has(d)) byDir.set(d, []); byDir.get(d).push(f); }
+    for (const d of [...byDir.keys()].sort()) {
+      const fs2 = byDir.get(d).sort((a, b) => (path.posix.basename(b).includes(x) - path.posix.basename(a).includes(x)) || a.localeCompare(b));
+      add(fs2[0], swapPath(fs2[0], x, w), `the closest module ${x} has this file`);
+    }
+    tests = ctx.files.filter((f) => isTest(f) && f.startsWith(root))
+      .sort((a, b) => (path.posix.basename(b).includes(x) - path.posix.basename(a).includes(x)) || a.localeCompare(b));
+  }
+  return { x, rows, tests: tests.slice(0, 2).map((f) => testItem(ctx, f)).filter(Boolean) };
+}
+// The smallest function / method / class that holds a line; else the line ± 5.
+function enclosing(ctx, f, line) {
+  const s = ctx.syms(f).filter((y) => /function|method|class/.test(y.kind) && y.lines && y.lines[0] <= line && y.lines[1] >= line)
+    .sort((a, b) => (a.lines[1] - a.lines[0]) - (b.lines[1] - b.lines[0]))[0];
+  const n = (ctx.read(f) || []).length;
+  // A symbol of more than 40 lines: the row shows the hit line ± 5; the text keeps the symbol and its range.
+  if (s && s.lines[1] - s.lines[0] + 1 > 40) return { a: Math.max(1, line - 5), b: Math.min(n, line + 5), what: `${s.kind} ${s.name} ${s.lines[0]}-${s.lines[1]} (hit at line ${line})`, sym: true, capped: true };
+  if (s) return { a: s.lines[0], b: s.lines[1], what: `${s.kind} ${s.name}`, sym: true };
+  return { a: Math.max(1, line - 5), b: Math.min(n, line + 5), what: `lines near ${line}`, sym: false };
+}
+const reuseOk = (ctx, f) => ctx.fileSet.has(f) && SRC.test(f) && !isTest(f) && !ENV_FILE.test(f) && (ctx.read(f) || []).length <= 1500;
+// C2.1 + C2.2: code that holds the doc's literal text; users of the named constants.
+function backendReuse(ctx, ents, docText) {
+  const out = [];
+  if (docText) {
+    const t = noFences(docText);
+    const spans = [];
+    for (const m of t.matchAll(/`([^`\n]+)`|"([^"\n]+)"/g)) {
+      const s = (m[1] || m[2] || "").trim();
+      if (s.split(/\s+/).length < 4 || s.length < 16 || /:\/\/|(^|\s)\/[\w{}:.-]+\//.test(s) || spans.includes(s)) continue;
+      spans.push(s);
+    }
+    for (const s of spans) {
+      if (out.length >= 3) break;
+      for (const line of git(ctx.root, ["grep", "-n", "-F", "-e", s]).split("\n")) {
+        const m = /^(.+?):(\d+):/.exec(line);
+        if (!m || !reuseOk(ctx, m[1])) continue;
+        const e = enclosing(ctx, m[1], +m[2]);
+        out.push(item("reuse", m[1], e.a, e.b, e.what, `has the doc text "${s.slice(0, 40)}"`, e.capped ? null : ctx, 6.9));
+        break;
+      }
+    }
+  }
+  const users = [];
+  for (const e of ents) {
+    if (users.length >= 3) break;
+    if (!/^[A-Z][A-Z0-9]*(_[A-Z0-9]+)+$/.test(e.name)) continue;
+    const defs = new Set((e.items || []).filter((i) => i.kind === "symbol").flatMap((i) => i.locs || [i.file]));
+    if (!defs.size) continue;
+    const hits = new Map();
+    for (const line of git(ctx.root, ["grep", "-n", "-w", "-F", "-e", e.name]).split("\n")) {
+      const m = /^(.+?):(\d+):/.exec(line);
+      if (!m || defs.has(m[1]) || !reuseOk(ctx, m[1])) continue;
+      if (!hits.has(m[1])) hits.set(m[1], []);
+      hits.get(m[1]).push(+m[2]);
+    }
+    let n = 0;
+    for (const [f, ls] of hits) {
+      if (n >= 2 || users.length >= 3) break;
+      const encs = ls.map((l) => enclosing(ctx, f, l));
+      const en = encs.find((x) => x.sym) || encs[0];
+      if (out.concat(users).some((r) => r.file === f && r.start === en.a)) { n++; continue; }
+      users.push(item("reuse", f, en.a, en.b, en.what, `uses ${e.name}`, en.capped ? null : ctx, 6.4));
+      n++;
+    }
+  }
+  return out.concat(users);
 }
 
 // ---------- 5. tests ----------
@@ -730,12 +1251,33 @@ function testExemplars(ctx, list, engine) {
     cands.push({ f, sc, ls });
   }
   cands.sort((a, b) => b.sc - a.sc || a.f.localeCompare(b.f));
-  return cands.slice(0, 2).map(({ f, ls }) => {
+  const out = cands.slice(0, 2).map(({ f, ls }) => {
     const d = ls.findIndex((l) => /^\s*describe(\.\w+)?\(/.test(l));
     const firstIt = ls.findIndex((l, i) => i > d && /^\s*(it|test)(\.\w+)?\(/.test(l));
     const end = d > 0 ? Math.min(d, 80) : Math.min(ls.length, 80);
     return item("test", f, 1, Math.max(1, end), `setup 1-${end}${d >= 0 ? `; first describe ${d + 1}` : ""}${firstIt >= 0 ? `; first it ${firstIt + 1}` : ""}`, "test exemplar", null, 6);
   });
+  return out.concat(goTests(ctx, list)).slice(0, 2);
+}
+// lorc 0.5.1: Go test exemplars: the _test.go files in the directories of the exemplars (the same package).
+// A matching base name (x.go ↔ x_test.go) ranks first.
+function goTests(ctx, list) {
+  const goList = list.filter((f) => /\.go$/i.test(f));
+  if (!goList.length) return [];
+  const dirs = new Set(goList.map((f) => path.posix.dirname(f)));
+  const bases = new Set(goList.map((f) => path.posix.basename(f).replace(/\.go$/i, "")));
+  const cands = ctx.files.filter((f) => /_test\.go$/i.test(f) && dirs.has(path.posix.dirname(f)))
+    .map((f) => ({ f, sc: (bases.has(path.posix.basename(f).replace(/_test\.go$/i, "")) ? 2 : 0) + (goList.indexOf(goList.find((x) => path.posix.dirname(x) === path.posix.dirname(f))) === 0 ? 1 : 0) }))
+    .sort((a, b) => b.sc - a.sc || a.f.localeCompare(b.f));
+  const out = [];
+  for (const { f } of cands.slice(0, 2)) {
+    const ls = ctx.read(f);
+    if (!ls) continue;
+    const t = ls.findIndex((l) => /^func\s+Test\w*\(/.test(l));
+    const end = t > 0 ? Math.min(t, 80) : Math.min(ls.length, 80);
+    out.push(item("test", f, 1, Math.max(1, end), `setup 1-${end}${t >= 0 ? `; first test ${t + 1}` : ""}`, "test exemplar", null, 6));
+  }
+  return out;
 }
 
 // ---------- 6. text ----------
@@ -752,6 +1294,64 @@ function render(request, sections) {
     }
   }
   return head + body + tail;
+}
+
+// lorc 0.5.2 (back end): error classes (…Error, …Exception) of all resolved entities, before the 40 cap. Max 3.
+function errorTypes(ctx, ents) {
+  const out = [];
+  for (const e of ents) {
+    if (!/(Error|Exception)$/.test(String(e.name || ""))) continue;
+    for (const i of e.items || []) {
+      if (out.length >= 3) return out;
+      if (i.kind !== "symbol" || !/^class\s/.test(String(i.what || ""))) continue;
+      if (isTest(i.file) || /\.go$/i.test(i.file) || !SRC.test(i.file) || i.end - i.start + 1 > 40) continue;
+      if (!out.some((x) => x.file === i.file && x.start === i.start)) out.push({ name: e.name, file: i.file, start: i.start, end: i.end });
+    }
+  }
+  return out;
+}
+
+// lorc 0.5.2 (back end, TS only): a type alias of components['schemas']['X'] → the X block in the generated file.
+const TS_FILE = /\.[cm]?tsx?$/i;
+function schemaFile(ctx) {
+  if (ctx.schemaFile !== undefined) return ctx.schemaFile;
+  ctx.schemaFile = null;
+  const has = (f) => (ctx.read(f) || []).some((l) => /^\s*export\s+interface\s+components\b/.test(l));
+  const fromGraph = ctx.model ? (ctx.model.byName.get("components") || []).map((d) => d.file).filter((f) => TS_FILE.test(f)) : [];
+  for (const f of [...fromGraph, ...ctx.files.filter((x) => TS_FILE.test(x) && !isTest(x) && !/\.d\.ts$/i.test(x))]) {
+    if (has(f)) { ctx.schemaFile = f; break; }
+  }
+  return ctx.schemaFile;
+}
+function schemaShapes(ctx, ents) {
+  const out = [];
+  for (const e of ents) {
+    for (const i of e.items || []) {
+      if (out.length >= 4) return out;
+      if (i.kind !== "symbol" || !TS_FILE.test(i.file)) continue;
+      const line = (ctx.read(i.file) || [])[i.start - 1] || "";
+      const m = /components\['schemas'\]\['(\w+)'\]/.exec(line);
+      if (!m) continue;
+      const sf = schemaFile(ctx);
+      const ls = sf && ctx.read(sf);
+      if (!ls) return out;
+      const head = new RegExp(`^\\s+${m[1]}: \\{`);
+      const s0 = ls.findIndex((l) => head.test(l));
+      if (s0 < 0) continue;
+      let depth = 0;
+      let end = -1;
+      for (let k = s0; k < ls.length && k < s0 + 40; k++) {
+        for (const ch of ls[k]) { if (ch === "{") depth++; else if (ch === "}") depth--; }
+        if (depth <= 0) { end = k; break; }
+      }
+      if (end < 0 || out.some((x) => x.file === sf && x.start === s0 + 1)) continue;
+      const it = item("symbol", sf, s0 + 1, end + 1, `schema ${m[1]} (generated)`, `shape of "${e.name}"`, null, 6.2);
+      Object.defineProperty(it, "schema", { value: m[1], enumerable: false });
+      Object.defineProperty(it, "alias", { value: e.name, enumerable: false });
+      out.push(it);
+    }
+  }
+  return out;
 }
 
 function build(root, request, opts = {}) {
@@ -771,23 +1371,38 @@ function build(root, request, opts = {}) {
     try { engine = require("./tier.js").compute(root, request, { doc: opts.doc, history: false }); } catch (_) { engine = null; }
   }
   const ctx = makeCtx(root, loaded);
+  // lorc 0.5.2: back-end work (no component file). The 0.5.2 rules run only then.
+  const be = ctx.be = !hasComponents(ctx);
   const ents = entitiesOf(request, docText);
+  // The URLs with more segments first: they find the most specific section of a big file.
+  ctx.urlEnts = ents.filter((e) => e.type === "url").map((e, i) => ({ e, i, n: urlSegs(e.name).length })).sort((a, b) => b.n - a.n || a.i - b.i).map((x) => x.e);
   resolveAll(ctx, ents);
+  // lorc 0.5.2 (back end): the error types and the generated schema shapes. They do not depend on the entity cap.
+  const errors = be ? errorTypes(ctx, ents) : [];
+  const schemaItems = be ? schemaShapes(ctx, ents) : [];
   const g = (engine && engine.detail && engine.detail.graph) || {};
   const reqStems = wordStems(request);
   const allStems = new Set([...reqStems, ...wordStems(docText.slice(0, 600))]);
   const routerFile = g.router || ctx.files.find((f) => /(^|\/)router\/index\.[jt]s$/.test(f)) || null;
   const targets = [];
   targets.push(...routeTargets(ctx, routerFile, reqStems.size ? reqStems : allStems));
+  // lorc 0.5.1: no router target → the server routes (back end).
+  if (!targets.length) targets.push(...serverRouteTargets(ctx, ents, allStems));
   targets.push(...apiTarget(ctx, ents, engine));
   const consts = constantTargets(ctx, engine, reqStems);
   targets.push(...consts);
   targets.push(...i18nTargets(ctx, request));
   targets.push(...ctaTargets(ctx, consts, reqStems, routerFile));
   const ex = exemplars(ctx, ents, engine);
-  const tests = testExemplars(ctx, ex.list, engine);
+  // lorc 0.5.1: wiring targets for back-end work only (the top exemplar is not a component).
+  if (ex.list.length && !COMP_EXT.test(ex.list[0])) targets.push(...wireTargets(ctx, ex.list[0]));
+  let tests = testExemplars(ctx, ex.list, engine);
+  // lorc 0.5.2 (back end): the mirror of the closest feature, its unit tests first, and the reuse rows that matter.
+  const mir = be && docText ? mirrorOf(ctx, ents, docText, targets) : { x: null, rows: [], tests: [] };
+  if (mir.tests.length) tests = [...mir.tests, ...tests.filter((t) => !mir.tests.some((m) => m.file === t.file))].slice(0, 2);
+  const reuse = be ? [...backendReuse(ctx, ents, docText), ...ex.hop] : ex.hop;
   // Entity rows: drop rows that a target or an exemplar already covers.
-  const covered = new Set([...targets, ...ex.items, ...tests].map((i) => i.file));
+  const covered = new Set([...targets, ...mir.rows, ...ex.items, ...tests].map((i) => i.file));
   const entItems = [];
   const styles = new Map();
   for (const e of ents) {
@@ -809,17 +1424,21 @@ function build(root, request, opts = {}) {
       `style rules for ${rows.length} doc classes: ${rows.map(([n, i]) => `${short(n)} ${i.start}-${i.end}`).join(", ")}`, "doc classes", null, 6.8));
   }
   // Max 30 items; drop the lowest-ranked first, also to fit maxBytes.
-  const pools = { names: entItems, targets, exemplars: ex.items, tests, reuse: ex.hop };
+  for (const it of schemaItems) if (!entItems.some((x) => x.file === it.file && x.start === it.start)) entItems.push(it);
+  const pools = { names: entItems, targets, mirror: mir.rows, exemplars: ex.items, tests, reuse };
   const all = Object.values(pools).flat();
   all.sort((a, b) => a.rank - b.rank);
   const drop = new Set();
-  while (all.length - drop.size > 30) drop.add(all[drop.size]);
+  // lorc 0.5.2: a back-end pack keeps max 34 items; a front-end pack keeps max 30.
+  const cap = be ? 34 : 30;
+  while (all.length - drop.size > cap) drop.add(all[drop.size]);
   const keep = (arr) => arr.filter((i) => !drop.has(i));
   let text = "";
   for (let k = drop.size; k <= all.length; k++) {
     text = render(request, [
       ["Request and doc names", keep(pools.names)],
       ["Where the change goes", keep(pools.targets)],
+      [`Mirror (closest feature: ${mir.x})`, keep(pools.mirror)],
       ["Copy from", keep(pools.exemplars)],
       ["Tests to copy", keep(pools.tests)],
       ["Reuse", keep(pools.reuse)],
@@ -829,10 +1448,16 @@ function build(root, request, opts = {}) {
   }
   if (Buffer.byteLength(text) > maxBytes) text = Buffer.from(text).subarray(0, maxBytes - 4).toString("utf8").replace(/�$/, "") + "\n";
   const entities = ents.filter((e) => e.type !== "noun" || (e.items || []).length).slice(0, 40).map((e) => ({ name: e.name, type: e.type, from: e.from, at: keep(e.items || []).map(at) }));
-  return {
-    v: 1, entities, targets: keep(targets), exemplars: keep(ex.items), tests: keep(tests), reuse: keep(ex.hop),
+  const out = { v: 1, entities, targets: keep(targets) };
+  if (be) out.be = true;
+  if (be) out.mirror = keep(mir.rows).map((i) => Object.assign({}, i, { counterpart: i.counterpart }));
+  // Only when not empty: a Go pack stays the same.
+  if (errors.length) out.errors = errors;
+  if (schemaItems.length) out.schemas = schemaItems.map((i) => ({ name: i.schema, alias: i.alias, file: i.file, start: i.start, end: i.end }));
+  return Object.assign(out, {
+    exemplars: keep(ex.items), tests: keep(tests), reuse: keep(reuse),
     doc: docRel, graph: !!(loaded && loaded.model), text, bytes: Buffer.byteLength(text), ms: Date.now() - t0,
-  };
+  });
 }
 
 function write(runDir, pack) {
@@ -1021,8 +1646,31 @@ function readPlan(root, pack, opts = {}) {
     // Style helpers the DOC names: only in an exemplar's file or a shared style partial (_x.scss).
     const shared = (f) => STYLE_EXT.test(f) && /^_/.test(path.posix.basename(f));
     for (const h of styleHelpers(root, opts.docText || "")) if (exFiles.has(h.file) || shared(h.file)) add(h.file, h.a, h.b, `style helper ${h.word}`, 3);
+    // lorc 0.5.2: a mirror row whose counterpart the task writes.
+    for (const m of pack.mirror || []) {
+      const cp = m.counterpart || ((/ → (\S+) \(not in the doc\)$/.exec(String(m.what || "")) || [])[1]);
+      if (cp && files.includes(posix(cp))) add(m.file, m.start, m.end, `mirror of ${cp}`, 3.5);
+    }
+    // lorc 0.5.2 (back end): the error types the doc names (StandardError …): their fields shape the tests.
+    // The list comes from build() before the entity cap (pack.errors).
+    if (pack.be) {
+      for (const e of pack.errors || []) add(e.file, e.start, e.end, `error type ${e.name}`, 3);
+      // Generated schema shapes of the aliases that the task text names.
+      const txt = String(Array.isArray(opts.words) ? opts.words.join(" ") : opts.words || "");
+      for (const sc of pack.schemas || []) {
+        if (new RegExp(`\\b${sc.alias}\\b`).test(txt)) add(sc.file, sc.start, sc.end, `schema ${sc.name} (generated)`, 3.5);
+      }
+    }
     // Test exemplar: setup + top-level helpers (no it block).
-    const t0 = (pack.tests || [])[0];
+    // lorc 0.5.2: for a TS/JS test file of the task, the test of the same directory (else the same parent) first.
+    let t0 = (pack.tests || [])[0];
+    const tf = files.find((f) => TEST.test(f) && /\.[cm]?[jt]sx?$/i.test(f));
+    if (tf) {
+      const dir = path.posix.dirname(tf);
+      const same = (pack.tests || []).find((t) => path.posix.dirname(posix(t.file)) === dir)
+        || (pack.tests || []).find((t) => path.posix.dirname(path.posix.dirname(posix(t.file))) === path.posix.dirname(dir));
+      if (same) t0 = same;
+    }
     const tls = t0 && read(t0.file);
     if (tls) {
       const d = tls.findIndex((l) => /^describe(\.\w+)?\(/.test(l));
@@ -1127,4 +1775,4 @@ function styleHelpers(root, words) {
   return false;
 }
 
-module.exports = { build, write, cmd, entitiesOf, nounPhrases, ruleRange, localeKeys, readPlan, parsePlanRefs, planWords };
+module.exports = { build, write, cmd, entitiesOf, nounPhrases, ruleRange, localeKeys, readPlan, parsePlanRefs, planWords, makeCtx, loadGraph, cardOf, exportsCard };

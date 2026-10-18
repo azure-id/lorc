@@ -4,7 +4,7 @@ const assert = require("node:assert");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { parse, readDoc, namesOf } = require("../bin/lib/tier-text.js");
+const { parse, readDoc, namesOf, stripNegated } = require("../bin/lib/tier-text.js");
 
 const nouns = (r) => r.creates.map((c) => c.noun);
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "lorc-tt-"));
@@ -206,4 +206,24 @@ test("docNames: at most 8; endpointsOf; leadCue", () => {
   const cues = ["feat(pay): add payout card", "Fix crash on login", "chore(deps): bump lodash", "[PAY-12] Remove old banner",
     "PAY-3 update the copy", "refactor: extract hook", "Payout list sorting", "tambah halaman laporan"].map(leadCue);
   assert.deepStrictEqual(cues, ["add", "fix", "bump", "remove", "update", "refactor", "other", "add"]);
+});
+
+test("T5: a negated migration is not a migration cue", () => {
+  assert.strictEqual(parse("Implement X. No DB migration.").cues.migration, false);
+  assert.strictEqual(parse("Do not add a migration for this").cues.migration, false);
+  assert.strictEqual(parse("Add a migration for the orders table").cues.migration, true);
+  assert.ok(!/migration/.test(stripNegated("No DB migration.")));
+  const dir = tmp();
+  fs.writeFileSync(path.join(dir, "T.md"), "Add the list endpoint.\nNo DB migration.\n");
+  assert.strictEqual(parse("Implement the ticket", { root: dir, doc: "T.md", known: () => false }).cues.migration, false);
+  fs.writeFileSync(path.join(dir, "M.md"), "Add a migration for the orders table.\n");
+  assert.strictEqual(parse("Implement the ticket", { root: dir, doc: "M.md", known: () => false }).cues.migration, true);
+});
+
+test("doc.paths: repo paths in order, unique, not filtered by known names", () => {
+  const dir = tmp();
+  fs.writeFileSync(path.join(dir, "T.md"), "1. src/services/va.ts - new.\n2. `src/init.ts` and src/services/va.ts again.\n3. Edit types.ts (no slash).\n4. internal/core/autoapply/handlers/autoapply-handler.go\n");
+  const r = parse("Implement the ticket", { root: dir, doc: "T.md", known: () => false });
+  assert.deepStrictEqual(r.doc.paths, ["src/services/va.ts", "src/init.ts", "internal/core/autoapply/handlers/autoapply-handler.go"]);
+  assert.deepStrictEqual(r.doc.names, []);
 });

@@ -4,13 +4,14 @@ One lean coding skill for Claude Code.
 
 [![npm](https://img.shields.io/npm/v/@azure-id/lorc?label=npm)](https://www.npmjs.com/package/@azure-id/lorc) ![node](https://img.shields.io/badge/node-%E2%89%A5%2018-green) ![license](https://img.shields.io/badge/license-MIT-lightgrey) ![dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)
 
-**Latest version:** 0.4.3 — 17-10-2026 · npm: [`@azure-id/lorc`](https://www.npmjs.com/package/@azure-id/lorc)
+**Latest version:** 0.5.2 — 18-10-2026 · npm: [`@azure-id/lorc`](https://www.npmjs.com/package/@azure-id/lorc)
 
 ## What it is
 
 lorc is one skill: `/lorc`. It does one coding request: a fix, a feature or a refactor.
 lorc started from ORC parts: house rules, wiki, code pattern, executors, orc extra, review, and wait on limit.
 Since 0.4.0, lorc owns its code graph engine (forked from ORC 2.3.0).
+Since 0.5.0, the graph also links store keys, component events and props, i18n keys, config keys and tables, in the front end and the back end.
 When ORC 2.2.0 or newer is installed, lorc calls ORC.
 When ORC is not installed, lorc does the same work itself.
 lorc has zero runtime dependencies.
@@ -112,7 +113,7 @@ More: [docs/settings.md](docs/settings.md)
 | `lorc tier` | lorc's tier engine |
 | `lorc context` | the context pack: anchored line ranges for a request |
 | `lorc read` | the read plan: the code ranges a run or a task needs, in one call |
-| `lorc graph upgrade` | convert a format-1 graph store in place |
+| `lorc graph` | code graph: `where`, `status [--heal]`, `update`, `scan`, `upgrade`, `gc`, `ctx`, `map`, `changes`, `sync` |
 | `lorc run end` | finish the run: graph update, run record |
 | `lorc doctor` | check the install; `--fix` repairs |
 | `lorc upgrade` | install the latest version, then update |
@@ -120,6 +121,22 @@ More: [docs/settings.md](docs/settings.md)
 All commands: [docs/commands.md](docs/commands.md)
 
 ## Benchmark
+
+**0.5.x — lorc vs no skills** (medians of 3 runs, Opus 5.5 medium, blind grades). The tests ran on real-world, complex production repos.
+
+| Stack · level | Lane s | Cost $ | Grade | lorc vs no skills |
+|---|---|---|---|---|
+| Vue 2 SPA | 905 → 667 | 4.31 → 2.90 | 84 → 83 | time −26 %, cost −33 %, tokens −47 % |
+| Go Fiber API · mid | 310 → 242 | 1.54 → 1.50 | 94 → 96 | time −22 %, cost −3 % |
+| Go Fiber API · high | 335 → 285 | 1.81 → 1.74 | 96 → 93 | time −15 %, cost −4 % |
+| TS Express + TypeORM · mid | 269 → 283 | 1.08 → 0.81 | 96 → 96 | time +5 %, cost −25 % |
+| TS Express + TypeORM · high | 294 → 329 | 1.47 → 1.44 | 95 → 89 | time +12 %, cost −2 % |
+
+Back end: lorc 0.5.2. Front end: lorc 0.5.0 (the 0.5.2 front-end pack and tier are unchanged).
+
+Details: [docs/benchmark.md](docs/benchmark.md#05x--front-end--back-end-vs-no-skills-18-10-2026)
+
+**Earlier (0.4.3 vs `/orc-quick`)**
 
 | Arm | Lane s | Cost $ | Tokens | Score | E2E |
 |---|---|---|---|---|---|
@@ -146,21 +163,21 @@ Never edit the generated executor files. Edit `agents-src/executor.template.md`,
 
 ## Changelog
 
-### 0.4.3 — 17-10-2026
-The 0.4 line in short:
+### 0.5.2 — 18-10-2026
+Back-end fixes from the 0.5.1 eval:
 
-- **Eval medians vs 0.3.3 (RMT1): lane 746 → 627 s, cost $2.82 → $2.36, tokens 4.31M → 3.40M, score 86 → 88, graph calls 1 → 0.**
-- Read file: each executor task gets a small read file (one Read); `lorc read` prints the main read plan in one call.
-- lorc owns the graph engine: store format 2, 1-file update 11.5 MB → 254 KB written, cold build 3.7 s → 2.0 s.
-- More robust graph: zero-symbol files 60 → 8, partial files 72 → 17, API functions with a URL 43 → 248.
-- Context pack: anchored line ranges for the names in the request and the doc.
-- Smarter tier engine, and `must_ask` items with options and evidence.
-- `lorc graph upgrade` converts an old store; old stores stay readable.
+- Tier: the risk floor counts only risky files that the work changes. High or complex work goes to sonnet or higher. A back-end ticket that names files sets a minimum size. The back-end split groups the work by layer (api / logic / data / worker).
+- Back-end context pack: a new **Mirror** section (the closest existing feature: its other files and its unit tests), more **Reuse** rows, and narrow ranges instead of whole files.
+- Executors: create a file with one Write, send all edits of a step in one message, and read the error fields and one same-layer test before writing tests. They run lint once at the end on every changed or new file. The slice lint line now lists new files and test files too.
+- Front-end packs and front-end tier decisions do not change.
 
 Full notes: [CHANGELOG.md](CHANGELOG.md)
 
 <details><summary>History</summary>
 
+- 0.5.1 — the context pack and the tier engine work better for back ends
+- 0.5.0 — framework + language links in the code graph; back-end core fixes
+- 0.4.3 — one small read file per executor task; eval medians beat 0.3.3
 - 0.4.2 — read plan: `lorc read` prints the code a run or a task needs
 - 0.4.1 — executor: fewer messages; slice refs get a range
 - 0.4.0 — lorc owns the graph engine (store format 2, upgrade), context pack, smarter tier engine

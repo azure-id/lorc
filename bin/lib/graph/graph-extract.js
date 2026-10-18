@@ -53,6 +53,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
+const L = require("./graph-links.js");
 
 // @3 (W9): route handlers are symbols, and a function passed BY NAME is a `ref`.
 // @4 (EW1): every record says how much of the file the extractor actually saw.
@@ -60,6 +61,8 @@ const { spawnSync } = require("child_process");
 const HEURISTIC = "heuristic@7";
 const MAX_CALLS_PER_SYMBOL = 200;
 const MAX_EFFECTS_PER_SYMBOL = 12;
+const MAX_ENV_EFFECTS = 200;
+const MAX_TABLE_EFFECTS = 64;
 const MAX_URLS_PER_SYMBOL = 200;
 
 const KW = new Set(
@@ -589,13 +592,25 @@ function argPieces(c, open, close) {
         const sp = strAt.get(at);
         if (sp) obj[x[1]] = src.slice(sp.start, sp.end);
       }
+      // lorc 0.5.0 (W34b): `dir: path.join(__dirname, 'a', 'b')` (also
+      // `resolve`, with or without `path.`) → `dir: "a/b"`, and
+      // `dirNameRoutePrefix: false` → `noDirPrefix: "1"`. For autoload mounts.
+      const dm = /\bdir\s*:\s*(?:path\s*\.\s*)?(?:join|resolve)\s*\(\s*__dirname\s*((?:,\s*(["'])[^"'\n]*\2\s*)+)\)/.exec(body);
+      if (dm) {
+        const off = bodyStart + dm.index + dm[0].length - 1 - dm[1].length;
+        const segs = stringsIn(src, strAt, off, bodyStart + dm.index + dm[0].length);
+        const dir = segs.join("/").replace(/^\.?\/+/, "").replace(/\/+$/, "");
+        if (segs.length && dir) obj.dir = dir;
+      }
+      if (/\bdirNameRoutePrefix\s*:\s*false\b/.test(body)) obj.noDirPrefix = "1";
       if (Object.keys(obj).length) p.obj = obj;
     } else if (/\+\s*(["'`])[^"'`]*\1\s*$/.test(t)) {
       // `BASE + "/p"` — the TAIL is known, the prefix is not.
       const all = stringsIn(src, strAt, bodyStart, end);
       if (all.length) p.cat = all[all.length - 1];
     } else {
-      const req = /^\s*require\s*\(\s*(["'])[^"']*\1\s*\)\s*$/.exec(body);
+      // lorc 0.5.0 (W34b): a dynamic `import('./x')` is a target like `require`.
+      const req = /^\s*(?:require|import)\s*\(\s*(["'])[^"']*\1\s*\)\s*$/.exec(body);
       if (req) p.req = firstStringIn(src, strAt, bodyStart, end);
       const inc = /^\s*include\s*\(/.exec(body);
       if (inc) p.inc = firstStringIn(src, strAt, bodyStart, end);
@@ -603,6 +618,10 @@ function argPieces(c, open, close) {
       if (cls) p.id = cls[1].split("\\").pop() + "." + (firstStringIn(src, strAt, bodyStart, end) || "");
       const id = !p.req && !p.inc && !p.id ? IDENT_PIECE.exec(body) : null;
       if (id && !KW.has(id[1]) && !/^\d/.test(id[1])) p.id = id[1].replace(/\s+/g, "").replace(/->|::/g, ".");
+      // lorc 0.5.0 (W28g): `x.getRouter()` / `new X(…).getRouter()` — a
+      // mount target that is a call with no arguments.
+      const rc = !p.req && !p.inc && !p.id ? /^\s*(?:new\s+([A-Za-z_$][\w$]*)\s*\([\s\S]*\)|((?:this\s*\.\s*)?[A-Za-z_$][\w$]*))\s*\.\s*([A-Za-z_$][\w$]*)\s*\(\s*\)\s*$/.exec(body) : null;
+      if (rc) p.rcall = `${rc[1] || rc[2].replace(/\s+/g, "")}.${rc[3]}`;
     }
     // W19d (F3): `LIST + "/" + id` — the terms of a concatenation that starts
     // with a name. `urlOf` puts the file constant's text in for a known name.
@@ -644,7 +663,155 @@ function assignBefore(m, at) {
   return KW.has(n) ? null : n;
 }
 
+// ── TypeScript declarations (lorc 0.5.0, W32c, C8) ──────────────────────────
+// `interface`, `type` and `enum` declare names that other files import and
+// use. Without them a TypeScript back end had hundreds of names with no symbol.
+// An interface member that is a method signature, or a property with a
+// function type, is a NAME-ONLY method `I.m`. An enum member is not a symbol:
+// a ref `E.k` resolves to the enum itself (graph-query.js).
+const TS_IFACE = /^[ \t]*(export[ \t]+)?(?:default[ \t]+)?(?:declare[ \t]+)?interface[ \t]+([A-Za-z_$][\w$]*)([^{;]*)\{/gm;
+const TS_TYPE = /^[ \t]*(export[ \t]+)?(?:declare[ \t]+)?type[ \t]+([A-Za-z_$][\w$]*)[ \t]*(?:<[^=;]*?>)?[ \t]*=/gm;
+const TS_ENUM = /^[ \t]*(export[ \t]+)?(?:declare[ \t]+)?(?:const[ \t]+)?enum[ \t]+([A-Za-z_$][\w$]*)[ \t]*\{/gm;
+const TS_SIG = /^\s*(?:readonly[ \t]+)?([A-Za-z_$][\w$]*)[ \t]*\??[ \t]*(?:<[^>\n]*>)?[ \t]*(\(|:)/;
+function tsBases(tail) {
+  const ex = /\bextends\b([\s\S]*)$/.exec(tail || "");
+  if (!ex) return [];
+  // Drop the type arguments, nested ones too: `B<C<D>>` is `B`.
+  let t = ex[1];
+  for (let k = 0; k < 5 && /<[^<>]*>/.test(t); k++) t = t.replace(/<[^<>]*>/g, "");
+  const out = [];
+  for (const b of t.split(",")) if (/^[A-Za-z_$][\w$.]*$/.test(b.trim())) out.push(b.trim().split(".").pop());
+  return [...new Set(out)].slice(0, 8);
+}
+// The end of a `type X = …` statement: the `;` at depth 0, or the end of a
+// line at depth 0 when the type does not go on to the next line.
+function typeEnd(m, from) {
+  let depth = 0;
+  for (let k = from; k < m.length; k++) {
+    const ch = m[k];
+    if (ch === "(" || ch === "{" || ch === "[") depth++;
+    else if (ch === ")" || ch === "}" || ch === "]") {
+      if (--depth < 0) return k - 1;
+    } else if (ch === ";" && depth === 0) return k;
+    else if (ch === "\n" && depth === 0) {
+      const done = m.slice(from, k).trim();
+      if (!done || /(?:[=|&,?:<]|=>)$/.test(done)) continue;
+      const next = /^\s*(\S)/.exec(m.slice(k + 1, k + 200));
+      if (next && /[|&?:.=>]/.test(next[1])) continue;
+      return k - 1;
+    }
+  }
+  return m.length - 1;
+}
+function tsDecls(c, add, defParens) {
+  const { m } = c;
+  let x;
+  TS_IFACE.lastIndex = 0;
+  while ((x = TS_IFACE.exec(m))) {
+    const open = x.index + x[0].length - 1;
+    const to = matchPair(m, open, "{", "}");
+    const name = x[2];
+    add({ name, qname: name, kind: "interface", from: x.index, to, exported: !!x[1], bases: tsBases(x[3]) });
+    // The members at depth 1: a piece ends at `;`, `,` or a line end.
+    let depth = 0;
+    let start = open + 1;
+    for (let k = open + 1; k <= to; k++) {
+      const ch = m[k];
+      if (depth === 0 && (ch === ";" || ch === "," || ch === "\n" || k === to)) {
+        const piece = m.slice(start, k);
+        const y = TS_SIG.exec(piece);
+        if (y && !MEMBER_KW.has(y[1]) && (y[2] === "(" || /^\s*(?:<[^>\n]*>\s*)?\(/.test(piece.slice(y[0].length)) && /=>/.test(piece))) {
+          const from = start + piece.indexOf(y[1]);
+          if (y[2] === "(") defParens.add(start + y[0].length - 1);
+          add({ name: y[1], qname: `${name}.${y[1]}`, kind: "method", from, to: from, exported: !!x[1], nameOnly: true });
+        }
+        start = k + 1;
+      }
+      if (ch === "(" || ch === "{" || ch === "[") depth++;
+      else if (ch === ")" || ch === "}" || ch === "]") depth--;
+    }
+  }
+  TS_TYPE.lastIndex = 0;
+  while ((x = TS_TYPE.exec(m))) {
+    add({ name: x[2], qname: x[2], kind: "type", from: x.index, to: typeEnd(m, x.index + x[0].length), exported: !!x[1] });
+  }
+  TS_ENUM.lastIndex = 0;
+  while ((x = TS_ENUM.exec(m))) {
+    const open = x.index + x[0].length - 1;
+    add({ name: x[2], qname: x[2], kind: "enum", from: x.index, to: matchPair(m, open, "{", "}"), exported: !!x[1] });
+  }
+}
+
+// lorc 0.5.0 (W28g): the top-level arguments between `open` and `close`,
+// each with its trimmed text and its start offset.
+function splitTop(m, open, close) {
+  const out = [];
+  let depth = 0;
+  let a = open + 1;
+  for (let k = open + 1; k <= close && k < m.length; k++) {
+    const ch = m[k];
+    const end = k === close;
+    if (!end && (ch === "(" || ch === "[" || ch === "{")) depth++;
+    else if (!end && (ch === ")" || ch === "]" || ch === "}")) depth--;
+    if (!end && !(ch === "," && depth === 0)) continue;
+    const text = m.slice(a, k);
+    if (text.trim()) out.push({ a: a + text.search(/\S/), text: text.trim() });
+    a = k + 1;
+  }
+  return out;
+}
+
+// lorc 0.5.0 (W28g): a route handler argument → `{ fn }` (an arrow or a
+// function expression), `{ name, self, wrapped }` (a handler by name), or null.
+const HANDLER_ID = /^(this[ \t]*\.[ \t]*)?([A-Za-z_$][\w$]*(?:[ \t]*\.[ \t]*[A-Za-z_$][\w$]*)*?)([ \t]*\.[ \t]*bind[ \t]*\([^()]*\))?$/;
+function handlerOf(t, depth) {
+  t = String(t).trim();
+  if (/^(?:async\s+)?(?:function\b|(?:\([^()]*\)|[A-Za-z_$][\w$]*)\s*(?::[^=]+)?=>)/.test(t)) return { fn: true };
+  const y = HANDLER_ID.exec(t);
+  if (y) {
+    const name = y[2].replace(/\s+/g, "");
+    if (!name || name === "this" || REF_WORDS.has(name) || (!y[1] && KW.has(name))) return null;
+    return { name, self: !!y[1], wrapped: !!y[3] };
+  }
+  const w = /^[A-Za-z_$][\w$.]*\s*\(/.exec(t);
+  if (!w || depth >= 3 || !t.endsWith(")")) return null;
+  const open = w[0].length - 1;
+  if (matchPairQuiet(t, open, "(", ")") !== t.length - 1) return null;
+  const inner = splitTop(t, open, t.length - 1);
+  if (!inner.length) return null;
+  const h = handlerOf(inner[inner.length - 1].text, depth + 1);
+  return h ? { ...h, wrapped: true } : null;
+}
+
 // ── declarations: brace languages ───────────────────────────────────────────
+// lorc 0.5.0 (W34b): the paren of a call after its name, past an optional
+// BALANCED type-argument list (`<{ Body: Array<Item> }>`, also over lines).
+// The `>` of `=>` does not close the list. A `;` outside `{ }` or more than
+// 400 chars stops the search. The result is -1 when no `(` follows.
+function typeArgsEnd(m, at) {
+  let k = at;
+  while (k < m.length && (m[k] === " " || m[k] === "\t")) k++;
+  if (m[k] === "<") {
+    const stop = Math.min(m.length, k + 400);
+    let depth = 0;
+    let brace = 0;
+    let j = k;
+    for (; j < stop; j++) {
+      const ch = m[j];
+      // A `;` in a type literal (`{ Body: B; Headers: H }`) is a separator.
+      if (ch === "{") brace++;
+      else if (ch === "}") brace--;
+      else if (ch === ";" && brace <= 0) return -1;
+      else if (ch === "<") depth++;
+      else if (ch === ">" && m[j - 1] !== "=" && --depth === 0) break;
+    }
+    if (j >= stop) return -1;
+    k = j + 1;
+    while (k < m.length && /\s/.test(m[k])) k++;
+  }
+  return m[k] === "(" ? k : -1;
+}
+
 function braceDefs(c, lang) {
   const { src, m, starts } = c;
   const defs = [];
@@ -667,7 +834,8 @@ function braceDefs(c, lang) {
   let x;
 
   if (lang === "js" || lang === "ts") {
-    const CLASS = /^[ \t]*(export[ \t]+)?(?:default[ \t]+)?(?:abstract[ \t]+)?class[ \t]+([A-Za-z_$][\w$]*)([^{;]*)\{/gm;
+// lorc 0.5.0 (W28f): a decorator may stand on the class line (`@Entity('t') export class T {}`).
+    const CLASS = /^[ \t]*(?:@[\w.]+(?:\([^()\n]*\))?[ \t]+)*(export[ \t]+)?(?:default[ \t]+)?(?:abstract[ \t]+)?class[ \t]+([A-Za-z_$][\w$]*)([^{;]*)\{/gm;
     while ((x = CLASS.exec(m))) {
       const open = x.index + x[0].length - 1;
       const to = matchPair(m, open, "{", "}");
@@ -724,10 +892,17 @@ function braceDefs(c, lang) {
     // registration call, so the middleware passed to it and every call inside
     // the handler belong to the route. W1: a handler passed BY NAME
     // (`app.get("/p", handler)`) is a route too, when the receiver is a router.
-    const ROUTE = /\b([A-Za-z_$][\w$]*)[ \t]*\.[ \t]*(get|post|put|patch|delete|del|all|options|head)[ \t]*\(/g;
+    // lorc 0.5.0 (W34b): the regex stops at the method name. A typed
+    // registration (`fastify.post<{ Body: B }>("/p", …)`) has a type-argument
+    // list before the paren. `typeArgsEnd` skips it.
+    const ROUTE = /\b([A-Za-z_$][\w$]*)[ \t]*\.[ \t]*(get|post|put|patch|delete|del|all|options|head)(?=[ \t]*[(<])/g;
     const ROUTER_HEAD = /^(router|app|server|api|routes?|r|fastify|koa|hono|express|v\d+)$/i;
+    // lorc 0.5.0 (W28g): a name that ends with `router` is a router head too
+    // (`bankRouter`, `this.v1Router`). A class controller registers on a field.
+    const routerHead = (h) => ROUTER_HEAD.test(h) || /[rR]outer$/.test(h);
     while ((x = ROUTE.exec(m))) {
-      const paren = x.index + x[0].length - 1;
+      const paren = typeArgsEnd(m, x.index + x[0].length);
+      if (paren < 0) continue;
       const close = matchPair(m, paren, "(", ")");
       const pieces = argPieces(c, paren, close);
       const p0 = pieces[0];
@@ -737,9 +912,19 @@ function braceDefs(c, lang) {
       // `cache.get("/k")` and `request(app).get("/orders")` pass no handler.
       const fnArg = /=>|\bfunction\b/.test(m.slice(p0 ? paren + 1 : paren, close));
       const namedHandler = !fnArg && pieces.length >= 2 && pieces[pieces.length - 1].id && ROUTER_HEAD.test(x[1]);
-      if (!fnArg && !namedHandler) continue;
+      // lorc 0.5.0 (W28g): the LAST argument is the handler when it is
+      // function-like: `this.m`, `this.m.bind(this)`, `m.bind(x)`, or a
+      // wrapper call around one of them (`asyncHandler(this.m)`).
+      const tops = splitTop(m, paren, close);
+      const hd = pieces.length >= 2 && tops.length >= 2 && routerHead(x[1]) ? handlerOf(tops[tops.length - 1].text, 0) : null;
+      if (!fnArg && !namedHandler && !hd) continue;
       regParens.add(paren);
-      add({ kind: "route", method: VERB_OF(x[2]), path: routePath, head: x[1], name: "route", from: x.index, to: close, exported: false });
+      const rd = { kind: "route", method: VERB_OF(x[2]), path: routePath, head: x[1], name: "route", from: x.index, to: close, exported: false };
+      if (/\bthis[ \t]*\.[ \t]*$/.test(m.slice(Math.max(0, x.index - 12), x.index))) rd.on = `this.${x[1]}`;
+      // A `this.m` handler, a bound handler or a wrapped handler is a REF of
+      // the route. `finalize` adds it; a bare name is a ref already.
+      if (hd && hd.name && (hd.self || hd.wrapped)) rd.hRef = { name: hd.name, line: lineOf(starts, tops[tops.length - 1].a), ...(hd.self ? { self: true } : {}) };
+      add(rd);
     }
     // W19d (F6): a test block, `describe("title", () => { … })` (also
     // `context` / `suite`, with `.only` / `.skip` / `.each(…)`). Its callback
@@ -783,7 +968,7 @@ function braceDefs(c, lang) {
     // A member starts at a line start, or right after the `{` / `}` / `;`
     // before it — so `class A extends B { go() { … } }` on one line is a
     // class WITH a member (W2: two fixtures and one real repository had it).
-    const MEMBER = /(?<=^|[{};])[ \t]*((?:(?:public|private|protected|static|async|readonly|override|abstract|get|set|declare|accessor)[ \t]+)*)\*?[ \t]*(#?[A-Za-z_$][\w$]*)[ \t]*\??[ \t]*(?:<[^>\n]*>)?[ \t]*(\(|(?::[^=\n;]+)?=[ \t]*(?:async[ \t]+)?(?:\(|[A-Za-z_$][\w$]*[ \t]*=>))/gm;
+    const MEMBER = /(?<=^|[{};])[ \t]*((?:(?:public|private|protected|static|async|readonly|override|abstract|get|set|declare|accessor)[ \t]+)*)\*?[ \t]*(#?[A-Za-z_$][\w$]*)[ \t]*\??[ \t]*(?:<[^>\n]*>)?[ \t]*(\(|(?::[^=\n;]+)?=[ \t]*(?:async[ \t]+)?(?:\(|function\b[^(\n]*\(|[A-Za-z_$][\w$]*[ \t]*=>))/gm;
     for (const cl of classes) {
       MEMBER.lastIndex = cl.open + 1;
       while ((x = MEMBER.exec(m)) && x.index < cl.to) {
@@ -795,7 +980,8 @@ function braceDefs(c, lang) {
           body = bodyAfter(m, matchPair(m, paren, "(", ")") + 1, false);
         } else if (x[3].endsWith("(")) {
           paren = end - 1;
-          body = bodyAfter(m, matchPair(m, paren, "(", ")") + 1, true);
+          // lorc 0.5.0 (W32c, C8): `p = function (…) {…}` has a body and no arrow.
+          body = bodyAfter(m, matchPair(m, paren, "(", ")") + 1, !/\bfunction\b/.test(x[3]));
         } else {
           body = bodyAfter(m, m.lastIndexOf("=>", end), true);
         }
@@ -804,6 +990,13 @@ function braceDefs(c, lang) {
         // declaration. Recording it made `NestFactoryStatic.create` three
         // symbols on nestjs/nest and every `ctx` on it an ambiguity.
         if (!body || body.end >= cl.to || m[body.open] === ";") {
+          // lorc 0.5.0 (W32c, C8): an `abstract m(…): R;` is a NAME-ONLY
+          // method. A call to it from a subclass then has a target.
+          if (body && body.end < cl.to && m[body.open] === ";" && x[3] === "(" && /\babstract\b/.test(x[1])) {
+            const name = x[2].replace(/^#/, "");
+            const from = x.index + x[0].length - x[0].replace(/^\s+/, "").length;
+            if (!MEMBER_KW.has(name)) add({ name, qname: `${cl.name}.${name}`, kind: "method", from, to: from, exported: cl.exported, member: true, owner: cl, nameOnly: true });
+          }
           if (body && body.end < cl.to) MEMBER.lastIndex = Math.max(body.end + 1, end);
           continue;
         }
@@ -815,6 +1008,7 @@ function braceDefs(c, lang) {
         MEMBER.lastIndex = Math.max(body.end + 1, end);
       }
     }
+    if (lang === "ts") tsDecls(c, add, defParens);
   } else if (lang === "go") {
     const TYPE = /^type[ \t]+([A-Za-z_]\w*)(?:\[[^\]]*\])?[ \t]+(?:struct|interface)[ \t]*\{/gm;
     while ((x = TYPE.exec(m))) {
@@ -1226,17 +1420,18 @@ function memberOf(m, a, b) {
   let x = MEM_ACCESSOR.exec(seg);
   if (x) return { type: "fn", name: x[1], paren: a + x[0].length - 1 };
   x = MEM_METHOD.exec(seg);
-  if (x && !/^(?:function|async)$/.test(x[1])) return { type: "fn", name: keyName(x[1]), paren: a + x[0].length - 1 };
+  if (x && !/^(?:function|async)$/.test(x[1])) return { type: "fn", name: keyName(x[1]), paren: a + x[0].length - 1, raw: x[1] };
   x = MEM_PAIR.exec(seg);
   if (x) {
     const name = keyName(x[1]);
+    const raw = x[1];
     const v = a + x[0].length;
     const f = fnValueAt(m, v);
     // `submit: function submit() {}` — the paren is a declaration's, never a call.
-    if (f) return { type: "fn", name, paren: f.paren, v };
-    if (m[v] === "{") return { type: "obj", name, open: v, close: matchPairQuiet(m, v, "{", "}"), v };
-    if (m[v] === "[") return { type: "arr", name, open: v, close: matchPairQuiet(m, v, "[", "]"), v };
-    return { type: "val", name, v };
+    if (f) return { type: "fn", name, paren: f.paren, v, raw };
+    if (m[v] === "{") return { type: "obj", name, open: v, close: matchPairQuiet(m, v, "{", "}"), v, raw };
+    if (m[v] === "[") return { type: "arr", name, open: v, close: matchPairQuiet(m, v, "[", "]"), v, raw };
+    return { type: "val", name, v, raw };
   }
   if (/^[A-Za-z_$][\w$]*\s*$/.test(seg)) return { type: "short", name: seg.trim() };
   return null;
@@ -1427,7 +1622,9 @@ function objectDefs(c, have, sfc) {
   const constant = (name, from, to, v) => {
     if (!IDENT_RE.test(name) || taken.has(name) || (v != null && reexport(v))) return;
     taken.add(name);
-    add({ name, qname: name, kind: "const", from, to, exported: true });
+    // lorc 0.5.0: a same-file string value is kept as `value`.
+    const value = c.consts && c.consts.has(name) ? c.consts.get(name) : undefined;
+    add({ name, qname: name, kind: "const", from, to, exported: true, ...(value !== undefined ? { value } : {}) });
   };
   // E2 for an object whose members are data: each key is a constant. A
   // function-valued member is a function, not a constant, and is left alone.
@@ -1468,7 +1665,8 @@ function objectDefs(c, have, sfc) {
         if (IDENT_RE.test(w)) bases.push(w);
       }
     }
-    const cls = add({ name: oname, qname: oname, kind: "class", from, to: close, exported: true, ...(bases.length ? { bases: bases.slice(0, 8) } : {}) });
+    // `open` lets a link adapter read the object again (internal, not copied).
+    const cls = add({ name: oname, qname: oname, kind: "class", from, to: close, exported: true, ...(bases.length ? { bases: bases.slice(0, 8) } : {}), open });
     // v2.2.0 T3: the component CONTRACT — `props`, `emits`, `inject`. Each
     // member is a name-only symbol; like a `const`, it owns no call.
     for (const x of top) {
@@ -1490,34 +1688,36 @@ function objectDefs(c, have, sfc) {
         }
       }
     }
-    const method = (name, from, to, paren) => {
+    // `sec` is the section name (null for a top-level member) and `rawKey` the
+    // key as written. Both are internal: a link adapter reads them.
+    const method = (name, from, to, paren, sec, rawKey) => {
       if (paren != null) defParens.add(paren);
-      add({ name, qname: `${oname}.${name}`, kind: "method", from, to, exported: false });
+      add({ name, qname: `${oname}.${name}`, kind: "method", from, to, exported: false, sec, rawKey });
     };
-    const section = (open2, close2) => {
+    const section = (open2, close2, sec) => {
       for (const [a, b] of objectMembers(m, open2, close2)) {
         const mem = memberOf(m, a, b);
         if (!mem) continue;
-        if (mem.type === "fn") method(mem.name, a, trim(b), mem.paren);
+        if (mem.type === "fn") method(mem.name, a, trim(b), mem.paren, sec, mem.raw);
         else if (mem.type === "obj" && mem.close > mem.open) {
           // `label: { get() {…}, set(v) {…} }` and a watcher's `{ handler() {…} }`
           // are ONE member whose behaviour sits in its inner functions.
           const inner = objectMembers(m, mem.open, mem.close).map(([p, q]) => memberOf(m, p, q)).filter(Boolean);
           if (inner.some((i) => i.type === "fn" && /^(get|set|handler)$/.test(i.name))) {
             for (const i of inner) if (i.type === "fn" && i.paren != null) defParens.add(i.paren);
-            method(mem.name, a, trim(b), null);
+            method(mem.name, a, trim(b), null, sec, mem.raw);
           }
         }
       }
     };
     for (const x of top) {
-      if (x.mem.type === "fn") method(x.mem.name, x.a, trim(x.b), x.mem.paren);
-      else if (OBJ_SECTIONS.has(x.mem.name) && x.mem.type === "obj" && x.mem.close > x.mem.open) section(x.mem.open, x.mem.close);
+      if (x.mem.type === "fn") method(x.mem.name, x.a, trim(x.b), x.mem.paren, null, x.mem.raw);
+      else if (OBJ_SECTIONS.has(x.mem.name) && x.mem.type === "obj" && x.mem.close > x.mem.open) section(x.mem.open, x.mem.close, x.mem.name);
       else if (OBJ_SECTIONS.has(x.mem.name) && x.mem.type === "short") {
         // `const mutations = { … }; export default { mutations }` — the section
         // is declared above and named here.
         const d = declOf(x.mem.name);
-        if (d && m[d.v] === "{") section(d.v, matchPairQuiet(m, d.v, "{", "}"));
+        if (d && m[d.v] === "{") section(d.v, matchPairQuiet(m, d.v, "{", "}"), x.mem.name);
       }
     }
     return cls;
@@ -1552,6 +1752,17 @@ function objectDefs(c, have, sfc) {
   while (!(sfc && sfc.svelte) && (x = EXPORT_CONST.exec(m))) {
     const v = x.index + x[0].length;
     if (fnValueAt(m, v)) continue;
+    // lorc 0.5.0 (W28h): `export const mixin = { methods: {…} }` with a
+    // component, mixin or store shape is a class with its members.
+    if (m[v] === "{" && !taken.has(x[1])) {
+      const close = matchPairQuiet(m, v, "{", "}");
+      const top = topOf(v, close);
+      if (close > v && isShaped(top, false)) {
+        taken.add(x[1]);
+        objectClass(v, close, x.index, x[1], top);
+        continue;
+      }
+    }
     constant(x[1], x.index, valueEnd(m, v), v);
   }
   const EXPORTS_DOT = /^[ \t]*(?:module[ \t]*\.[ \t]*)?exports[ \t]*\.[ \t]*([A-Za-z_$][\w$]*)[ \t]*=[ \t]*/gm;
@@ -1730,6 +1941,10 @@ function vuePass(c, raw, sfc, defs, calls, imports, ownerName) {
   if (!sfc) {
     const seenObj = new Set();
     const PATH = /\bpath[ \t]*:[ \t]*['"`]/g;
+    // lorc 0.5.0 (W28h): pass 1 finds every route object (also a layout
+    // parent with only `path` + `children`). Pass 2 gives each one its FULL
+    // path: the parent's full path + "/" + its own path.
+    const recs = [];
     while ((x = PATH.exec(m))) {
       // the enclosing `{`
       let d = 0;
@@ -1763,12 +1978,52 @@ function vuePass(c, raw, sfc, defs, calls, imports, ownerName) {
       const nm = get("name");
       const nl = nm && nm.mem.type === "val" ? STR_LIT.exec(src.slice(nm.mem.v, nm.mem.v + 200)) : null;
       const ok = hasComp || (get("components") && get("components").mem.type === "obj") || (nl && (get("meta") || get("children") || get("redirect")));
-      if (!ok) continue;
-      let to = close;
-      const def = { kind: "route", method: "VIEW", path: pl[2], name: "route", from: open, to, exported: false, s: lineAt(open), e: lineAt(to) };
-      if (nl) def.route_name = nl[2];
+      const ch = get("children");
+      if (!ok && !ch) continue;
+      recs.push({ open, close, own: pl[2], ok, nl, hasComp, compId, comp, ch });
+    }
+    // The parent of a record: the smallest other record whose `children`
+    // array holds it.
+    const parentOf = (r) => {
+      let best = null;
+      for (const o of recs) {
+        if (o === r || !o.ch || o.ch.mem.type !== "arr" || !(o.ch.mem.open < r.open && o.ch.mem.close > r.close)) continue;
+        if (!best || o.close - o.open < best.close - best.open) best = o;
+      }
+      return best;
+    };
+    const fullOf = (r, depth) => {
+      if (r.full !== undefined) return r.full;
+      const par = depth < 8 ? parentOf(r) : null;
+      let full = r.own;
+      if (par && !r.own.startsWith("/")) {
+        const pf = fullOf(par, depth + 1);
+        full = r.own ? `${pf}/${r.own}` : pf;
+      }
+      r.full = full.replace(/\/{2,}/g, "/");
+      return r.full;
+    };
+    for (const r of recs) {
+      const full = fullOf(r, 0);
+      // Cross-file children: `children: xs` or `children: [...xs]` → a mount
+      // with the full path as the prefix.
+      if (r.ch && full) {
+        let target = null;
+        if (r.ch.mem.type === "val") target = m.slice(r.ch.mem.v, r.ch.b).trim();
+        else if (r.ch.mem.type === "arr") {
+          const sp = /^\s*\.\.\.\s*([A-Za-z_$][\w$]*)\s*,?\s*$/.exec(m.slice(r.ch.mem.open + 1, r.ch.mem.close));
+          if (sp) target = sp[1];
+        }
+        if (target && IDENT_RE.test(target) && c.extras) {
+          const line = lineAt(r.open);
+          c.extras.push({ line, field: "mounts", item: { prefix: full, target, line } });
+        }
+      }
+      if (!r.ok) continue;
+      const def = { kind: "route", method: "VIEW", path: full, name: "route", from: r.open, to: r.close, exported: false, s: lineAt(r.open), e: lineAt(r.close) };
+      if (r.nl) def.route_name = r.nl[2];
       defs.push(def);
-      if (hasComp) calls.push({ name: compId, line: lineAt(comp.mem.v), ref: true });
+      if (r.hasComp) calls.push({ name: r.compId, line: lineAt(r.comp.mem.v), ref: true });
     }
   }
 
@@ -1813,6 +2068,8 @@ function vuePass(c, raw, sfc, defs, calls, imports, ownerName) {
         break;
       }
     }
+    // lorc 0.5.0: the adapters use the same template range.
+    if (tOpen >= 0 && tEnd > tOpen) c.tpl = { open: tOpen, end: tEnd };
     if (tOpen >= 0 && tEnd > tOpen && ownerName) {
       const tdef = { name: "template", qname: `${ownerName}.template`, kind: "template", from: tOpen, to: tEnd, exported: false, s: lineAt(tOpen), e: lineAt(tEnd), _raw: raw.slice(starts[lineAt(tOpen) - 1] || 0, tEnd + 1) };
       defs.push(tdef);
@@ -1830,8 +2087,18 @@ function vuePass(c, raw, sfc, defs, calls, imports, ownerName) {
       const locals = new Set();
       const VFOR = /\sv-for[ \t]*=[ \t]*(["'])([^"']*?)\s+(?:in|of)\s/g;
       while ((x = VFOR.exec(body))) for (const w of x[2].replace(/[()]/g, " ").split(/[\s,]+/)) if (w) locals.add(w);
+      // lorc 0.5.0 (W28h): slot props (`slot-scope`, `v-slot`, `#name`) are
+      // template locals too (for the whole template: an approximation).
+      const SLOT = /\s(?:slot-scope|v-slot(?::[\w.\-[\]()]+)?|#[\w.\-[\]()]+)[ \t]*=[ \t]*(?:"([^"]*)"|'([^']*)')/g;
+      while ((x = SLOT.exec(body))) for (const w of (x[1] != null ? x[1] : x[2]).match(/[A-Za-z_$][\w$]*/g) || []) locals.add(w);
+      // Arrow parameters are locals of their own expression.
+      const ARROW = /(?:\(([^()]*)\)|([A-Za-z_$][\w$]*))[ \t]*=>/g;
       const refsOf = (expr, at) => {
         const e = blankStrings(expr);
+        const own = new Set();
+        let ar;
+        ARROW.lastIndex = 0;
+        while ((ar = ARROW.exec(e))) for (const w of (ar[1] != null ? ar[1] : ar[2]).match(/[A-Za-z_$][\w$]*/g) || []) own.add(w);
         const ID = /[A-Za-z_$][\w$]*/g;
         let q;
         while ((q = ID.exec(e))) {
@@ -1843,8 +2110,8 @@ function vuePass(c, raw, sfc, defs, calls, imports, ownerName) {
           while (n < e.length && /\s/.test(e[n])) n++;
           // an object key: `{ name: … }`
           if (e[n] === ":" && (p < 0 || e[p] === "{" || e[p] === ",")) continue;
-          if (bad(w) || locals.has(w)) continue;
-          push({ name: w, line: lineAt(at + q.index), self: true, ref: true });
+          if (bad(w) || locals.has(w) || own.has(w)) continue;
+          push({ name: w, line: lineAt(at + q.index), self: true, ref: true, tpl: true });
         }
       };
       const ATTR = /\s(@[\w.:\-[\]]+|v-on:[\w.:\-[\]]+|:[\w.\-[\]]+|v-bind:[\w.\-[\]]+|v-(?:if|else-if|show|model|html|text|for)(?::[\w-]+)?(?:\.[\w-]+)*)[ \t]*=[ \t]*(?:"([^"]*)"|'([^']*)')/g;
@@ -1906,6 +2173,23 @@ function vuePass(c, raw, sfc, defs, calls, imports, ownerName) {
     }
   }
   return imps;
+}
+
+// lorc 0.5.0 (W28d): the calls on the template lines get a STABLE order by
+// rank. The structural links (child ref, listen, prop, route, store) come
+// first, then the i18n keys, then the bindings. Thus the cap drops the
+// bindings first. The calls out of the template keep their order.
+function tplOrder(c, calls) {
+  if (!c.tpl || !calls || !calls.length) return;
+  const a = lineOf(c.starts, c.tpl.open);
+  const b = lineOf(c.starts, c.tpl.end);
+  const rank = (cc) => (cc.listen || cc.prop || cc.route || cc.store || (cc.ref && !cc.tpl && !cc.self) ? 0 : cc.i18n ? 1 : 2);
+  const idx = [];
+  for (let i = 0; i < calls.length; i++) if (calls[i].line >= a && calls[i].line <= b) idx.push(i);
+  if (idx.length < 2) return;
+  const inside = idx.map((i, k) => ({ cc: calls[i], k, r: rank(calls[i]) }));
+  inside.sort((x, y) => x.r - y.r || x.k - y.k);
+  idx.forEach((i, k) => (calls[i] = inside[k].cc));
 }
 
 // ── declarations: Python (indentation) ──────────────────────────────────────
@@ -2215,6 +2499,17 @@ function normCall(name) {
 // other call keeps only its name and line, as before.
 const ARGS_WORTH = /(^|\.)(get|post|put|patch|delete|del|head|options|fetch|axios|request|use|register|include_router|register_blueprint|mount|path|re_path|url|include|NewRequest|Get|Post|Head|APIRouter|Blueprint|Router|Route|json|perform|GetAsync|PostAsync|PutAsync|DeleteAsync|PatchAsync|SendAsync|open|route|add_url_rule|Group|Mount|Handle|HandleFunc)$/;
 
+// True when the text before `at` (spaces and newlines skipped) ends with a
+// member operator: the call at `at` is on a receiver the path did not capture.
+function chainDot(c, at) {
+  const pre = c.m.slice(Math.max(0, at - 40), at);
+  const dot = c.lang === "php" ? /(?:->|::)\s*$/ : /(?:\?\.|(?<!\.)\.|->|::)\s*$/;
+  return dot.test(pre);
+}
+
+// The member that holds a component instance in a test (W32c, C12).
+const INST_HOLDER = /^(vm|componentInstance)$/;
+
 function scanCalls(c, defParens, regParens) {
   const { m, starts } = c;
   const out = [];
@@ -2227,7 +2522,8 @@ function scanCalls(c, defParens, regParens) {
     // declaration name, are not calls.
     const before = m.slice(Math.max(0, x.index - 12), x.index);
     if (/\b(function|def|func|fn)[ \t]*\*?[ \t]*$/.test(before)) continue;
-    const cc = normCall(x[1]);
+    // A keyword after a chain dot is a METHOD name (`knex('t').select(…)`).
+    const cc = normCall(x[1]) || (KW.has(x[1]) && chainDot(c, x.index) ? { name: x[1], self: false } : null);
     if (!cc) continue;
     const close = matchPair(m, paren, "(", ")");
     // `async (req, res) => …` is a parameter list, not a call to `async`.
@@ -2235,18 +2531,53 @@ function scanCalls(c, defParens, regParens) {
     // W1: `new OrderService().create(…)` / Python `OrderService().create(…)` —
     // the receiver is a constructor call, so the head is the class. Without it
     // the call is a bare `create`, and a bare name is never a class method.
+    let viaNew = false;
     if (!cc.name.includes(".") && !cc.self) {
       const chain = m.slice(Math.max(0, x.index - 160), x.index);
       const nw = c.lang === "py" ? /\b([A-Z][\w]*)[ \t]*\([^()]*\)[ \t]*\.[ \t]*$/.exec(chain) : /\bnew[ \t]+([A-Za-z_$][\w$]*)[ \t]*\([^()]*\)[ \t]*\.[ \t]*$/.exec(chain);
-      if (nw) cc.name = `${nw[1]}.${cc.name}`;
-      else if (/\bsuper[ \t]*\([ \t]*\)[ \t]*\.[ \t]*$/.test(chain)) {
+      if (nw) {
+        cc.name = `${nw[1]}.${cc.name}`;
+        viaNew = true;
+      } else if (/\bsuper[ \t]*\([ \t]*\)[ \t]*\.[ \t]*$/.test(chain)) {
         // Python `super().m()` — a self call one level up (W2, G3).
         cc.self = true;
         cc.sup = true;
+        viaNew = true;
+      }
+    }
+    // lorc 0.5.0 (W32b, C4): a CHAIN call. The text before the path ends with
+    // `.` / `?.` (or `->` / `::`), so the receiver is a call result, an
+    // index, a string or a name on another line. The path did not capture it.
+    // Keep only the last segment: the receiver type is not known here.
+    // `...f()` (a spread) and `a..f()` (a range) are not chains. A PHP `.` is
+    // the string join operator, so PHP uses only `->` and `::`.
+    let chained = false;
+    // lorc 0.5.0 (W32c, C12): a component method called through the test
+    // instance, `wrapper.vm.m()` / `mount(C).vm.m()` /
+    // `fixture.componentInstance.m()`. Only the method name is kept; the
+    // resolver looks for it in the component files this file imports.
+    const segs = cc.name.split(".");
+    const inst = (c.lang === "js" || c.lang === "ts") && !cc.self && segs.length >= 2 && INST_HOLDER.test(segs[segs.length - 2]);
+    if (inst) {
+      cc.name = segs[segs.length - 1];
+      delete cc.sup;
+      viaNew = true;
+    }
+    if (!viaNew) {
+      if (chainDot(c, x.index)) {
+        cc.name = cc.name.split(".").pop();
+        delete cc.self;
+        delete cc.sup;
+        chained = true;
       }
     }
     const rec = { name: cc.name, line: lineOf(starts, paren), ...(cc.self ? { self: true } : {}), ...(cc.sup ? { sup: true } : {}), _p: paren };
     if (regParens && regParens.has(paren)) rec.reg = true;
+    if (chained) rec.chain = true;
+    if (inst) rec.inst = true;
+    // lorc 0.5.0 (W32a): a Go call on a call result or an index (`f().m()`,
+    // `a[i].m()`) is a CHAIN. Its receiver type is not known here.
+    if (c.lang === "go" && /[)\]]\s*\.\s*$/.test(m.slice(Math.max(0, x.index - 40), x.index))) rec.chain = true;
     if (ARGS_WORTH.test(cc.name)) {
       rec.args = argPieces(c, paren, close);
       const assign = assignBefore(m, x.index);
@@ -2308,6 +2639,276 @@ function refsIn(m, starts, open, close, out, c) {
   }
 }
 
+// ── Go locals (lorc 0.5.0, W32a) ────────────────────────────────────────────
+// The heuristic Go rung has no scope data, so it reads the names each function
+// binds: the receiver, the parameters, the named results, the names on the
+// left of `:=`, `var NAME` and the parameters of a function literal. A BARE
+// ref with one of those names is a value, so it is dropped. A call `x.M()` on
+// such a name (not the receiver) gets `lv`: its type is not known.
+function goParams(text) {
+  const pieces = [];
+  let depth = 0;
+  let a = 0;
+  for (let k = 0; k <= text.length; k++) {
+    const ch = text[k];
+    if (ch === "(" || ch === "[" || ch === "{") depth++;
+    else if (ch === ")" || ch === "]" || ch === "}") depth--;
+    else if (k === text.length || (ch === "," && depth === 0)) {
+      const p = text.slice(a, k).trim();
+      if (p) pieces.push(p);
+      a = k + 1;
+    }
+  }
+  // `(int, string)` has no names. `(a, b int)` has: one piece has a type.
+  if (!pieces.some((p) => /^[A-Za-z_]\w*\s+\S/.test(p))) return [];
+  return pieces.map((p) => /^([A-Za-z_]\w*)/.exec(p)).filter(Boolean).map((x) => x[1]);
+}
+function goLocals(c, defs, calls) {
+  const { m } = c;
+  const fns = defs.filter((d) => (d.kind === "function" || d.kind === "method") && d.to > d.from && m.startsWith("func", d.from));
+  if (!fns.length) return;
+  const info = fns.map((d) => {
+    const names = new Set();
+    let recv = null;
+    let k = d.from + 4;
+    while (/\s/.test(m[k] || "")) k++;
+    if (m[k] === "(") {
+      const rc = matchPair(m, k, "(", ")");
+      const rx = /^\s*([A-Za-z_]\w*)\s+\S/.exec(m.slice(k + 1, rc));
+      if (rx) recv = rx[1];
+      k = rc + 1;
+    }
+    const open = m.indexOf("(", k);
+    const brace = m.indexOf("{", open < 0 ? k : open);
+    if (open >= 0 && (brace < 0 || open < brace)) {
+      const close = matchPair(m, open, "(", ")");
+      for (const n of goParams(m.slice(open + 1, close))) names.add(n);
+      const rest = /^\s*\(/.exec(m.slice(close + 1, close + 200));
+      if (rest) {
+        const ro = close + 1 + rest[0].length - 1;
+        for (const n of goParams(m.slice(ro + 1, matchPair(m, ro, "(", ")")))) names.add(n);
+      }
+    }
+    const body = m.slice(brace < 0 ? k : brace, d.to + 1);
+    let x;
+    const DECL = /(?<![\w.])((?:[A-Za-z_]\w*\s*,\s*)*[A-Za-z_]\w*)\s*:=/g;
+    while ((x = DECL.exec(body))) for (const n of x[1].split(",")) names.add(n.trim());
+    const VAR = /\bvar\s+((?:[A-Za-z_]\w*\s*,\s*)*[A-Za-z_]\w*)/g;
+    while ((x = VAR.exec(body))) for (const n of x[1].split(",")) names.add(n.trim());
+    const LIT = /\bfunc\s*\(/g;
+    while ((x = LIT.exec(body))) {
+      const o = x.index + x[0].length - 1;
+      const cl = matchPair(body, o, "(", ")");
+      if (cl > o) for (const n of goParams(body.slice(o + 1, cl))) names.add(n);
+    }
+    if (recv) names.add(recv);
+    names.delete("_");
+    return { d, names, recv };
+  });
+  const scopeOf = (line) => {
+    let best = null;
+    for (const f of info) if (f.d.s <= line && line <= f.d.e && (!best || f.d.e - f.d.s < best.d.e - best.d.s)) best = f;
+    return best;
+  };
+  for (const cc of calls) {
+    if (cc.self || cc.sup) continue;
+    const f = scopeOf(cc.line);
+    if (!f) continue;
+    const parts = cc.name.split(".");
+    if (cc.ref) {
+      if (parts.length === 1 && f.names.has(parts[0])) cc.drop = true;
+      continue;
+    }
+    if (parts.length > 1 && !cc.chain && parts[0] !== f.recv && f.names.has(parts[0])) cc.lv = true;
+  }
+}
+
+// ── JS / TS locals (lorc 0.5.0, W32b, C5) ───────────────────────────────────
+// The heuristic JS / TS rung has no scope data, so it reads the names each
+// function or method binds: its parameters (plain, default, destructured,
+// rest, typed), the parameters of each arrow or function literal in its body,
+// and the names its body declares with `const` / `let` / `var`. A call `x.m()`
+// (two parts, not `this`) on such a name gets `lv`: its type is not known. A
+// constructor parameter PROPERTY (`private readonly svc: S`) is not a local: it
+// is `this.svc`. An import binding of the file is never a local.
+function jsSplit(text) {
+  const out = [];
+  let depth = 0;
+  let a = 0;
+  for (let k = 0; k <= text.length; k++) {
+    const ch = text[k];
+    if (ch === "(" || ch === "[" || ch === "{" || ch === "<") depth++;
+    else if (ch === ")" || ch === "]" || ch === "}" || (ch === ">" && text[k - 1] !== "=")) depth--;
+    else if (k === text.length || (ch === "," && depth === 0)) {
+      const p = text.slice(a, k).trim();
+      if (p) out.push(p);
+      a = k + 1;
+    }
+  }
+  return out;
+}
+function jsPattern(p, names) {
+  p = p.replace(/^(?:@[\w$.]+(?:\([^()]*\))?\s*)+/, "").replace(/^\.\.\./, "").trim();
+  if (/^(?:private|public|protected|readonly|override)\b/.test(p)) return;
+  if (p[0] === "{" || p[0] === "[") {
+    const close = matchPair(p, 0, p[0], p[0] === "{" ? "}" : "]");
+    if (close <= 0) return;
+    for (const el of jsSplit(p.slice(1, close))) {
+      const e = el.replace(/^\.\.\./, "");
+      // `b: c` takes `c`; `a = 1` takes `a`.
+      const kv = /^[\w$]+\s*:\s*([\s\S]+)$/.exec(e);
+      jsPattern(kv && p[0] === "{" ? kv[1] : e, names);
+    }
+    return;
+  }
+  const id = /^([A-Za-z_$][\w$]*)/.exec(p);
+  if (id && !KW.has(id[1])) names.add(id[1]);
+}
+// The `(` that opens the `)` at `close`, or -1.
+function matchBack(text, close) {
+  let depth = 0;
+  for (let k = close; k >= 0; k--) {
+    if (text[k] === ")") depth++;
+    else if (text[k] === "(" && --depth === 0) return k;
+  }
+  return -1;
+}
+function jsLocals(c, defs, calls, imps) {
+  const { m } = c;
+  const fns = defs.filter((d) => (d.kind === "function" || d.kind === "method") && d.to > d.from && d.s && d.e);
+  if (!fns.length) return;
+  const imported = new Set();
+  for (const imp of imps || []) for (const b of imp.bindings || []) imported.add(b.local);
+  const info = fns.map((d) => {
+    const names = new Set();
+    const open = m.indexOf("(", d.from);
+    const brace = m.indexOf("{", d.from);
+    let bodyFrom = d.from;
+    if (open >= 0 && (brace < 0 || open < brace) && open < d.to) {
+      const close = matchPair(m, open, "(", ")");
+      if (close > open) {
+        for (const p of jsSplit(m.slice(open + 1, close))) jsPattern(p, names);
+        bodyFrom = close + 1;
+      }
+    }
+    const body = m.slice(bodyFrom, d.to + 1);
+    let x;
+    const DECL = /\b(?:const|let|var)\s+/g;
+    while ((x = DECL.exec(body))) jsPattern(body.slice(x.index + x[0].length, x.index + x[0].length + 400), names);
+    // Arrow and function literal parameters: `r =>`, `(a, b) =>`, `function (a)`.
+    const ARROW1 = /(?<![\w$.])([A-Za-z_$][\w$]*)\s*=>/g;
+    while ((x = ARROW1.exec(body))) if (!KW.has(x[1])) names.add(x[1]);
+    const ARROW = /\)\s*(?::[^=;{}()]{1,80})?=>/g;
+    while ((x = ARROW.exec(body))) {
+      const o = matchBack(body, x.index);
+      if (o >= 0) for (const p of jsSplit(body.slice(o + 1, x.index))) jsPattern(p, names);
+    }
+    const LIT = /\bfunction\b[\s*]*[\w$]*\s*\(|\bcatch\s*\(/g;
+    while ((x = LIT.exec(body))) {
+      const o = x.index + x[0].length - 1;
+      const cl = matchPair(body, o, "(", ")");
+      if (cl > o) for (const p of jsSplit(body.slice(o + 1, cl))) jsPattern(p, names);
+    }
+    for (const n of imported) names.delete(n);
+    return { d, names };
+  });
+  for (const cc of calls) {
+    if (cc.self || cc.sup || cc.ref || cc.chain) continue;
+    const parts = cc.name.split(".");
+    if (parts.length !== 2) continue;
+    for (const f of info) {
+      if (f.d.s <= cc.line && cc.line <= f.d.e && f.names.has(parts[0])) {
+        cc.lv = true;
+        break;
+      }
+    }
+  }
+}
+
+// ── typed fields (lorc 0.5.0, W32d, C11) ────────────────────────────────────
+// The named type of each field of a Go struct or a TS class: `{ field: "Type" }`.
+// A pointer, a generic argument and a package qualifier are removed. A slice, a
+// map, a channel, a function, an array and a built-in type give no entry. An
+// embedded Go field is a base (`bases`), not a field. The read side follows a
+// 3-part name `T.f.m` through this table (graph-query.js).
+const MAX_FIELDS = 64;
+const GO_BUILTIN = new Set("bool string error byte rune int int8 int16 int32 int64 uint uint8 uint16 uint32 uint64 uintptr float32 float64 complex64 complex128 any".split(" "));
+const TS_BUILTIN = new Set("Array ReadonlyArray Promise Record Partial Readonly Required Pick Omit Map Set WeakMap WeakSet Date RegExp Error Function Object String Number Boolean Symbol BigInt".split(" "));
+function goFieldType(t) {
+  t = String(t).trim().replace(/^\*+/, "");
+  if (!/^[A-Za-z_]/.test(t) || /^(?:map|chan|func|interface|struct)\b/.test(t)) return null;
+  const x = /^(?:[A-Za-z_]\w*\.)?([A-Za-z_]\w*)(?:\[[^\]]*\])?$/.exec(t);
+  return x && !GO_BUILTIN.has(x[1]) ? x[1] : null;
+}
+// The text at depth 0 of `body`: the content of each `()` and `{}` is removed.
+function topLevel(body) {
+  let out = "";
+  let depth = 0;
+  for (const ch of body) {
+    if (ch === "(" || ch === "{") depth++;
+    else if (ch === ")" || ch === "}") depth = Math.max(0, depth - 1);
+    else if (depth === 0) out += ch;
+  }
+  return out;
+}
+function typeFields(c, lang, d) {
+  if (d.kind !== "class" || !d.s) return null;
+  const { m, starts } = c;
+  const from = starts[d.s - 1] || 0;
+  const to = d.e && starts[d.e] !== undefined ? starts[d.e] : m.length;
+  const text = m.slice(from, to);
+  const out = {};
+  let n = 0;
+  const add = (k, t) => {
+    if (!k || !t || n >= MAX_FIELDS || Object.prototype.hasOwnProperty.call(out, k)) return;
+    out[k] = t;
+    n++;
+  };
+  if (lang === "go") {
+    const x = new RegExp(`\\b${d.name}(?:\\[[^\\]]*\\])?\\s+struct\\s*\\{`).exec(text);
+    if (!x) return null;
+    const open = from + x.index + x[0].length - 1;
+    const close = matchPair(m, open, "{", "}");
+    if (close <= open) return null;
+    let depth = 0;
+    for (const line of m.slice(open + 1, close).split(/[\n;]/)) {
+      if (depth === 0) {
+        const f = /^\s*([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s+(\*?[A-Za-z_][\w.]*(?:\[[^\]]*\])?)(?![\w.[({])/.exec(line);
+        const t = f && goFieldType(f[2]);
+        if (t) for (const k of f[1].split(",")) add(k.trim(), t);
+      }
+      for (const ch of line) {
+        if (ch === "{") depth++;
+        else if (ch === "}") depth = Math.max(0, depth - 1);
+      }
+    }
+  } else if (lang === "ts") {
+    const cx = /\bclass\b/.exec(text);
+    if (!cx) return null;
+    const open = m.indexOf("{", from + cx.index);
+    const close = open >= 0 ? matchPair(m, open, "{", "}") : -1;
+    if (close <= open) return null;
+    const body = m.slice(open + 1, close);
+    // `repo: Repo<User>;` → Repo. `items: Item[]` is an array: no entry.
+    const FIELD = /^\s*(?:@[\w$.]+\s*)*(?:(?:public|private|protected|readonly|declare|override|accessor)\s+)*([A-Za-z_$][\w$]*)\s*[?!]?\s*:\s*([A-Z][\w$]*)\s*(?:<[^;\n]*?>)?\s*(\[)?/;
+    for (const seg of topLevel(body).split(/[;\n]/)) {
+      if (/^\s*static\b/.test(seg)) continue;
+      const f = FIELD.exec(seg);
+      if (f && !f[3] && !TS_BUILTIN.has(f[2])) add(f[1], f[2]);
+    }
+    const ctor = /\bconstructor\s*\(/.exec(body);
+    if (ctor) {
+      const o = ctor.index + ctor[0].length - 1;
+      const cl = matchPair(body, o, "(", ")");
+      for (const p of cl > o ? jsSplit(body.slice(o + 1, cl)) : []) {
+        const f = /^(?:@[\w$.]+(?:\([^()]*\))?\s*)*(?:public|private|protected|readonly)\s+(?:readonly\s+)?([A-Za-z_$][\w$]*)\s*\??\s*:\s*([A-Z][\w$]*)\s*(?:<[^>]*>)?\s*(\[)?/.exec(p.trim());
+        if (f && !f[3] && !TS_BUILTIN.has(f[2])) add(f[1], f[2]);
+      }
+    }
+  }
+  return n ? out : null;
+}
+
 // ── instance aliases (v1.8.2 W2, G2) ────────────────────────────────────────
 // `const store = new OrderStore()` makes `store.list()` a call to
 // `OrderStore.list`. nestjs/nest measured 118 `maybe` callers on ONE symbol
@@ -2323,9 +2924,29 @@ const ID = "[A-Za-z_$][A-Za-z0-9_$]*";
 function aliasesOf(c, lang) {
   const { m, starts } = c;
   const out = [];
-  const push = (pos, local, cls, self) => {
+  const push = (pos, local, cls, self, q) => {
     if (!local || (cls && !/^[A-Z]/.test(cls))) return;
-    out.push({ line: lineOf(starts, pos), local: local.replace(/^[$@]+/, ""), cls: cls || null, ...(self ? { self: true } : {}) });
+    out.push({ line: lineOf(starts, pos), local: local.replace(/^[$@]+/, ""), cls: cls || null, ...(self ? { self: true } : {}), ...(q ? { q } : {}) });
+  };
+  // lorc 0.5.0 (W28g, R2): true when `pos` is inside the parens of a
+  // parameter list (the close paren has `{`, `=>` or `:` after it), never
+  // inside an object literal or a call.
+  const inParams = (pos) => {
+    let d = 0;
+    for (let k = pos - 1; k >= 0 && k > pos - 4000; k--) {
+      const ch = m[k];
+      if (ch === ")" || ch === "]" || ch === "}") d++;
+      else if (ch === "(" || ch === "[" || ch === "{") {
+        if (d > 0) {
+          d--;
+          continue;
+        }
+        if (ch !== "(") return false;
+        const close = matchPairQuiet(m, k, "(", ")");
+        return close >= 0 && /^\s*(?:\{|=>|:)/.test(m.slice(close + 1, close + 200));
+      }
+    }
+    return false;
   };
   let x;
   if (lang === "js" || lang === "ts") {
@@ -2337,10 +2958,17 @@ function aliasesOf(c, lang) {
     // this.x = new S()  ·  constructor(private readonly x: S)  ·  x: S;  ·  x = new S();
     const THIS = new RegExp(`\\bthis\\.(${ID})\\s*=\\s*new\\s+(${UP})`, "g");
     while ((x = THIS.exec(m))) push(x.index, x[1], x[2], true);
-    const PARAM = new RegExp(`\\b(?:public|private|protected|readonly)\\s+(?:readonly\\s+)?(${ID})\\s*[?!]?\\s*:\\s*(${UP})`, "g");
+    const PARAM = new RegExp(`\\b(?:public|private|protected|readonly)\\s+(?:readonly\\s+)?(${ID})\\s*[?!]?\\s*:\\s*(${UP})(?![\\w$]*(?:<[^>\\n]*>)?\\s*\\[)`, "g");
     while ((x = PARAM.exec(m))) push(x.index, x[1], x[2], true);
     const FIELD = new RegExp(`^[ \\t]+(?:(?:public|private|protected|static|readonly|declare|override|accessor)\\s+)*(${ID})\\s*[?!]?\\s*(?::\\s*(${UP})\\s*(?:=[^\\n;]*)?|=\\s*new\\s+(${UP}))\\s*(?:\\(|;)`, "gm");
     while ((x = FIELD.exec(m))) push(x.index, x[1], x[2] || x[3], true);
+    // lorc 0.5.0 (W32d, C11): a typed TS parameter `(repo: UserRepo)` is a
+    // local alias in its function. A parameter property (with a modifier) is a
+    // field, and PARAM above records it.
+    if (lang === "ts") {
+      const TPARAM = new RegExp(`[(,]\\s*(${ID})\\s*\\??\\s*:\\s*(${UP})(?![\\w$]*(?:<[^>\\n]*>)?\\s*\\[)`, "g");
+      while ((x = TPARAM.exec(m))) if (!TS_BUILTIN.has(x[2]) && inParams(x.index + 1)) push(x.index, x[1], x[2], false);
+    }
   } else if (lang === "py") {
     // x = S()  ·  x: S = …  ·  x: S  ·  self.x = S()  ·  def f(x: S)
     const ASSIGN = new RegExp(`^[ \\t]*(${ID})\\s*(?::\\s*(${UP})\\s*)?=\\s*(?:(${UP})\\s*\\(|([^\\n]*))`, "gm");
@@ -2359,8 +2987,12 @@ function aliasesOf(c, lang) {
     while ((x = NEW.exec(m))) push(x.index, x[1], x[2], false);
     const RECV = new RegExp(`^func\\s*\\(\\s*(${ID})\\s+\\*?(${UP})\\s*\\)`, "gm");
     while ((x = RECV.exec(m))) push(x.index, x[1], x[2], false);
-    const PARAM = new RegExp(`[(,]\\s*(${ID})\\s+\\*?(${UP})\\s*[,)]`, "g");
-    while ((x = PARAM.exec(m))) push(x.index, x[1], x[2], false);
+    // lorc 0.5.0 (W32d, C11): a package qualifier is removed
+    // (`h *handlers.Handlers` → `h` is a `Handlers`).
+    // lorc 0.5.0 (W28g, R1): the qualifier is kept as `q`, so a type from an
+    // external package is marked on the call.
+    const PARAM = new RegExp(`[(,]\\s*(${ID})\\s+\\*?(?:([A-Za-z_]\\w*)\\.)?(${UP})(?=\\s*[,)])`, "g");
+    while ((x = PARAM.exec(m))) push(x.index, x[1], x[3], false, x[2]);
   } else if (lang === "java" || lang === "cs") {
     // S x = …  ·  var x = new S()  ·  S x;  (fields, locals, parameters)
     const TYPED = new RegExp(`\\b(${UP})(?:<[^>\\n]*>)?\\s+(${ID})\\s*(?:=|;|,|\\))`, "g");
@@ -2657,11 +3289,17 @@ function parenFor(src, starts, call) {
   return p >= 0 && p < le ? p : null;
 }
 
+const { ENV_READS } = require("./graph-links-config.js");
+const { tablesOf } = require("./graph-links-data.js");
+
 function effectsOf(lang, src, m, starts, strings, strAt, calls) {
   const out = [];
   for (const s of strings) {
     const text = src.slice(s.start, s.end);
-    if (SQL_RE.test(text)) out.push({ type: "sql", text: clip(text), line: lineOf(starts, s.start) });
+    if (!SQL_RE.test(text)) continue;
+    // lorc 0.5.0 (adapter `data`): the table names come from the FULL text.
+    const tables = tablesOf(text);
+    out.push({ type: "sql", text: clip(text), line: lineOf(starts, s.start), ...(tables.length ? { tables } : {}) });
   }
   let x;
   ENV_RE.lastIndex = 0;
@@ -2669,6 +3307,18 @@ function effectsOf(lang, src, m, starts, strings, strAt, calls) {
     if (!codeAt(src, m, x.index)) continue;
     const name = x.slice(1).find(Boolean);
     if (name) out.push({ type: "env", text: name, line: lineOf(starts, x.index) });
+  }
+  // lorc 0.5.0 (adapter `config`): more env read forms. One effect per key and line.
+  const seen = new Set(out.filter((e) => e.type === "env").map((e) => e.text + "@" + e.line));
+  for (const re of ENV_READS) {
+    re.lastIndex = 0;
+    while ((x = re.exec(src))) {
+      if (!codeAt(src, m, x.index) || !x[1]) continue;
+      const line = lineOf(starts, x.index);
+      if (seen.has(x[1] + "@" + line)) continue;
+      seen.add(x[1] + "@" + line);
+      out.push({ type: "env", text: x[1], line });
+    }
   }
   const fsRe = FS_RE[lang];
   for (const cc of calls) {
@@ -2775,14 +3425,24 @@ function urlOf(lang, call, consts) {
 // `app.use("/orders", ordersRouter)` and its cousins → { prefix, target }.
 // `target` is a NAME (an import binding, a dotted name), an inline require's
 // specifier, or a Django `include()` module — resolved on read.
-function mountOf(lang, call) {
+// lorc 0.5.0 (W34b): true when `local` is an import binding of the autoload
+// plugin package.
+const AUTOLOAD_PKG = /^(@fastify\/autoload|fastify-autoload)$/;
+function autoload(imports, local) {
+  for (const imp of imports || []) {
+    if (!AUTOLOAD_PKG.test(String(imp.from || ""))) continue;
+    if ((imp.bindings || []).some((b) => b.local === local)) return true;
+  }
+  return false;
+}
+function mountOf(lang, call, imports, rel) {
   const args = call.args;
   if (!args || !args.length) return null;
   const last = call.name.split(".").pop();
   const pos = args.filter((a) => !a.kw);
   const kw = {};
   for (const a of args) if (a.kw) kw[a.kw] = a;
-  const tgt = (a) => (a ? (a.req != null ? a.req : a.inc != null ? a.inc : a.id != null ? a.id : null) : null);
+  const tgt = (a) => (a ? (a.req != null ? a.req : a.inc != null ? a.inc : a.id != null ? a.id : a.rcall != null ? a.rcall : null) : null);
   const norm = (p) => (p == null ? null : String(p).startsWith("/") ? String(p) : "/" + String(p));
   if ((lang === "js" || lang === "ts") && last === "use" && pos[0] && pos[0].s != null && pos[0].s.startsWith("/")) {
     const t = pos.slice(1).map(tgt).find(Boolean);
@@ -2790,6 +3450,11 @@ function mountOf(lang, call) {
   }
   if ((lang === "js" || lang === "ts") && last === "register" && pos[0] && tgt(pos[0])) {
     const o = pos[1] && pos[1].obj;
+    // lorc 0.5.0 (W34b): an autoload plugin registers every file under `dir`.
+    // The mount has a folder and no target (graph-query.js `mountsInto`).
+    if (o && o.dir && pos[0].id && autoload(imports, pos[0].id)) {
+      return { prefix: o.prefix || "", dir: path.posix.join(path.posix.dirname(rel || ""), o.dir), auto: true, ...(o.noDirPrefix ? { flat: true } : {}) };
+    }
     return { prefix: (o && o.prefix) || "", target: tgt(pos[0]) };
   }
   if (lang === "py" && (last === "include_router" || last === "register_blueprint" || last === "mount")) {
@@ -2802,6 +3467,9 @@ function mountOf(lang, call) {
   if (lang === "py" && /^(path|re_path|url)$/.test(last) && pos[0] && pos[0].s != null && pos[1] && pos[1].inc != null) {
     return { prefix: norm(pos[0].s.replace(/^\^/, "")), target: pos[1].inc, module: true };
   }
+  // lorc 0.5.0 (W34b): `g := app.Group("/p", mw)` is a route group (a prefix
+  // on `g`, see `finalize`), not a mount of `mw`.
+  if (lang === "go" && last === "Group" && call.assign) return null;
   if (lang === "go" && (last === "Mount" || last === "Group") && pos[0] && pos[0].s != null && pos[1] && tgt(pos[1])) {
     return { prefix: pos[0].s, target: tgt(pos[1]) };
   }
@@ -2833,13 +3501,21 @@ const joinPath = (prefix, p) => {
 };
 
 // W19d (F6b): test code and the test-framework helpers it calls.
-const TEST_PATH = /(^|\/)(tests?|__tests__|spec|e2e)\/|\.(spec|test|e2e)\.[cm]?[jt]sx?$/;
-const TEST_BARE = /^(expect|it|test|describe|context|suite|beforeEach|afterEach|beforeAll|afterAll|within|waitFor\w*|act|mount|shallowMount|render|createLocalVue|flushPromises|nextTick|\$nextTick|setImmediate|setTimeout|spyOn|querySelector\w*|(?:get|getAll|query|queryAll|find|findAll)By\w+|mockClear|mockReset|mockRestore)$/;
-const TEST_HEAD = /^(jest|vi|sinon|cy|fireEvent|screen|userEvent|wrapper|container|localVue|expect|it|test|describe|context|suite)$/;
+const TEST_PATH = /(^|\/)(tests?|__tests__|spec|e2e)\/|\.(spec|test|e2e)\.[cm]?[jt]sx?$|_test\.go$/;
+const TEST_BARE = /^(expect|it|test|describe|context|suite|beforeEach|afterEach|beforeAll|afterAll|within|waitFor\w*|act|mount|shallowMount|render|createLocalVue|flushPromises|nextTick|\$nextTick|setImmediate|setTimeout|spyOn|querySelector\w*|(?:get|getAll|query|queryAll|find|findAll)By\w+|mockClear|mockReset|mockRestore|when|thenResolve|thenReturn|thenReject|thenThrow|thenCall|verify|instance|mock|spy|capture|anything|anyString|anyNumber|anyOfClass|deepEqual|objectContaining|reset|resolves|rejects|toThrow|toThrowError|toHaveBeenCalled\w*|toBe\w*|toEqual|toStrictEqual|toMatch\w*)$/;
+const TEST_HEAD = /^(jest|vi|sinon|cy|fireEvent|screen|userEvent|wrapper|container|localVue|expect|it|test|describe|context|suite|request|supertest|nock|td)$/;
 const TEST_LAST = /^(find|findAll|findComponent|trigger|setValue|setData|setProps|emitted|exists|text|html|attributes|classes|isVisible|toBe\w*|toEqual|toHaveBeenCalled\w*|toContain|toMatch\w*|mockResolvedValue\w*|mockReturnValue\w*|mockImplementation\w*|only|skip|each|nextTick|\$nextTick|spyOn|querySelector\w*|(?:get|getAll|query|queryAll|find|findAll)By\w+|mockClear|mockReset|mockRestore)$/;
 const TEST_MATCHER = /^(toBe\w*|toEqual|toHaveBeenCalled\w*|toContain|toMatch\w*|mockResolvedValue\w*|mockReturnValue\w*|mockImplementation\w*)$/;
-function testHelper(name) {
+// lorc 0.5.0 (W32a): the Go test helpers — `t.Run`, `require.NoError`, the
+// sqlmock chain. `httptest.NewRequest` stays: it carries the URL a test reaches.
+const GO_TEST_HEAD = /^(t|b|tb|f|require|assert|suite|mock|sqlmock|httptest)$/;
+const GO_TEST_BARE = /^(ExpectQuery|ExpectExec|ExpectBegin|ExpectCommit|ExpectRollback|ExpectPrepare|ExpectationsWereMet|WithArgs|WillReturnRows|WillReturnResult|WillReturnError|WillDelayFor|AddRow|AddRows|NewRows|NewResult|NewErrorResult)$/;
+function testHelper(name, lang) {
   const parts = String(name).split(".");
+  if (lang === "go") {
+    if (parts.length === 1 && GO_TEST_BARE.test(parts[0])) return true;
+    if (parts.length > 1 && GO_TEST_HEAD.test(parts[0]) && !(parts[0] === "httptest" && /^NewRequest/.test(parts[parts.length - 1]))) return true;
+  }
   // `expect(x).toBe(1)` is read as a bare `toBe` call after a call.
   if (parts.length === 1) return TEST_BARE.test(parts[0]) || TEST_MATCHER.test(parts[0]);
   if (TEST_HEAD.test(parts[0]) || parts.includes("vm")) return true;
@@ -2852,6 +3528,14 @@ function finalize(c, lang, defs, calls, imports, exportsSet, extractor) {
   const rel = c.rel;
   const nLines = starts.length;
 
+  // lorc 0.5.0 (W28g): a route whose handler is `this.m`, bound or wrapped
+  // has a REF to the handler, so the route resolves to the method.
+  for (const d of defs) {
+    const h = d.kind === "route" ? d.hRef : null;
+    if (!h || calls.some((cc) => cc.ref && cc.name === h.name && cc.line === h.line && !!cc.self === !!h.self)) continue;
+    calls.push({ name: h.name, line: h.line, ref: true, ...(h.self ? { self: true } : {}) });
+  }
+
   // W1: the prefix each router VARIABLE carries in this file, and the prefix of
   // each class (a decorator on the class).
   const varPrefix = new Map();
@@ -2859,6 +3543,19 @@ function finalize(c, lang, defs, calls, imports, exportsSet, extractor) {
     if (cc.ref) continue;
     const p = prefixOf(cc);
     if (p != null) varPrefix.set(cc.assign, p);
+  }
+  // lorc 0.5.0 (W34b): Go route groups (Fiber, Gin, Echo). `v1 :=
+  // api.Group("/v1", mw)` gives `v1` the prefix of `api` plus "/v1". Source
+  // order lets a nested group see its parent. Not done: chi inline groups
+  // (`r.Route("/p", func(r chi.Router) {…})`).
+  if (lang === "go") {
+    for (const cc of [...calls].sort((a, b) => a.line - b.line)) {
+      if (cc.ref || !cc.assign || !cc.args || cc.name.split(".").pop() !== "Group") continue;
+      const p0 = cc.args.filter((a) => !a.kw)[0];
+      if (!p0 || p0.s == null) continue;
+      const head = cc.alias || cc.name.split(".")[0];
+      varPrefix.set(cc.assign, joinPath(varPrefix.get(head) || "", p0.s));
+    }
   }
   const classPrefix = new Map();
   for (const d of defs) {
@@ -2873,7 +3570,7 @@ function finalize(c, lang, defs, calls, imports, exportsSet, extractor) {
   const aliases = [];
   for (const d of defs) {
     if (d.kind === "route") {
-      const pre = varPrefix.get(d.head) || "";
+      const pre = varPrefix.get(d.head) || (d.on && varPrefix.get(d.on)) || "";
       d.name = `${d.method} ${clip(joinPath(pre, d.path), 60)}`;
       d.qname = d.name;
       continue;
@@ -2916,6 +3613,7 @@ function finalize(c, lang, defs, calls, imports, exportsSet, extractor) {
   };
   const ownerOf = (line) => (line >= 0 && line <= nLines ? owner[line] : -1);
   const localAl = new Map(); // owner index → Map<local, cls|null>
+  const localQ = new Map(); // owner index → Map<local, package qualifier> (W28g)
   const classAl = new Map(); // class name → Map<field, cls>
   for (let al of aliasesOf(c, lang)) {
     // W5 (G6): a `self` alias with no enclosing class is not a field — it is
@@ -2933,15 +3631,26 @@ function finalize(c, lang, defs, calls, imports, exportsSet, extractor) {
       const mm = localAl.get(idx) || new Map();
       // The first declaration in a scope wins; a later re-binding of the same
       // name in the same scope is rare and a guess either way.
-      if (!mm.has(al.local)) mm.set(al.local, al.cls);
+      if (!mm.has(al.local)) {
+        mm.set(al.local, al.cls);
+        if (al.q) {
+          const qq = localQ.get(idx) || new Map();
+          qq.set(al.local, al.q);
+          localQ.set(idx, qq);
+        }
+      }
       localAl.set(idx, mm);
     }
   }
   const classOfDef = (d) => (d && d.kind === "method" && d.qname.includes(".") ? d.qname.split(".").slice(0, -1).pop() : d && d.kind === "class" ? d.name : null);
+  // lorc 0.5.0 (W32d, C11): a 3-part name `a.b.c` (a call or a ref) whose
+  // head `a` has a type is renamed too (`T.b.c`). The read side follows the
+  // field `b` of `T`.
   const aliasFor = (cc) => {
-    if (cc.ref || cc.sup || !cc.name.includes(".")) return null;
+    if (cc.sup || !cc.name.includes(".")) return null;
     const parts = cc.name.split(".");
-    if (parts.length !== 2) return null;
+    if (parts.length !== 2 && parts.length !== 3) return null;
+    if (cc.ref && parts.length !== 3) return null;
     const head = parts[0];
     const idx = ownerOf(cc.line);
     const d = idx >= 0 ? defs[idx] : null;
@@ -2951,15 +3660,29 @@ function finalize(c, lang, defs, calls, imports, exportsSet, extractor) {
       const cls = mm ? mm.get(head) : undefined;
       return cls ? { cls, head } : null;
     }
-    const scoped = localAl.get(idx);
-    if (scoped && scoped.has(head)) {
-      const cls = scoped.get(head);
-      return cls ? { cls, head } : null; // null = shadowed here
+    // lorc 0.5.0 (W32d): a symbol inside a function (a route registration, a
+    // nested function) also sees the aliases of each symbol that holds it. The
+    // innermost scope wins.
+    const holders = [idx];
+    if (idx >= 0) {
+      const outer = [];
+      for (const i of localAl.keys()) if (i >= 0 && i !== idx && defs[i].s <= cc.line && cc.line <= defs[i].e) outer.push(i);
+      outer.sort((a, b) => defs[a].e - defs[a].s - (defs[b].e - defs[b].s));
+      holders.push(...outer);
+    }
+    for (const i of holders) {
+      const scoped = localAl.get(i);
+      if (scoped && scoped.has(head)) {
+        const cls = scoped.get(head);
+        const q = (localQ.get(i) || new Map()).get(head);
+        return cls ? { cls, head, ...(q ? { q } : {}) } : null; // null = shadowed here
+      }
     }
     const modAl = localAl.get(-1);
     if (idx !== -1 && modAl && modAl.has(head)) {
       const cls = modAl.get(head);
-      return cls ? { cls, head } : null;
+      const q = (localQ.get(-1) || new Map()).get(head);
+      return cls ? { cls, head, ...(q ? { q } : {}) } : null;
     }
     // Java, C#, Kotlin, C++ and Ruby all reach a field with no `this.`
     // (`@store` in Ruby is the field itself, written without `self.`).
@@ -2980,22 +3703,51 @@ function finalize(c, lang, defs, calls, imports, exportsSet, extractor) {
     const topLevel = new Set(defs.filter((d) => d.kind === "function").map((d) => d.name));
     for (const imp of imports || []) for (const b of imp.bindings || []) topLevel.add(b.local);
     for (const cc of calls) {
-      if (cc.ref || cc.self || cc.name.includes(".") || topLevel.has(cc.name)) continue;
+      if (cc.ref || cc.self || cc.chain || cc.name.includes(".") || topLevel.has(cc.name)) continue;
       const d = defs[ownerOf(cc.line)];
       if (d && d.kind === "method") cc.self = true;
     }
   }
+  // lorc 0.5.0 (W28g, R1): the import that gives an alias type, when it is
+  // not a relative path (`fiber.Ctx`, `Request` from `express`). The read
+  // side keeps the call UNRESOLVED when that import is not a repo file.
+  const goPkg = (from) => {
+    const segs = String(from).split("/");
+    let last = segs.pop();
+    if (/^v\d+$/.test(last) && segs.length) last = segs.pop();
+    return last;
+  };
+  const extOf = (al) => {
+    for (const imp of imports || []) {
+      if (!imp.from || /^[./]/.test(imp.from)) continue;
+      const bs = imp.bindings || [];
+      if (lang === "go" ? al.q && (bs.some((b) => b.local === al.q) || goPkg(imp.from) === al.q) : (lang === "ts" || lang === "js") && bs.some((b) => b.local === al.cls)) return imp.from;
+    }
+    return null;
+  };
   for (const cc of calls) {
     const al = aliasFor(cc);
     if (!al) continue;
-    cc.name = `${al.cls}.${cc.name.split(".")[1]}`;
+    cc.name = [al.cls, ...cc.name.split(".").slice(1)].join(".");
     cc.alias = al.head;
+    const ext = extOf(al);
+    if (ext) cc.ext = ext;
     delete cc.self;
+    delete cc.lv;
+    delete cc.chain;
   }
 
   // N1: the sentence the author already wrote, read out of the raw source (the
   // mask blanks comments, so it cannot come from `m`).
   const rawLines = src.split(/\r?\n/);
+  // lorc 0.5.0 (W28g): in a file with routes, a method whose body is only
+  // `return this.r` is a router getter. A mount of `x.getM()` then reaches
+  // only the routes registered on `this.r`.
+  const hasRoutes = defs.some((d) => d.kind === "route" && d.on);
+  const returnsOf = (d) => {
+    const y = /\{\s*return\s+(this\.[A-Za-z_$][\w$]*)\s*;?\s*\}\s*$/.exec(rawLines.slice(d.s - 1, d.e).join("\n"));
+    return y ? { returns: y[1] } : {};
+  };
   const syms = defs.map((d) => {
     const doc = docFor(rawLines, lang, d);
     return {
@@ -3010,13 +3762,29 @@ function finalize(c, lang, defs, calls, imports, exportsSet, extractor) {
       effects: [],
       ...(doc ? { doc } : {}),
       ...(d.route ? { route: d.route } : {}),
+      ...(d.kind === "route" && d.on ? { on: d.on } : {}),
+      ...(hasRoutes && d.kind === "method" ? returnsOf(d) : {}),
       ...(d.route_name ? { route_name: d.route_name } : {}),
       ...(d.values ? { values: d.values } : {}),
       ...(d.bases && d.bases.length ? { bases: d.bases } : {}),
+      ...((lang === "go" || lang === "ts") && d.kind === "class" ? ((fl) => (fl ? { fields: fl } : {}))(typeFields(c, lang, d)) : {}),
+      ...(d.value !== undefined ? { value: d.value } : {}),
+      ...(d.store ? { store: d.store } : {}),
+      ...(d.key !== undefined ? { key: d.key } : {}),
+      ...(d.key_via !== undefined ? { key_via: d.key_via } : {}),
+      ...(d.store_module ? { store_module: true } : {}),
+      ...(d.namespaced ? { namespaced: true } : {}),
+      ...(d.mapped ? { mapped: d.mapped } : {}),
+      ...(d.table ? { table: d.table } : {}),
     };
   });
   const mod = { id: "", name: "<module>", qname: "<module>", kind: "module", lines: [1, nLines], exported: false, body_hash: "", calls: [], effects: [] };
   const at = (line) => (owner[line] >= 0 ? syms[owner[line]] : mod);
+  // lorc 0.5.0: the link adapters' extras go to the symbol that owns the line.
+  for (const ex of c.extras || []) {
+    const t = at(ex.line);
+    (t[ex.field] || (t[ex.field] = [])).push(ex.item);
+  }
 
   const known = new Set(defs.map((d) => d.name));
   for (const imp of imports || []) for (const b of imp.bindings || []) known.add(b.local);
@@ -3033,10 +3801,13 @@ function finalize(c, lang, defs, calls, imports, exportsSet, extractor) {
   // file — a call to a test-framework helper is noise. It is dropped before
   // the cap, so the calls to source names (the links a test gives) stay.
   const testFile = TEST_PATH.test(rel || "");
+  // A Go test file has no test blocks: each `func TestX(t *testing.T)` is a
+  // function. So in a Go test file, every symbol is test code.
+  const goTest = lang === "go" && testFile;
   for (const cc of calls) {
     if (cc.ref) continue;
     const t = at(cc.line);
-    if ((t.kind === "test" || (t === mod && testFile)) && testHelper(cc.name)) cc.drop = true;
+    if ((t.kind === "test" || (t === mod && testFile) || goTest) && testHelper(cc.name, lang)) cc.drop = true;
   }
   for (const cc of calls) {
     if (cc.drop) continue;
@@ -3044,9 +3815,15 @@ function finalize(c, lang, defs, calls, imports, exportsSet, extractor) {
     // scope is the DIRECTORY, so a bare Go identifier is kept too and the
     // package rung on read decides (`mux.HandleFunc("/p", listOrders)`).
     const refHead = cc.self ? cc.name.split(".").pop() : cc.name.split(".")[0];
-    if (cc.ref && !known.has(refHead) && !(lang === "go" && !cc.name.includes("."))) continue;
+    // lorc 0.5.0 (W32d): a ref that an alias renamed has a known head type.
+    if (cc.ref && !cc.alias && !cc.tpl && !known.has(refHead) && !(lang === "go" && !cc.name.includes("."))) continue;
+    // lorc 0.5.0: a template ref is kept also when its head is not known
+    // here (a mixin or a global gives it), but never a JS global name.
+    if (cc.tpl && L.JS_GLOBALS.has(refHead)) continue;
     const t = at(cc.line);
-    if (t.calls.length < MAX_CALLS_PER_SYMBOL)
+    // lorc 0.5.0 (W28d, W28e): a template or a test block holds more links, so its cap is double.
+    const cap = t.kind === "template" || t.kind === "test" ? 2 * MAX_CALLS_PER_SYMBOL : MAX_CALLS_PER_SYMBOL;
+    if (t.calls.length < cap)
       t.calls.push({
         name: cc.name,
         line: cc.line,
@@ -3054,8 +3831,21 @@ function finalize(c, lang, defs, calls, imports, exportsSet, extractor) {
         ...(cc.sup ? { sup: true } : {}),
         ...(cc.ref ? { ref: true } : {}),
         ...(cc.alias ? { alias: cc.alias } : {}),
+        ...(cc.ext ? { ext: cc.ext } : {}),
         ...(cc.route ? { route: true } : {}),
+        ...(cc.path ? { path: true } : {}),
         ...(cc.via ? { via: true } : {}),
+        ...(cc.store ? { store: cc.store } : {}),
+        ...(cc.event ? { event: cc.event } : {}),
+        ...(cc.ns_via ? { ns_via: cc.ns_via } : {}),
+        ...(cc.tpl ? { tpl: true } : {}),
+        ...(cc.i18n ? { i18n: true } : {}),
+        ...(cc.prefix ? { prefix: true } : {}),
+        ...(cc.listen ? { listen: true } : {}),
+        ...(cc.prop ? { prop: true } : {}),
+        ...(cc.chain ? { chain: true } : {}),
+        ...(cc.lv ? { lv: true } : {}),
+        ...(cc.inst ? { inst: true } : {}),
       });
     else cut(t, cc.line);
     if (cc.ref || !cc.args) continue;
@@ -3065,17 +3855,30 @@ function finalize(c, lang, defs, calls, imports, exportsSet, extractor) {
       if (t.urls.length < MAX_URLS_PER_SYMBOL) t.urls.push(u);
       else cut(t, cc.line);
     }
-    const mt = mountOf(lang, cc);
-    if (mt) (t.mounts || (t.mounts = [])).push({ ...mt, line: cc.line });
+    const mt = mountOf(lang, cc, imports, rel);
+    if (mt) {
+      // lorc 0.5.0 (W28g): `x.getRouter` where `x = new X()` here → the class `X`.
+      const al = /^[A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*$/.test(mt.target) ? aliasFor({ name: mt.target, line: cc.line }) : null;
+      if (al) mt.cls = al.cls;
+      // The router that holds a mount of `this.r` (`this.router.use(…)`).
+      if (cc.self && /^this\./.test(mt.target) && cc.name.includes(".")) mt.on = `this.${cc.name.split(".").slice(0, -1).join(".")}`;
+      (t.mounts || (t.mounts = [])).push({ ...mt, line: cc.line });
+    }
   }
   // A function passed as an argument runs no HTTP, SQL or fs effect by being passed.
-  for (const ef of effectsOf(lang, src, m, starts, strings, strAt, calls.filter((cc) => !cc.ref))) {
+  // lorc 0.5.0 (W28f): `env` effects and table effects have their own caps.
+  // The adapters' effects (`c.effects`) are merged here.
+  const effCap = (ef) => (ef.type === "env" ? MAX_ENV_EFFECTS : ef.tables ? MAX_TABLE_EFFECTS : MAX_EFFECTS_PER_SYMBOL);
+  const effGroup = (ef) => (ef.type === "env" ? 1 : ef.tables ? 2 : 0);
+  for (const ef of [...effectsOf(lang, src, m, starts, strings, strAt, calls.filter((cc) => !cc.ref)), ...(c.effects || [])]) {
     const t = at(ef.line);
-    if (t.effects.length >= MAX_EFFECTS_PER_SYMBOL) {
+    if (t.effects.some((e) => e.type === ef.type && e.text === ef.text)) continue;
+    const g = effGroup(ef);
+    if (t.effects.filter((e) => effGroup(e) === g).length >= effCap(ef)) {
       cut(t, ef.line);
       continue;
     }
-    if (!t.effects.some((e) => e.type === ef.type && e.text === ef.text)) t.effects.push(ef);
+    t.effects.push(ef);
   }
 
   // The partial RANGES, merged, in line order. A cap gives the tail from the
@@ -3130,7 +3933,7 @@ function finalize(c, lang, defs, calls, imports, exportsSet, extractor) {
     assignId(s);
     syms.push(s);
   }
-  if (mod.calls.length || mod.effects.length || mod.urls || mod.mounts) {
+  if (mod.calls.length || mod.effects.length || mod.urls || mod.mounts || mod.global_mixins || mod.global_props) {
     mod.id = `${rel}#<module>`;
     syms.push(mod);
   }
@@ -3244,10 +4047,41 @@ function i18nKeys(src) {
   return keys;
 }
 
+// lorc 0.5.0: the keys of a `.env` file: [[KEY, line]]. KEYS ONLY: a value
+// is never kept and never logged (an env file holds secrets).
+function envKeys(text) {
+  const keys = [];
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const x = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*=/.exec(lines[i]);
+    if (x) keys.push([x[1], i + 1]);
+  }
+  return keys;
+}
+
+// lorc 0.5.0 (W28f): the tables and views of a `.sql` file: [[name, line]].
+// Name: lower case, schema kept, quotes stripped. Comments do not count.
+function sqlKeys(text) {
+  const blank = (x) => x.replace(/[^\n]/g, " ");
+  const t = text.replace(/\/\*[\s\S]*?\*\//g, blank).replace(/--[^\n]*/g, blank);
+  const re =
+    /\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:TEMP|TEMPORARY)\s+)?(?:UNLOGGED\s+)?(?:TABLE|(?:MATERIALIZED\s+)?VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?([`"[]?[A-Za-z_][\w$]*[`"\]]?(?:\.[`"[]?[A-Za-z_][\w$]*[`"\]]?)*)/gi;
+  const keys = [];
+  let x;
+  while ((x = re.exec(t))) {
+    const line = t.slice(0, x.index).split("\n").length;
+    keys.push([x[1].replace(/[`"[\]]/g, "").toLowerCase(), line]);
+  }
+  return keys;
+}
+
 function extractOne(item, borrowed) {
+  if (item.lang === "sql") return { symbols: [], imports: [], keys: sqlKeys(String(item.src || "")) };
   if (item.lang === "i18n") return { symbols: [], imports: [], keys: i18nKeys(String(item.src || "")) };
+  if (item.lang === "env") return { symbols: [], imports: [], keys: envKeys(String(item.src || "")) };
   let { lang, src } = item;
   const raw = src;
+  const lang0 = lang;
   resetCoverage();
   let sfc = null;
   if (lang === "vue" || lang === "svelte") {
@@ -3258,15 +4092,38 @@ function extractOne(item, borrowed) {
     item = { ...item, src, lang };
   }
   const c = context(item);
+  c.consts = L.foldConsts(c);
+  c.extras = [];
+  c.effects = [];
+  // lorc 0.5.0: the context the link adapters read (graph-links.js).
+  const linkCtx = (defs, calls, imports, ownerName) => ({
+    rel: c.rel,
+    lang: lang0,
+    raw,
+    c,
+    sfc,
+    defs,
+    calls,
+    imports,
+    ownerName,
+    consts: c.consts,
+    extras: c.extras,
+    effects: c.effects,
+    h: { objectMembers, memberOf, matchPairQuiet, lineOf, ownerStem, IDENT_RE },
+  });
   if (borrowed) {
     const calls = [];
     for (const cc of borrowed.calls) {
-      const n = normCall(cc.name);
+      // A keyword after a chain dot is a METHOD name (W32b).
+      const n = normCall(cc.name) || (cc.chain && /^[A-Za-z_$][\w$]*$/.test(cc.name) ? { name: cc.name, self: false } : null);
       if (!n) continue;
       if (cc.ref && n.sup) continue;
       const rec = { name: n.name, line: cc.line, ...(n.self ? { self: true } : {}), ...(n.sup ? { sup: true } : {}), ...(cc.ref ? { ref: true } : {}) };
       if (cc.args) rec.args = cc.args;
       if (cc.assign) rec.assign = cc.assign;
+      if (cc.chain) rec.chain = true;
+      if (cc.lv) rec.lv = true;
+      if (cc.inst) rec.inst = true;
       calls.push(rec);
     }
     const defs = borrowed.defs.map((d) => ({ ...d, from: c.starts[d.s - 1] || 0 }));
@@ -3286,7 +4143,13 @@ function extractOne(item, borrowed) {
       if (lang === "js" || lang === "ts") {
         const o = objectDefs(c, defs, sfc);
         defs.push(...o.defs);
+        const ctx = linkCtx(defs, calls, imps, o.ownerName);
+        L.runStage("object", ctx);
         imps = vuePass(c, raw, sfc, defs, calls, imps, o.ownerName);
+        ctx.calls = calls;
+        ctx.imports = imps;
+        L.runStage("code", ctx);
+    tplOrder(c, calls);
       }
       for (const p of regParens) reg.add(lineOf(c.starts, p));
       for (const cc of calls) if (reg.has(cc.line) && ARGS_WORTH.test(cc.name)) cc.reg = true;
@@ -3315,6 +4178,7 @@ function extractOne(item, borrowed) {
   }
   const { defs, defParens, regParens, exportsSet } = braceDefs(c, lang);
   let ownerNameOf = null;
+  let ctx = null;
   if (lang === "js" || lang === "ts") {
     const o = objectDefs(c, defs, sfc);
     ownerNameOf = o.ownerName;
@@ -3322,11 +4186,22 @@ function extractOne(item, borrowed) {
     // APPENDED, never sorted in: a file with no object keeps every symbol in
     // the order 1.9.0 wrote it, so its record is the same bytes.
     for (const p of o.defParens) defParens.add(p);
+    // The calls do not exist yet: stage "code" gets them below.
+    ctx = linkCtx(defs, null, null, ownerNameOf);
+    L.runStage("object", ctx);
   }
   braceDecorators(c, lang, defs);
   const calls = scanCalls(c, defParens, regParens);
   let imps = importsFor(lang, c.src, c.m, c.starts);
-  if (lang === "js" || lang === "ts") imps = vuePass(c, raw, sfc, defs, calls, imps, ownerNameOf);
+  if (lang === "js" || lang === "ts") {
+    imps = vuePass(c, raw, sfc, defs, calls, imps, ownerNameOf);
+    ctx.calls = calls;
+    ctx.imports = imps;
+    L.runStage("code", ctx);
+    tplOrder(c, calls);
+  }
+  if (lang === "go") goLocals(c, defs, calls);
+  if (lang === "js" || lang === "ts") jsLocals(c, defs, calls, imps);
   return finalize(c, lang, defs, calls, imps, exportsSet, HEURISTIC);
 }
 
@@ -3446,8 +4321,15 @@ class V(ast.NodeVisitor):
         s.generic_visit(node)
     def visit_Call(s, node):
         name = dotted(node.func)
+        chained = False
+        if not name and isinstance(node.func, ast.Attribute):
+            # A call on a call result or an index (W32b, C4): a chain.
+            name = node.func.attr
+            chained = True
         if name and id(node) not in s.skip:
             rec = {"name": name, "line": node.lineno}
+            if chained:
+                rec["chain"] = True
             last = name.split(".")[-1]
             if last in WORTH:
                 rec["args"] = [piece(a) for a in node.args] + [piece(k.value, k.arg) for k in node.keywords if k.arg]
@@ -3599,6 +4481,27 @@ function tsWalk(ts, it) {
         const key = ts.isIdentifier(pr.name) || ts.isStringLiteralLike(pr.name) ? pr.name.text : null;
         const val = strOf(pr.initializer);
         if (key && val != null) obj[key] = val;
+        // lorc 0.5.0 (W34b): the same autoload keys the heuristic reads —
+        // a nested `options: { prefix }`, `dir: path.join(__dirname, …)` and
+        // `dirNameRoutePrefix: false`.
+        const iv = unwrap(pr.initializer);
+        if (key && key !== "dir" && iv && ts.isObjectLiteralExpression(iv)) {
+          for (const q of iv.properties) {
+            if (ts.isPropertyAssignment(q) && q.name && ts.isIdentifier(q.name) && q.name.text === "prefix" && obj.prefix == null) {
+              const pv = strOf(q.initializer);
+              if (pv != null) obj.prefix = pv;
+            }
+          }
+        }
+        if (key === "dir" && iv && ts.isCallExpression(iv) && /^(path\.)?(join|resolve)$/.test(dotted(iv.expression) || "")) {
+          const [a0, ...rest] = iv.arguments;
+          const segs = rest.map(strOf);
+          if (a0 && ts.isIdentifier(unwrap(a0)) && unwrap(a0).text === "__dirname" && segs.length && segs.every((x) => x != null)) {
+            const dir = segs.join("/").replace(/^\.?\/+/, "").replace(/\/+$/, "");
+            if (dir) obj.dir = dir;
+          }
+        }
+        if (key === "dirNameRoutePrefix" && pr.initializer.kind === ts.SyntaxKind.FalseKeyword) obj.noDirPrefix = "1";
       }
       if (Object.keys(obj).length) p.obj = obj;
       return p;
@@ -3612,8 +4515,16 @@ function tsWalk(ts, it) {
     if (ts.isCallExpression(e)) {
       const head = dotted(e.expression);
       const first = e.arguments && e.arguments.length ? strOf(e.arguments[0]) : null;
-      if (head === "require" && first != null) {
+      // lorc 0.5.0 (W34b): a dynamic `import('./x')` is a target like `require`.
+      if ((head === "require" || e.expression.kind === ts.SyntaxKind.ImportKeyword) && first != null) {
         p.req = first;
+        return p;
+      }
+      // lorc 0.5.0 (W28g): `x.getRouter()` / `new X(…).getRouter()` (a mount target).
+      if (!e.arguments.length && ts.isPropertyAccessExpression(e.expression)) {
+        const recv = unwrap(e.expression.expression);
+        const rn = recv && ts.isNewExpression(recv) && ts.isIdentifier(recv.expression) ? recv.expression.text : recv ? dotted(recv) : null;
+        if (rn) p.rcall = `${rn}.${e.expression.name.text}`;
         return p;
       }
     }
@@ -3656,7 +4567,45 @@ function tsWalk(ts, it) {
     });
   };
 
+  // lorc 0.5.0 (W32b): a receiver the walker can name — a name, `this`,
+  // `super`, a property path of those, or a constructor call (W1). Any other
+  // receiver (a call result, an index, a string) makes a CHAIN call.
+  const rooted = (node) => {
+    const n = unwrap(node);
+    if (!n) return false;
+    if (ts.isIdentifier(n) || ts.isPrivateIdentifier(n) || n.kind === ts.SyntaxKind.ThisKeyword || n.kind === ts.SyntaxKind.SuperKeyword) return true;
+    if (ts.isPropertyAccessExpression(n)) return rooted(n.expression);
+    if (ts.isNewExpression(n) || ts.isCallExpression(n)) return !!dotted(n) && rooted(n.expression);
+    return false;
+  };
+  // The locals of each enclosing function: the parameters (not parameter
+  // properties) and the names it declares. Innermost last.
+  const scopes = [];
+  const importLocals = new Set();
+  const bindNames = (name, set) => {
+    if (!name) return;
+    if (ts.isIdentifier(name)) set.add(name.text);
+    else if (ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name)) for (const el of name.elements) if (el && el.name) bindNames(el.name, set);
+  };
+  const isLocal = (n) => {
+    if (importLocals.has(n)) return false;
+    for (let k = scopes.length - 1; k >= 0; k--) if (scopes[k].has(n)) return true;
+    return false;
+  };
   const visit = (node) => {
+    if (ts.isFunctionLike(node) && node.body) {
+      const set = new Set();
+      for (const p of node.parameters || []) if (!modifiers(p).some((x) => x.kind !== ts.SyntaxKind.Decorator)) bindNames(p.name, set);
+      scopes.push(set);
+      visitInner(node);
+      scopes.pop();
+      return;
+    }
+    if (ts.isVariableDeclaration(node) && scopes.length) bindNames(node.name, scopes[scopes.length - 1]);
+    if (ts.isCatchClause(node) && node.variableDeclaration && scopes.length) bindNames(node.variableDeclaration.name, scopes[scopes.length - 1]);
+    visitInner(node);
+  };
+  const visitInner = (node) => {
     if (ts.isImportDeclaration(node) && node.moduleSpecifier && ts.isStringLiteralLike(node.moduleSpecifier)) {
       const bindings = [];
       const cl = node.importClause;
@@ -3667,6 +4616,7 @@ function tsWalk(ts, it) {
         else if (nb && ts.isNamedImports(nb)) for (const el of nb.elements) bindings.push({ local: el.name.text, orig: (el.propertyName || el.name).text, kind: "named" });
       }
       imports.push({ from: node.moduleSpecifier.text, line: lineAt(node.getStart(sf)), bindings });
+      for (const b of bindings) importLocals.add(b.local);
     }
     if (ts.isExportDeclaration(node) && !node.moduleSpecifier && node.exportClause && ts.isNamedExports(node.exportClause)) {
       for (const el of node.exportClause.elements) exportsSet.add(el.name.text);
@@ -3691,6 +4641,31 @@ function tsWalk(ts, it) {
       ts.forEachChild(node, visit);
       chain.pop();
       return;
+    }
+    // lorc 0.5.0 (W32c, C8): the TypeScript declarations. The heuristic rung
+    // (`tsDecls`) gives the same symbols.
+    if (ts.isInterfaceDeclaration(node) && node.name) {
+      const iname = node.name.text;
+      const bases = [];
+      for (const h of node.heritageClauses || []) for (const t of h.types) {
+        const d = dotted(t.expression);
+        if (d) bases.push(d.split(".").pop());
+      }
+      push(node, iname, "interface", { exported: isExported(node), ...(bases.length ? { bases: bases.slice(0, 8) } : {}) });
+      for (const mem of node.members || []) {
+        if (!mem.name || !ts.isIdentifier(mem.name)) continue;
+        const fn = ts.isMethodSignature(mem) || (ts.isPropertySignature(mem) && mem.type && ts.isFunctionTypeNode(mem.type));
+        if (!fn) continue;
+        const line = lineAt(mem.name.getStart(sf));
+        defs.push({ name: mem.name.text, qname: `${iname}.${mem.name.text}`, kind: "method", s: line, e: line, exported: isExported(node), nameOnly: true });
+      }
+    }
+    if (ts.isTypeAliasDeclaration(node) && node.name) push(node, node.name.text, "type", { exported: isExported(node) });
+    if (ts.isEnumDeclaration(node) && node.name) push(node, node.name.text, "enum", { exported: isExported(node) });
+    // An `abstract m(…): R;` is a NAME-ONLY method (W32c, C8).
+    if (ts.isMethodDeclaration(node) && !node.body && node.name && ts.isIdentifier(node.name) && chain.length && has(node, ts.SyntaxKind.AbstractKeyword)) {
+      const line = lineAt(node.name.getStart(sf));
+      defs.push({ name: node.name.text, qname: `${chain[chain.length - 1]}.${node.name.text}`, kind: "method", s: line, e: line, exported: !isPrivate(node), nameOnly: true });
     }
     if (ts.isFunctionDeclaration(node) && node.name && node.body) {
       push(node, node.name.text, "function", { exported: isExported(node) });
@@ -3738,7 +4713,10 @@ function tsWalk(ts, it) {
           if (prop) bindings.push({ local: d.name.text, orig: prop, kind: "named" });
           else bindings.push({ local: d.name.text, orig: "default", kind: "namespace" });
         }
-        if (bindings.length) imports.push({ from: spec, line: lineAt(d.getStart(sf)), bindings });
+        if (bindings.length) {
+          imports.push({ from: spec, line: lineAt(d.getStart(sf)), bindings });
+          for (const b of bindings) importLocals.add(b.local);
+        }
       }
     }
     if ((ts.isCallExpression(node) || ts.isNewExpression(node)) && !skip.has(node)) {
@@ -3755,6 +4733,21 @@ function tsWalk(ts, it) {
         // calls in ONE place, and normalising twice loses `self`
         // (`this.ok` would already be `ok` by the time it got there).
         const rec = { name, line };
+        if (ts.isCallExpression(node) && callee && ts.isPropertyAccessExpression(callee) && callee.name) {
+          const head = unwrap(callee.expression);
+          if (!rooted(head)) {
+            rec.name = callee.name.text;
+            rec.chain = true;
+          } else if (ts.isIdentifier(head) && name.split(".").length === 2 && isLocal(head.text)) rec.lv = true;
+          // lorc 0.5.0 (W32c, C12): `….vm.m()` / `….componentInstance.m()` is a
+          // call on a component instance in a test (INST_CALL).
+          if (head && ts.isPropertyAccessExpression(head) && head.name && INST_HOLDER.test(head.name.text)) {
+            rec.name = callee.name.text;
+            rec.inst = true;
+            delete rec.chain;
+            delete rec.lv;
+          }
+        }
         if (ARGS_WORTH.test(name)) {
           rec.args = (node.arguments || []).map((a) => piece(a));
           rec.end = lineAt(node.getEnd());
@@ -3804,9 +4797,9 @@ function runTsWalk(items, root) {
 
 // ── the borrowed Go parser (v1.8.2 W6, G7) ──────────────────────────────────
 // Go ships its own parser in its standard library, so a repository that has a
-// Go toolchain can have an EXACT parse for free. The program below is written
-// once per CLI process to the OS temp directory and run with `go run` over the
-// whole batch — JSON in on stdin, JSON out on stdout, the same contract the
+// Go toolchain can have an EXACT parse for free. lorc 0.5.0 (W32a): the program
+// below is built ONCE per Go version and source into a cache directory in the
+// OS temp directory, and the binary runs over the whole batch — JSON in on stdin, JSON out on stdout, the same contract the
 // Python rung uses. No module, no network: it imports only `go/parser`,
 // `go/ast`, `go/token`, `encoding/json` and `os`.
 const GO_AST = String.raw`package main
@@ -3833,6 +4826,8 @@ type Call struct {
 	Line   int     ` + "`json:\"line\"`" + `
 	End    int     ` + "`json:\"end,omitempty\"`" + `
 	Ref    bool    ` + "`json:\"ref,omitempty\"`" + `
+	Chain  bool    ` + "`json:\"chain,omitempty\"`" + `
+	LV     bool    ` + "`json:\"lv,omitempty\"`" + `
 	Assign string  ` + "`json:\"assign,omitempty\"`" + `
 	Args   []Piece ` + "`json:\"args,omitempty\"`" + `
 }
@@ -3964,7 +4959,7 @@ func main() {
 	out := map[string]*Out{}
 	for _, it := range items {
 		fset := token.NewFileSet()
-		f, err := parser.ParseFile(fset, it.Abs, nil, parser.SkipObjectResolution)
+		f, err := parser.ParseFile(fset, it.Abs, nil, 0)
 		if err != nil || f == nil {
 			out[it.Rel] = nil
 			continue
@@ -4042,6 +5037,20 @@ func main() {
 				o.Defs = append(o.Defs, Def{Name: n.Name.Name, QName: q, Kind: kind, S: line(n.Pos()), E: line(n.End()), Exported: n.Name.IsExported()})
 			}
 		}
+		// lorc 0.5.0 (W32a): the receiver of each method. A call on the
+		// receiver is a call on a known type; a call on any other local is not.
+		recvs := map[*ast.Object]bool{}
+		for _, d := range f.Decls {
+			if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv != nil {
+				for _, fl := range fd.Recv.List {
+					for _, nm := range fl.Names {
+						if nm.Obj != nil {
+							recvs[nm.Obj] = true
+						}
+					}
+				}
+			}
+		}
 		assign := map[ast.Expr]string{}
 		ast.Inspect(f, func(nd ast.Node) bool {
 			if a, ok := nd.(*ast.AssignStmt); ok && len(a.Lhs) == 1 && len(a.Rhs) == 1 {
@@ -4057,8 +5066,38 @@ func main() {
 				return true
 			}
 			name := dotted(ce.Fun)
+			chain, lv := false, false
+			// lorc 0.5.0 (W32a): a call on a call result, an index or a field
+			// of a local is a CHAIN; a method call on a local is LV.
+			if se, ok := ce.Fun.(*ast.SelectorExpr); ok {
+				root := se.X
+				for {
+					if s2, ok := root.(*ast.SelectorExpr); ok {
+						root = s2.X
+						continue
+					}
+					break
+				}
+				if id, ok := root.(*ast.Ident); ok {
+					if id.Obj != nil && id.Obj.Kind == ast.Var && !recvs[id.Obj] {
+						if _, direct := se.X.(*ast.Ident); direct {
+							lv = true
+						} else if s2, ok := se.X.(*ast.SelectorExpr); ok && s2.X == root {
+							// lorc 0.5.0 (W32d): h.Discovery.List() keeps its
+							// three parts. The type of h can name it.
+							lv = true
+						} else {
+							chain = true
+							name = se.Sel.Name
+						}
+					}
+				} else {
+					chain = true
+					name = se.Sel.Name
+				}
+			}
 			if name != "" {
-				c := Call{Name: name, Line: line(ce.Pos())}
+				c := Call{Name: name, Line: line(ce.Pos()), Chain: chain, LV: lv}
 				last := name[strings.LastIndex(name, ".")+1:]
 				if worth[last] {
 					c.End = line(ce.End())
@@ -4072,6 +5111,16 @@ func main() {
 				o.Calls = append(o.Calls, c)
 			}
 			for _, a := range ce.Args {
+				// lorc 0.5.0 (W32a): a parameter, a local or a package var
+				// is a value, not a function passed by name.
+				if id, ok := a.(*ast.Ident); ok && id.Obj != nil && id.Obj.Kind == ast.Var {
+					continue
+				}
+				// A predeclared value is not a function either (the heuristic
+				// rung drops the same words).
+				if id, ok := a.(*ast.Ident); ok && (id.Name == "nil" || id.Name == "true" || id.Name == "false" || id.Name == "iota") {
+					continue
+				}
 				if r := dotted(a); r != "" {
 					o.Calls = append(o.Calls, Call{Name: r, Line: line(a.Pos()), Ref: true})
 				}
@@ -4093,32 +5142,75 @@ function findGo() {
   goProbe = null;
   const cmd = process.env.ORC_GRAPH_GO || "go";
   try {
-    const r = spawnSync(cmd, ["version"], { encoding: "utf8", timeout: 15000, windowsHide: true });
+    // lorc 0.5.0 (W32a): the probe runs outside the repository with the local
+    // toolchain. A `toolchain` line in the go.mod of the repository must not
+    // start a download.
+    const r = spawnSync(cmd, ["version"], { cwd: os.tmpdir(), encoding: "utf8", timeout: 15000, windowsHide: true, env: GO_ENV() });
     if (r.status !== 0 || !/go\d|go version/.test(r.stdout || "")) return null;
     const ver = /go(\d+\.\d+(?:\.\d+)?)/.exec(r.stdout || "");
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "orc-graph-go-"));
-    fs.writeFileSync(path.join(dir, "main.go"), GO_AST);
-    fs.writeFileSync(path.join(dir, "go.mod"), "module orcgraph\n\ngo 1.20\n");
-    goProbe = { cmd, ver: ver ? ver[1] : "?", dir };
+    // lorc 0.5.0 (W32a): one cache directory per Go version and program
+    // source. It holds the sources and the built binary.
+    const hash = crypto.createHash("sha1").update(GO_AST + "\n" + String(r.stdout).trim()).digest("hex").slice(0, 12);
+    const dir = path.join(os.tmpdir(), "lorc-graph-go-" + hash);
+    const bin = path.join(dir, process.platform === "win32" ? "goast.exe" : "goast");
+    goProbe = { cmd, ver: ver ? ver[1] : "?", dir, bin };
+    if (!fs.existsSync(bin)) buildGoAst(goProbe);
   } catch (_) {
     goProbe = null;
   }
   return goProbe;
 }
 
+const GO_ENV = () => ({ ...process.env, GOFLAGS: "-mod=mod", GO111MODULE: "on", GOTOOLCHAIN: "local" });
+
+// Write the Go program and its module file into the cache directory.
+function writeGoSources(go) {
+  fs.mkdirSync(go.dir, { recursive: true });
+  fs.writeFileSync(path.join(go.dir, "main.go"), GO_AST);
+  fs.writeFileSync(path.join(go.dir, "go.mod"), "module orcgraph\n\ngo 1.20\n");
+}
+
+// lorc 0.5.0 (W32a): build the binary. Another CLI process can build at the
+// same time, so the build goes to a temporary name and a rename puts it in
+// place. A rename that fails because the binary is already there is not an
+// error.
+function buildGoAst(go) {
+  try {
+    writeGoSources(go);
+    const tmp = path.join(go.dir, `goast-${process.pid}-${Date.now()}${process.platform === "win32" ? ".exe" : ""}`);
+    const r = spawnSync(go.cmd, ["build", "-o", tmp, "."], { cwd: go.dir, encoding: "utf8", timeout: 120000, windowsHide: true, env: GO_ENV() });
+    if (r.status !== 0 || !fs.existsSync(tmp)) return false;
+    try {
+      fs.renameSync(tmp, go.bin);
+    } catch (_) {
+      try {
+        fs.unlinkSync(tmp);
+      } catch (_e) {
+        // The temporary file stays. It does no harm.
+      }
+    }
+    return fs.existsSync(go.bin);
+  } catch (_) {
+    return false;
+  }
+}
+
 function runGoAst(items, root) {
   void root;
   const go = findGo();
   if (!go) return null;
-  const r = spawnSync(go.cmd, ["run", "."], {
-    cwd: go.dir,
-    input: JSON.stringify(items.map((i) => ({ rel: i.rel, abs: i.abs }))),
-    encoding: "utf8",
-    maxBuffer: 512 * 1024 * 1024,
-    timeout: 600000,
-    windowsHide: true,
-    env: { ...process.env, GOFLAGS: "-mod=mod", GO111MODULE: "on" },
-  });
+  const input = JSON.stringify(items.map((i) => ({ rel: i.rel, abs: i.abs })));
+  const opts = { cwd: go.dir, input, encoding: "utf8", maxBuffer: 512 * 1024 * 1024, timeout: 600000, windowsHide: true, env: GO_ENV() };
+  let r = fs.existsSync(go.bin) ? spawnSync(go.bin, [], opts) : null;
+  // The binary is missing or it failed: `go run` is the fallback.
+  if (!r || r.status !== 0 || !r.stdout) {
+    try {
+      writeGoSources(go);
+    } catch (_) {
+      return null;
+    }
+    r = spawnSync(go.cmd, ["run", "."], opts);
+  }
   if (r.status !== 0 || !r.stdout) return null;
   try {
     return { map: JSON.parse(r.stdout), extractor: `go-ast@${go.ver}` };

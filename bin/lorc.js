@@ -54,7 +54,7 @@ Object.assign(COMMANDS, {
   run: lazy("runs.js", "run record: checkpoint, end, resume, list, show"),
   habits: lazy("habits.js", "habit proposals; habits accept|decline <id>"),
   stats: lazy("stats.js", "tokens and cost per finished run"),
-  graph: lazy("graph-router.js", "code graph: where, status, update, ctx, map, changes, sync"),
+  graph: lazy("graph-router.js", "code graph: where, status, update, scan, ctx, map, changes, sync"),
   wiki: lazy("wiki.js", "wiki status | sync | pick \"<words>\" | commands"),
   pattern: lazy("pattern.js", "code pattern status [<lang>] | show <lang>"),
   rules: lazy("rules.js", "house rules: init | show | card | lint [--diff]"),

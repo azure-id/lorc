@@ -79,6 +79,7 @@ test("trimming: role first, then focus rows, then pages; sets trimmed", () => {
 
 test("prep on a risky path sets tier_hint.risky_paths", () => {
   const e = repo({ "src/payments/charge.js": "function chargeCard(x) { return x; }\nmodule.exports = { chargeCard };\n" });
+  e.lorc(["graph", "update"]); // W33: prep builds no graph; the user does.
   const on = JSON.parse(e.lorc(["prep", "change chargeCard payments", "--json", "--no-start"]).stdout);
   assert.ok(on.tier_engine.why.some((w) => /risk: money.*src\/payments\/charge\.js/.test(w)), JSON.stringify(on.tier_engine));
   e.write(".claude/lorc/settings.json", JSON.stringify({ tier_engine: "off" }));
@@ -274,4 +275,13 @@ test("0.3.3: no router in the fixture -> no must_ask key", () => {
   const e = repo();
   const out = JSON.parse(e.lorc(["prep", "add a new page for subtract", "--json", "--no-start"]).stdout);
   assert.ok(!("must_ask" in out), JSON.stringify(out.must_ask));
+});
+
+test("W33: no store → graph.suggest, and prep builds no store", () => {
+  const e = repo();
+  const r = e.lorc(["prep", "add subtract", "--json", "--no-start"]);
+  assert.strictEqual(r.status, 0, r.stderr);
+  const o = JSON.parse(r.stdout);
+  assert.strictEqual(o.graph.suggest, "lorc graph scan");
+  assert.ok(!fs.existsSync(path.join(e.root, ".claude", "lorc", "orc", "graph", "meta.json")));
 });

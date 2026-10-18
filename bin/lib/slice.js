@@ -80,7 +80,7 @@ function contextPart(runDir, input, files, refFiles) {
   const fileSet = new Set(files);
   const refSet = new Set(refFiles);
   const creates = Boolean(input.creates);
-  const all = { targets: pack.targets || [], exemplars: pack.exemplars || [], tests: pack.tests || [], reuse: pack.reuse || [] };
+  const all = { targets: pack.targets || [], mirror: pack.mirror || [], exemplars: pack.exemplars || [], tests: pack.tests || [], reuse: pack.reuse || [] };
   const seen = new Set();
   const picked = [];
   const add = (it) => {
@@ -90,9 +90,14 @@ function contextPart(runDir, input, files, refFiles) {
     picked.push(it);
   };
   // 1. Items in the task's files (targets first), 2. in its refs, 3. exemplars, tests, reuse when the task creates a file.
-  for (const k of ["targets", "exemplars", "tests", "reuse"]) for (const it of all[k]) if (fileSet.has(it.file)) add(it);
-  for (const k of ["targets", "exemplars", "tests", "reuse"]) for (const it of all[k]) if (refSet.has(it.file)) add(it);
-  if (creates) for (const k of ["exemplars", "tests", "reuse"]) for (const it of all[k]) add(it);
+  for (const k of ["targets", "mirror", "exemplars", "tests", "reuse"]) for (const it of all[k]) if (fileSet.has(it.file)) add(it);
+  // 0.5.2: a mirror row whose counterpart the task writes.
+  for (const it of all.mirror) {
+    const cp = it.counterpart || ((/ → (\S+) \(not in the doc\)$/.exec(String(it.what || "")) || [])[1]);
+    if (cp && fileSet.has(cp)) add(it);
+  }
+  for (const k of ["targets", "mirror", "exemplars", "tests", "reuse"]) for (const it of all[k]) if (refSet.has(it.file)) add(it);
+  if (creates) for (const k of ["mirror", "exemplars", "tests", "reuse"]) for (const it of all[k]) add(it);
   const out = picked.map((it) => ({
     file: it.file, line: `- ${it.file}:${it.start}${it.end !== it.start ? "-" + it.end : ""} — ${it.what}${it.why ? ` (${it.why})` : ""}`,
     code: it.code ? it.code : "",
@@ -168,15 +173,28 @@ function commandsPart(root, files, graphTests = []) {
   const check = require("./check.js");
   let c = {};
   try { c = require("./wiki.js").commands(root) || {}; } catch (_) { c = {}; }
-  const tc = c.typecheck || c.build || "none";
   // 0.1.6: each file maps to its project dir; a line runs there (cd <dir> && ...).
   const cd = (d, x) => (d === "." ? x : `cd ${d} && ${x}`);
   const ad = (d) => (d === "." ? root : path.join(root, d));
+  // 0.5.2: a typecheck first (no build: a build writes dist/ and parallel builds race); the build is the fallback.
+  let tc = c.typecheck || null;
+  if (!tc) {
+    try {
+      const d = Object.keys(check.groupByProject(root, files))[0] || ".";
+      const t = check.typecheckCmd(ad(d));
+      if (t) tc = cd(d, t);
+    } catch (_) { tc = null; }
+  }
+  const tcLine = tc ? `- typecheck: ${tc}` : `- typecheck/build: ${c.build || "none"}`;
   const testLines = [];
   try {
     // Before the edit, `graph changes` sees no hunk: the slice's ctx tests fill in.
     const t = [...new Set([...check.affectedTests(root, files), ...graphTests])]
-      .filter((x) => fs.existsSync(path.join(root, x))).sort();
+      .filter((x) => fs.existsSync(path.join(root, x)));
+    // 0.5.2: the declared test files that do not exist yet run too.
+    const fresh = files.filter((f) => (/(^|\/)(tests?|__tests__|specs?)\/|\.(test|spec)\.[cm]?[jt]sx?$/i.test(f) || /_test\.go$/i.test(f)) && !fs.existsSync(path.join(root, f)));
+    t.push(...fresh.filter((f) => !t.includes(f)));
+    t.sort();
     for (const [d, tf] of Object.entries(check.groupByProject(root, t))) {
       const run = check.runner(ad(d));
       testLines.push(run ? cd(d, run.cmd(tf)) : `${tf.join(" ")} (no runner found${d === "." ? "" : " in " + d})`);
@@ -186,7 +204,7 @@ function commandsPart(root, files, graphTests = []) {
   const covs = [];
   try {
     for (const [d, ff] of Object.entries(check.groupByProject(root, files))) {
-      const l = check.lintCmd(ad(d), ff, d === "." ? c : null);
+      const l = check.lintCmd(ad(d), ff, d === "." ? c : null, { planned: true });
       if (l) lints.push(cd(d, l));
       // 0.1.5: the coverage bar is a project P0 rule: the executor meets it before it returns.
       const run = check.runner(ad(d));
@@ -197,7 +215,7 @@ function commandsPart(root, files, graphTests = []) {
       }
     }
   } catch (_) { /* none */ }
-  const out = [`- typecheck/build: ${tc}`, `- tests for this task: ${testLines.join(" ; ") || "none found"}`, `- lint: ${lints.join(" ; ") || "none"}`, ...covs];
+  const out = [tcLine,`- tests for this task: ${testLines.join(" ; ") || "none found"}`, `- lint: ${lints.join(" ; ") || "none"}`, ...covs];
   return out.join("\n");
 }
 
@@ -289,7 +307,7 @@ function refBlock(root, r) {
 const REF_LONG = 150;
 function rangeRefs(root, runDir, kept) {
   const pack = (() => { try { return paths.readJson(path.join(runDir, "context.json"), null); } catch (_) { return null; } })() || {};
-  const items = ["targets", "exemplars", "tests", "reuse"].flatMap((k) => pack[k] || []);
+  const items = ["targets", "mirror", "exemplars", "tests", "reuse"].flatMap((k) => pack[k] || []);
   return kept.map((s) => {
     const m = /^(.+?)(?:\s+[—–-]+\s+(.+))?$/.exec(s);
     const file = m[1];

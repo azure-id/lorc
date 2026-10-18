@@ -93,7 +93,8 @@ function focusRows(map) {
   return rows;
 }
 
-// Build the graph when there is none, else update the changed files. In process
+// Update the changed files. No graph → build nothing; `suggest` tells the user
+// to run `lorc graph scan`. In process
 // (no child). `lorc tier` calls this too.
 function healGraph(root) {
   try { return require("./graph-router.js").heal(root); } catch (e) {
@@ -109,6 +110,7 @@ function graphPart(root) {
   const st = healGraph(root);
   out.state = st.error ? "unknown" : st.state || null;
   if (st.error) out.error = st.error;
+  if (st.suggest) out.suggest = st.suggest;
   out.loaded = null;
   if (sel.mode === "own") {
     try {

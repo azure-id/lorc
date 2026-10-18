@@ -137,3 +137,30 @@ test("0.1.6: tests in a sub-project folder run there (client/)", () => {
     .split("\n").find((l) => l.startsWith("- tests for this task:"));
   assert.ok(line.includes("- tests for this task: cd client && "), line);
 });
+
+test("0.5.2: lintCmd with planned keeps a missing file; the default drops it", () => {
+  const check = require("../bin/lib/check.js");
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "lorc-lint-"));
+  fs.writeFileSync(path.join(d, "package.json"), JSON.stringify({ name: "x", version: "1.0.0", devDependencies: { eslint: "9" } }));
+  fs.mkdirSync(path.join(d, "src"));
+  fs.writeFileSync(path.join(d, "src", "a.ts"), "export const a = 1;\n");
+  const files = ["src/a.ts", "src/new.ts", "tests/unit/new.test.ts"];
+  // Changed for R4 (0.5.2 eslint cache): the command now has --cache --cache-location.
+  const pre = `npx eslint --cache --cache-location ${check.lintCmd(d, ["src/a.ts"], null).split(" ")[4]} `;
+  assert.strictEqual(check.lintCmd(d, files, null), pre + "src/a.ts");
+  assert.strictEqual(check.lintCmd(d, files, null, { planned: true }), pre + "src/a.ts src/new.ts tests/unit/new.test.ts");
+  fs.rmSync(d, { recursive: true, force: true });
+});
+
+test("0.5.2 R4: lintCmd for an eslint project has --cache --cache-location", () => {
+  const check = require("../bin/lib/check.js");
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "lorc-lintc-"));
+  fs.writeFileSync(path.join(d, "package.json"), JSON.stringify({ name: "x", version: "1.0.0", devDependencies: { eslint: "9" } }));
+  fs.writeFileSync(path.join(d, "a.ts"), "export const a = 1;\n");
+  let c = check.lintCmd(d, ["a.ts"], null);
+  assert.ok(/^npx eslint --cache --cache-location \S*\.claude\/lorc\/eslintcache\/"? a\.ts$/.test(c), c);
+  fs.mkdirSync(path.join(d, "node_modules"));
+  c = check.lintCmd(d, ["a.ts"], null);
+  assert.ok(/--cache-location \S*node_modules\/\.cache\/lorc-eslint\/"? a\.ts$/.test(c), c);
+  fs.rmSync(d, { recursive: true, force: true });
+});

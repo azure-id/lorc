@@ -41,9 +41,10 @@
 //   callers target symbol id → the confident callers of it, as
 //           `[caller symbol id, line, state, kind, extra]`, where `kind` is
 //           0 a call · 1 a function passed by name · 2 a URL · 3 an inherited
-//           member (v1.8.2, schema 3). `extra` is the URL text for 2 and the
-//           alias name (`store` in `store.list()`) for a call through an
-//           instance alias; absent otherwise.
+//           member (v1.8.2, schema 3) · 4 a store link (lorc 0.5.0, schema
+//           5). `extra` is the URL text for 2, the alias name (`store` in
+//           `store.list()`) for a call through an instance alias, and the
+//           store role of the call for 4; absent otherwise.
 //   maybe   target symbol id → how many AMBIGUOUS calls list this target, by
 //           CALLER FILE. Per file, not per call site: 5 MB on django/django
 //           instead of 45 MB, and the card only ever shows the total.
@@ -61,9 +62,12 @@ const G = require("./graph.js");
 
 // 3 (v1.8.2 W1): ROUTE rows. A 1.8.1 cache is refused by the schema check and
 // recomputed on read until the next `update` rewrites it — no answer changes.
-const RESOLVE_SCHEMA = 4;
+// 5 (lorc 0.5.0 W29a): store rows (kind 4), and one row per target of a
+// result with `targets`.
+// 6 (lorc 0.5.0 W34c): impl rows (kind 8).
+const RESOLVE_SCHEMA = 6;
 const DERIVED_SCHEMA = 2;
-const CONFIDENT = new Set(["LOCAL", "IMPORT", "UNIQUE", "ROUTE"]);
+const { CONFIDENT } = require("./graph-states.js");
 const NAMES_PER_KEY = 5;
 
 // Format 1 only (read for backward compatibility).
@@ -115,12 +119,25 @@ function computeCallers(model) {
     for (const s of f.symbols || []) {
       s.file = rel;
       for (const c of s.calls || []) {
+        // lorc 0.5.0 (W34e): an i18n call resolves only to I18N (not CONFIDENT,
+        // no `target`) or UNRESOLVED. It never makes a row, so do not resolve it.
+        if (c.i18n) continue;
         const r = Q.resolveCall(model, rel, s, c);
         if (r.target && CONFIDENT.has(r.state)) {
-          const kind = c.ref ? 1 : r.inherited ? 3 : 0;
-          const row = [s.id, c.line, r.state, kind];
-          if (kind === 0 && c.alias) row.push(c.alias);
-          (own(callers, r.target) || (callers[r.target] = [])).push(row);
+          const kind = r.state === "EVENT" ? 7 : c.store ? 4 : c.listen ? 5 : c.prop ? 6 : c.ref ? 1 : r.inherited ? 3 : 0;
+          for (const t of r.targets || [r.target]) {
+            // lorc 0.5.0 (W34c): a row for a class that implements the target
+            // interface member. Its state comes from the file of the impl.
+            if (r.impl && t !== r.target) {
+              (own(callers, t) || (callers[t] = [])).push([s.id, c.line, callerFile(model, t) === rel ? "LOCAL" : "IMPORT", 8, r.impl]);
+              continue;
+            }
+            const row = [s.id, c.line, r.state, kind];
+            if (kind === 0 && c.alias) row.push(c.alias);
+            if (kind === 4) row.push(c.store);
+            if (kind === 7) row.push(c.via ? Q.constValue(model, rel, c.name) : c.name);
+            (own(callers, t) || (callers[t] = [])).push(row);
+          }
         } else if (r.state === "AMBIGUOUS") ambiguous(r, rel);
       }
       // W1: the URLs this symbol sends, resolved to route symbols.
@@ -210,8 +227,11 @@ function sortedObject(o) {
   for (const k of Object.keys(o).sort()) out[k] = o[k];
   return out;
 }
+// lorc 0.5.0 (W34e): one shared collator. Its `compare` gives the same order
+// as `localeCompare` with no arguments, and it is faster.
+const collate = new Intl.Collator().compare;
 function byRow(a, b) {
-  return String(a[0]).localeCompare(String(b[0])) || a[1] - b[1];
+  return collate(String(a[0]), String(b[0])) || a[1] - b[1];
 }
 function sortedRows(o) {
   const out = bare();
@@ -233,7 +253,7 @@ function writeNames(p, model, callers) {
   for (const [name, syms] of model.byName) {
     const rows = syms
       .map((s) => ({ s, fan: (own(callers, s.id) || []).length }))
-      .sort((a, b) => b.fan - a.fan || a.s.file.localeCompare(b.s.file))
+      .sort((a, b) => b.fan - a.fan || collate(a.s.file, b.s.file))
       .slice(0, NAMES_PER_KEY)
       .map(({ s, fan }) => [s.qname, s.kind, s.file, s.lines[0], s.lines[1], fan]);
     if (!rows.length) continue;
