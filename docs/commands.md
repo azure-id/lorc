@@ -61,7 +61,7 @@ Changed: 4 files · Verified: unit tests, lint · Findings: 1 P3
 | `lorc run` | run record: `checkpoint`, `end`, `resume`, `list`, `show` |
 | `lorc habits` | habit proposals; `accept` or `decline <id>` |
 | `lorc stats` | tokens and cost per finished run |
-| `lorc graph` | code graph: `where`, `status [--heal]`, `update`, `upgrade`, `gc`, `ctx`, `map`, `changes`, `sync` |
+| `lorc graph` | code graph: `where`, `status [--heal]`, `update`, `scan`, `upgrade`, `gc`, `ctx`, `map`, `changes`, `sync` |
 | `lorc context` | `context "<request>" [--doc <path>] [--run <slug>] [--json]`: the context pack (anchored line ranges for the request) |
 | `lorc wiki` | `status`, `sync`, `pick "<words>"`, `commands` |
 | `lorc pattern` | code pattern `status [<lang>]`, `show <lang>` |
@@ -76,7 +76,7 @@ Changed: 4 files · Verified: unit tests, lint · Findings: 1 P3
 | `lorc tier` | `tier "<request>" [--doc <path>] [--json] [--brief] [--no-heal]`: lorc's tier engine · `tier eval [--recompute]` |
 | `lorc jev` | `status [--ping]`, `connect -`, `disconnect`, `tier`, `ask [--run <slug>] -`: the TypeSafe jev judges |
 
-**Code graph commands.** `lorc graph upgrade` converts a format-1 store (lorc ≤ 0.3.x, `graph@7`) to format 2 in place. A language parses again only when its extractor version changed. Any update also upgrades the store. `lorc graph sync` stays only for older skills: it is a no-op. `lorc graph gc` keeps every file that the current or the previous manifest lists and deletes the other bucket files at once. It deletes a stray temp file only when it is older than 10 minutes (the grace time). More: [graph.md](graph.md).
+**Code graph commands.** `lorc graph scan` is the same as `lorc graph update`. It is a clearer name for a full build. lorc never builds the first graph by itself: run `lorc graph scan` once. `lorc graph update --if-exists` does nothing when no graph exists. `lorc graph update --json` gives `files`, `symbols`, `modules`, `parsed`, `reused`, `ms` and `written_bytes`. `lorc graph upgrade` converts a format-1 store (lorc ≤ 0.3.x, `graph@7`) to format 2 in place. A language parses again only when its extractor version changed. Any update also upgrades the store. `lorc graph sync` stays only for older skills: it is a no-op. `lorc graph gc` keeps every file that the current or the previous manifest lists and deletes the other bucket files at once. It deletes a stray temp file only when it is older than 10 minutes (the grace time). More: [graph.md](graph.md).
 
 **Context pack.** `lorc context` links the names in the request and the doc (identifiers, files, CSS classes, endpoints, quoted UI text) to anchored line ranges. It adds the change targets, the closest exemplars with cards, the test setup to copy and 1-hop reuse. With `--run <slug>` it writes `<run>/context.md` and `context.json`. `lorc prep` does this for each run.
 

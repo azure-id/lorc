@@ -7,9 +7,86 @@
 Arms: Q = `/orc-quick`. LS = lorc alone. LO = lorc with ORC installed.
 Gate per cell: cost lower AND tokens lower AND lane time lower AND score median not lower than Q AND the critical e2e steps pass in 3 of 3 runs.
 
+## 0.5.x — front end + back end vs no skills (18-10-2026)
+
+**Method.**
+- Every test ran on a real-world, complex production repository (not a toy repo):
+  - Vue 2 SPA (Vue 2.7, Vuex, vue-i18n): 1,252 tracked files, ~13,400 graph symbols.
+  - Go Fiber API (raw SQL + sqlmock unit tests): ~300 tracked files, 164 routes, 54 test packages.
+  - TypeScript Express + TypeORM API (class controllers, BullMQ workers, TypeORM): ~270 tracked files, 33 routes, ~200 unit tests.
+- Arms: no skills = plain Claude Code (no skill, no wiki, no lorc files). lorc 0.5.0, lorc 0.5.1 and lorc 0.5.2 = `/lorc`.
+- lorc 0.5.2 (back end only): 4 fix rounds. The Go runs used the round-3 build (round 4 does not touch Go packs or slices). The TypeScript runs used the final round-4 build. The no-skills arm is the arm of the 0.5.0 eval (same fixtures).
+- The main model and effort are the same in all arms: Opus 5.5 medium. A simulated developer answers the questions from fixed facts. One run at a time. 3 runs per arm. The tables show medians.
+- Back-end tasks use "baseline removal": we removed a feature that has good unit tests and gave the ticket. The removed tests (+ edge tests) are hidden acceptance tests: Go mid 21, Go high 25, TS mid 41, TS high 20. The existing suite must stay green. The front end has its e2e journey (12 steps).
+- Levels: **mid** = the ticket has a full technical contract (≥ 3 layers, ≥ 5 files). **high** = a thin contract: the rules in prose and only the names and signatures that the hidden tests compile against.
+- Blind grading: a fresh grader per run gets the ticket, the rubric, the diff and the test output. The packet has no arm, cost or time. Grade 0–100 (correctness 40, tests 20, fit to codebase patterns 20, scope 10, readability 10).
+- lorc's graph scan (1–4 s, zero tokens) runs before the lane and is not in the lane time.
+
+**Vue 2 SPA — front-end task (RMT1)**
+
+| Arm | Lane s | Cost $ | Tokens | E2E | Grade |
+|---|---|---|---|---|---|
+| no skills | 905 | 4.31 | 7.39M | 12/12 | 84 |
+| **lorc 0.5.0** | **667** | **2.90** | **3.92M** | 12/12 | 83 |
+
+**Go Fiber API — mid**
+
+| Arm | Lane s | Cost $ | Tokens | Hidden | Grade |
+|---|---|---|---|---|---|
+| no skills | 310 | 1.54 | 1.29M | 21/21 | 94 |
+| lorc 0.5.0 | 227 | 1.44 | 1.34M | 21/21 | 93 |
+| lorc 0.5.1 | 281 | 1.90 | 1.37M | 21/21 | 95 |
+| **lorc 0.5.2** | **242** | **1.50** | 1.34M | 21/21 | 96 |
+
+lorc 0.5.2 runs: 253 s / $1.50 / 1.56M / 93 · 188 s / $1.29 / 1.24M / 96 · 242 s / $1.53 / 1.35M / 96.
+
+**Go Fiber API — high**
+
+| Arm | Lane s | Cost $ | Tokens | Hidden | Grade |
+|---|---|---|---|---|---|
+| no skills | 335 | 1.81 | 1.48M | 25/25 | 96 |
+| lorc 0.5.1 | 267 | 1.76 | 1.50M | 25/25 | 94 |
+| **lorc 0.5.2** | **285** | **1.74** | 1.88M | 25/25 | 93 |
+
+lorc 0.5.2 runs: 303 s / $1.80 / 1.91M / 92 · 285 s / $1.15 / 1.08M / 95 · 259 s / $1.74 / 1.88M / 93.
+
+**TypeScript Express + TypeORM API — mid**
+
+| Arm | Lane s | Cost $ | Tokens | Hidden | Grade |
+|---|---|---|---|---|---|
+| no skills | 269 | 1.08 | 0.82M | 41/41 | 96 |
+| lorc 0.5.0 | 279 | 1.01 | 0.96M | 41/41 | 95 |
+| lorc 0.5.1 | 262 | 0.86 | 0.72M | 41/41 | 95 |
+| **lorc 0.5.2** | 283 | **0.81** | **0.77M** | 41/41 | 96 |
+
+lorc 0.5.2 runs: 263 s / $0.80 / 0.74M / 96 · 286 s / $0.84 / 0.77M / 95 · 283 s / $0.81 / 0.87M / 96.
+
+**TypeScript Express + TypeORM API — high**
+
+| Arm | Lane s | Cost $ | Tokens | Hidden (of 20 / of 19) | Grade |
+|---|---|---|---|---|---|
+| no skills | 294 | 1.47 | 1.35M | 19/20 · 19/19 | 95 |
+| lorc 0.5.1 | 369 | 1.20 | 1.58M | 19/20 · 19/19 | 92 |
+| lorc 0.5.2 | 329 | 1.44 | 1.50M | 18/20 · 18/19 | 89 |
+
+lorc 0.5.2 runs: 303 s / $1.46 / 1.52M / 88 · 329 s / $1.44 / 1.47M / 89 · 336 s / $1.28 / 1.47M / 91.
+
+TS high: all 6 runs fail one original hidden test of the service's create flow. Its mock gives no entity manager to `dataSource.transaction`, and the ticket does not ask for that. "Of 19" does not count this test (same rule for both arms). Grades per run: no skills 80, 95, 97; lorc 0.5.1 92, 85, 95.
+
+TS high, lorc 0.5.2: every run of both arms fails the over-specified test above (its mock gives the transaction callback no entity manager). The 0.5.2 runs also fail a second test of the same kind. They save through the static manager method of the repository inside the transaction. This code is correct, but the mock of the test supports only the instance save call. The blind graders capped correctness for it (89).
+
+**Summary (measured, n = 3 per arm).**
+- Front end: lorc wins on time (−26 %), cost (−33 %) and tokens (−47 %).
+- Main measures: lane time and cost. Tokens can rise when lorc moves work to cheaper executors in parallel.
+- Go, lorc 0.5.2: faster and cheaper at both levels. Mid: time −22 %, cost −3 %, grade 94 → 96 (the 0.5.1 cost loss is fixed). High: time −15 %, cost −4 %, tokens +27 %, grade 96 → 93.
+- TypeScript mid, lorc 0.5.2: cheaper at about equal time: cost −25 %, time +5 %, tokens −6 %, grade 96 → 96.
+- TypeScript high, lorc 0.5.2: about equal cost (−2 %), but slower (+12 %) and a lower blind grade (95 → 89), because of the second over-specified test. lorc does not win here. Next step: the TS high critical path.
+- Earlier rows: Go mid 0.5.0 −27 % time, −7 % cost; 0.5.1 on Go mid cost +24 %. TS high 0.5.1: cost −18 %, time +26 %.
+- Quality: all arms keep the suites green and pass all hidden tests, except TS high (median 19/19; one run per arm 18/19). The blind grades are within 1–3 points; no skills is slightly higher on the high tasks (Go −2, TS −3).
+
 ## lorc 0.4.3 (17-10-2026)
 
-Eval kit `2.1.2-dashboard-eval`, task RMT1 step 1, lorc alone, 3 runs per version, medians.
+Eval kit `2.1.2 (Vue 2 SPA eval)`, task RMT1 step 1, lorc alone, 3 runs per version, medians.
 
 | Version | Lane s | Cost $ | Tokens | Graph calls | Score | E2E |
 |---|---|---|---|---|---|---|

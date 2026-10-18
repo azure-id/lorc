@@ -1,5 +1,102 @@
 # Changelog
 
+## 0.5.2 — 18-10-2026
+**Back-end fixes from the 0.5.1 eval: cheaper executors, a real split for big back-end tickets, and a context pack that shows what to reuse.**
+
+**Why.** The 0.5.1 eval lost on two back-end measures. Go Fiber API mid cost more than 0.5.0: the tier engine set the executor to opus-5-low in every Go run, because existing migration files (table definitions that the work only reads) counted as a risk. TypeScript Express + TypeORM API high was slower than no skills: the engine estimated 4 files (the ticket changes 8 source files), so one executor did the whole ticket. Blind graders also found code that copied an existing check instead of reusing it, and a DI wiring that did not follow the closest feature.
+
+**Changes**
+- **Tier engine.** The risk floor counts only risky files that the work changes. High or complex work never goes to haiku (sonnet minimum, unless the change is mechanical). A back-end ticket that names files sets a minimum size (new files + named wiring and worker files). A background worker is an area. The back-end split groups the work by layer (api / logic / data / worker), and wiring files join a real group. "No DB migration" (a negated migration) is not a migration cue.
+- **Context pack (back ends only).** A new **Mirror** section: the closest existing feature, its files that the ticket does not name yet (for example its DI container), and its unit tests as the first test exemplars. **Reuse** rows for code that already holds the ticket's exact text and for the code that uses a named constant. Narrow ranges (the main symbol, ≤ 40 lines) instead of whole files. Go reuse rows only for files whose symbols an exemplar uses (no whole-package rows). The slice and the executor read plan carry the Mirror rows. The executor read plan of a back-end task holds the definition of an error class that the ticket names (≤ 40 lines), so tests assert the correct error fields.
+- **Executors.** Create a file with one Write (never a shell heredoc). Send all edits of a step in one message. Read the thrown error's fields and one same-layer test before writing tests. Run the lint command once at the end on every file that the executor changed or created. Never wait in a loop for a file that another group creates.
+- **Slice.** The lint line lists every declared task file, also the files that the task creates and its test files. Before, it listed only files that existed, so new files and tests did not get lint. "Tests for this task" also lists the declared new test files.
+- **Context pack (back ends), more.** The error classes that the doc names go to the executor read plan without the 40-name cap. A test task gets the test setup of the same layer. TypeScript types generated from OpenAPI (`components['schemas'][…]` aliases) show their schema block.
+- **Check.** eslint runs with a cache, so the final check lints again only the changed files. The slice typecheck prefers `npx tsc --noEmit` (no build output).
+- **Executors, more.** The rule "one Write, never a heredoc" is now the first rule.
+- Front-end packs and front-end tier decisions are byte-identical (checked on the Vue 2 SPA eval task).
+
+**Numbers** (offline, `lorc tier` / `lorc context` on the eval baselines, before → after)
+- Go Fiber API mid: executor opus-5-low → sonnet-5-med; split api / data / logic.
+- TypeScript Express + TypeORM API mid: plain ticket request tier low (haiku) → mid (sonnet); est 1 → 5.
+- Go Fiber API high: never "complex" from "No DB migration"; executor sonnet-5-med.
+- TypeScript Express + TypeORM API high: mid, est 4, 1 group → high, est 6, 3 groups (api / logic / worker).
+- Pack: Mirror shows the DI container and the unit tests of the closest feature; Reuse shows the existing callback-token check.
+- Tests: 477 → 498.
+
+**Eval** (no skills → lorc 0.5.2, medians of 3, lane s / $ / blind grade; real-world, complex repositories)
+- Go Fiber API mid: 310 → 242 s (−22 %), $1.54 → $1.50 (−3 %), 94 → 96. The 0.5.1 cost loss is fixed.
+- Go Fiber API high: 335 → 285 s (−15 %), $1.81 → $1.74 (−4 %), 96 → 93.
+- TypeScript Express + TypeORM API mid: 269 → 283 s (+5 %), $1.08 → $0.81 (−25 %), 96 → 96.
+- TypeScript Express + TypeORM API high: 294 → 329 s (+12 %), $1.47 → $1.44 (−2 %), 95 → 89, hidden 19/20 → 18/20. The 0.5.2 runs fail a second over-specified test: they save through the static manager method of the repository in the transaction (correct code), but the mock supports only the instance save call. lorc does not win here.
+- Details: `docs/benchmark.md`.
+
+## 0.5.1 — 18-10-2026
+**The context pack and the tier engine work for back ends.**
+
+**Why.** The 0.5.0 FE + BE eval (mid back-end tasks) showed that the context pack and the tier engine assume a front end. For back-end tickets, the pack had no "Copy from" and no targets. It listed whole big files (`openapi.yaml` 1-3151) and each method 3 times. A test file was the "API module". The noun "card" (bank cards) counted as a UI area.
+
+**Changes**
+- **Context pack for back ends.** Source-file exemplars with symbol ranges; the matching server route group + an insert hint; wiring targets (the files that import the module); Go test exemplars by folder; sections of big spec files; one row for each method name; routes before test URLs.
+- **Tier.** A repo with no UI files gets no "ui" layer from UI nouns (`detail.ui_repo`).
+- Front-end packs and front-end tier decisions are byte-identical (checked).
+
+**Numbers** (offline, `lorc context` on the eval baselines)
+- be-go pack, before → after: "Copy from" 0 → 3 (handler / service / repository with ranges); whole-file routes → `routes.go:136-143` route group + insert; + 2 wiring targets; + 2 test exemplars.
+- be-ts pack: 6,608 → 5,108 bytes; names 28 → 20; `openapi.yaml` 1-3151 → three 40-line sections.
+- Tests: 473 → 477.
+
+**Eval** (no skills → lorc, medians of 3, lane s / $ / blind grade; real-world production repos)
+- Vue 2 SPA (lorc 0.5.0): 905 → 667 s, $4.31 → $2.90, 84 → 83.
+- Go Fiber API mid: 310 → 227 s (0.5.0) / 281 s (0.5.1), $1.54 → $1.44 / $1.90, 94 → 93 / 95.
+- Go Fiber API high (0.5.1): 335 → 267 s, $1.81 → $1.76, 96 → 94.
+- TypeScript Express + TypeORM API mid: 269 → 279 s (0.5.0) / 262 s (0.5.1), $1.08 → $1.01 / $0.86, 96 → 95 / 95.
+- TypeScript Express + TypeORM API high (0.5.1): 294 → 369 s, $1.47 → $1.20, 95 → 92.
+- All arms pass all hidden tests, except TS high: median 19 of 19 without one test that no run can pass (one run per arm 18 of 19). Details: `docs/benchmark.md`.
+
+## 0.5.0 — 18-10-2026
+**The code graph links framework and language parts in the front end and the back end, with zero tokens.**
+
+**Why.** The owner asked for framework and language links in the code graph, for the front end and the back end. The graph was also weak on non-Vue back ends. Go Fiber API: the cold build took 15.7 s. TypeScript Express + TypeORM API: the graph found 2 routes. Go route → handler: 3 of 164.
+
+**Changes**
+- **Links.** Four adapters (`vue`, `events`, `config`, `data`) record links with zero tokens:
+  - store (mutation / action / getter / state), component events (emit → listen) and props;
+  - i18n keys, template bindings, global mixins and route paths;
+  - a global event bus by name;
+  - config keys: env reads, and `.env` / `.env.*` files. lorc records KEYS and line numbers only. It never records a value;
+  - tables: SQL text, `.sql` files, ORM entities and knex `createTable`.
+- **States and cards.**
+  - New states STORE, EVENT, I18N, CONFIG and TABLE. New misses: `missing_store`, `missing_i18n`, `missing_route`, `missing_event`, `missing_config`.
+  - `ctx` shows link rows. File cards show `links` rows. The context pack has the lines `store:`, `parents:`, `i18n:`, `events:`, `tables:` and `config:`. Locale blocks show `used by`.
+- **Back-end core fixes.**
+  - Go: lorc builds the parser once and caches it (no toolchain download). Go locals and test helpers are not calls. Go route groups fold into the route paths.
+  - A chained call never resolves by a bare name.
+  - TS: `export const` members, `enum`s, interfaces, types and class property arrows are symbols.
+  - Typed receivers: struct and class fields, 3-part member chains.
+  - Routes: Express class controllers and `x.getRouter()` mounts, typed Fastify registrations (`fastify.post<{…}>(…)`), Fastify autoload folder prefixes.
+  - A call through an interface or an abstract member reaches the class that implements it.
+- **Graph lifecycle.** lorc never builds the FIRST graph by itself. `lorc graph scan` (the same as `update`) builds it, and prep suggests it. When a graph exists, a run heals the changed files at the start and updates the graph once at the end (`update --if-exists`, also in the hook and at run end).
+- **Update output.** `graph update --json` gives `written_bytes` and `modules`. `symbols` counts the records without `module`.
+- **Context pack.** A hyphen word in the request (`top-up`) matches a joined file word (`Topup`) or its parts (`TopUp`). `top up`, `check out` and `log off` count as one word. File cards keep their first 4 `links` rows on a small budget.
+- **Cost.** A 1-file update is slower than in 0.4.3, because the derived cache also resolves the link calls (about 28 % more calls). The update runs once per subagent stop and once at run end. See the table.
+
+**Numbers** (sandbox clones, 0.4.3 → 0.5.0)
+
+| Repo | Measure | 0.4.3 | 0.5.0 |
+|---|---|---|---|
+| Vue 2 SPA | Cold build (lorc time, median of 3) | 1,980 ms | 2,161 ms |
+| Vue 2 SPA | Index | 5.48 MB | 7.37 MB |
+| Vue 2 SPA | Symbols | 10,399 | 13,364 |
+| Vue 2 SPA | Partial files | 18 | 4 |
+| Vue 2 SPA | 1-file update (wall) | 876 ms (median of 5) | 1,091 ms (median of 3) |
+| Vue 2 SPA | Store links resolved | — | 1,045 of 1,054 |
+| Vue 2 SPA | i18n keys resolved | — | 3,713 of 3,925 |
+| Go Fiber API | Cold build (lorc time, median of 3) | 15,735 ms | 817 ms |
+| Go Fiber API | Routes; route → handler | 164; 3 | 164; 78 of 80 non-test |
+| TypeScript Express + TypeORM API | Routes; route → handler | 2 | 33; 33 |
+| TypeScript Express + TypeORM API | Env keys resolved (`Env.get` reads) | not found | 43 of 49 |
+| TypeScript Fastify + knex API | Routes; route → handler | 35 | 150; 77 of 126 non-test |
+
 ## 0.4.3 — 17-10-2026
 **One small read file per executor task; the eval medians beat 0.3.3 on every measure.**
 
@@ -115,7 +212,7 @@ It made 17 dig calls before the first write and 18 one-by-one Edits: 7 to differ
   - Split groups list real files: a UI group with router, keys, locale; an API group with the module + its spec. Placeholders go into real files.
   - Structural analog (the closest existing flow, its 1-hop footprint) works with no git history. IDF-weighted git analogs with a dynamic k (Kocaguneli et al., TSE 2012). A cue prior from the history of the repo.
   - Confidence comes from signal agreement.
-  - Result: RMT1: high with the correct split (0.3.3: router in the "api" group). RMT3: mid, est 3 (0.3.3: high, est 6). Backtest on 40 dashboard commits (`bench-tier`): seed 1 median abs error 2 → 1, within ±1 file 48 → 53 %, within ×1.5 25 → 33 %; seed 2 level.
+  - Result: RMT1: high with the correct split (0.3.3: router in the "api" group). RMT3: mid, est 3 (0.3.3: high, est 6). Backtest on 40 Vue 2 SPA commits (`bench-tier`): seed 1 median abs error 2 → 1, within ±1 file 48 → 53 %, within ×1.5 25 → 33 %; seed 2 level.
 - **Answer recommendations (`must_ask`).** Items now have `kind` (`route`, `steps`, `field`, `name`), `seen[].v` options with `at` evidence, and `rec`.
   - `rec` covers the step pattern (inside the shell vs one route per step) from step constants and their comments, a payload field with no source in the repo data, and a doc spec name that breaks the sibling naming.
   - Route items keep `path` for older skills.
@@ -128,7 +225,7 @@ Docs only. README: short sections with links to new pages under `docs/` (how-it-
 Docs only. README benchmark: step 1 (RMT1) results of lorc 0.3.0–0.3.3 against `/orc-quick` and plain Claude Code (no skill, wiki and bare), as a table and as 4 Mermaid bar charts (cost, tokens, lane time, score). lorc 0.3.3 passes the step-1 gate: 746 s, $2.82, 4.31M tokens, score 86, e2e 3 of 3 (Q: 785 s, $3.95, 5.90M, 84). README install: from npm (`npm i -g @azure-id/lorc`); GitHub is the other way. No code change.
 
 ## 0.3.3 — 14-10-2026
-Why: eval of 0.3.2 (L1 LS × 3: 721 s, $3.15, 4.34M tokens, 84 points, e2e 2 of 3). In l1-ls-1 (PARTIAL, 58), the lane made up the route path `outwards/transfer` and did not ask. The repo already named `outwards/create` in a router comment (client/src/router/index.js:755) and in a test (`/remittances/outwards/create`, RemittanceLayout.spec.js:126). 0.1.10 l1-ls-2 failed in the same way.
+Why: eval of 0.3.2 (L1 LS × 3: 721 s, $3.15, 4.34M tokens, 84 points, e2e 2 of 3). In l1-ls-1 (PARTIAL, 58), the lane made up the route path `outwards/transfer` and did not ask. The repo already named `outwards/create` in a router comment (client/src/router/index.js:755) and in a test (`…/outwards/create`, a layout spec). 0.1.10 l1-ls-2 failed in the same way.
 - New `bin/lib/ask-facts.js`: `lorc prep` gives `must_ask[]` (only when it is not empty): `[{ q: "route path of the new page (router <file>)", seen: [{ path, at[] }] }]`. These are facts only, not a decision.
 - Trigger: the engine found a router, and the request or the doc adds a page or a route (route words, or an engine `creates` noun such as page, screen, view, step, wizard, modal).
 - `seen`: quoted path strings near the feature (stems of the request) that the router does not define yet. lorc ignores imports, URLs, file names, and paths that an API client, a mock or a fixture names. Rank = stems in the path × file weight (router 3, test 2, other code 1, docs 0.5). Max 3 paths, max 3 `at` each.
@@ -152,12 +249,12 @@ Why: in 3 of 3 eval runs of 0.3.0, the coverage miss cost points. The raw branch
 - The slice `- coverage:` command writes json-summary and lcovonly to lorc's coverage folder, then tells the executor to run `lorc cov --bar <project bar> --json` (not a test run), and to reach the bar on lines and SOURCE branches.
 - Executor contract: the return `coverage` entry has `src_branches` and `uncovered`. When the bar is not met: `coverage_bar_met:false` and the `uncovered` lines from `lorc cov`. The executor says "generated/tooling" only when `lorc cov` shows that source branches meet the bar.
 - The review packet has a `## Coverage` section (between Lint and Changed symbols): one line per changed source file, or "not measured", or "no changed source files".
-- Evidence from the eval sandboxes: `AmountAndMethod.vue` raw branches 83.33 % → source branches 100 %, generated: 2 uncovered at line 236 (import) (l1-ls-3; the same at line 249 in l1-ls-1 and line 251 in l1-ls-2). `remittance.api.js` (an old file that the task extended): whole file 61.11 % lines → changed lines 100 % / 100 %, bar met. A plain `.js` util with real gaps stays a gap (source branches 4.17 %, uncovered lines listed).
+- Evidence from the eval sandboxes: `AmountAndMethod.vue` raw branches 83.33 % → source branches 100 %, generated: 2 uncovered at line 236 (import) (l1-ls-3; the same at line 249 in l1-ls-1 and line 251 in l1-ls-2). An API module (an old file that the task extended): whole file 61.11 % lines → changed lines 100 % / 100 %, bar met. A plain `.js` util with real gaps stays a gap (source branches 4.17 %, uncovered lines listed).
 
 ## 0.3.0 — 12-10-2026
 - New `lorc tier "<request>" [--doc <path>] [--json] [--brief] [--no-history]`: lorc's own deterministic tier engine. `lorc tier eval [--recompute] [--json]` measures the engine and jev against the finished runs.
 - `lorc tier` builds or updates the code graph first, as `lorc prep` does. `--no-heal` skips it; prep gives the engine `--no-heal`. `lorc tier eval --recompute` also heals first.
-- With no graph, `lorc tier` takes the facts from git: related files from tracked paths (rarity weight, then change count), named symbols and their users from `git grep`. Dashboard repo, step 2 with the doc: no graph went from mid, ~5 files, 41 % to high, ~10 files, 67 % (graph: high, ~10, 74 %). `--json` shows `detail.graph.source`.
+- With no graph, `lorc tier` takes the facts from git: related files from tracked paths (rarity weight, then change count), named symbols and their users from `git grep`. Vue 2 SPA eval repo, step 2 with the doc: no graph went from mid, ~5 files, 41 % to high, ~10 files, 67 % (graph: high, ~10, 74 %). `--json` shows `detail.graph.source`.
 - `lorc prep` order: jev (a key, confident) → the engine (`tier_judge.by = "engine"`, with the reason jev did not decide) → the table (only when `tier_engine: off` or the engine fails). jev gets the engine's evidence as words (estimated source files, new components, areas, callers, similar commits, mechanical), never its tier.
 - The prep JSON has a compact `tier_engine` (tier, score, conf, cap, groups, est_files, executor, why ≤ 3, split). `prep.json` in the run folder keeps the full answer. `lorc prep` takes `--doc <path>` (a requirement doc).
 - Text signals: new-file units (page, component, modal, endpoint, service, model …) against element edits (button, field, column …), named targets (`code`, CamelCase, paths), wiring verbs, layers, risk classes, cues (mechanical, signature, refactor, migration, ordered, state, algorithm); a requirement doc (lines, items, API calls).
@@ -171,9 +268,9 @@ Why: in 3 of 3 eval runs of 0.3.0, the coverage miss cost points. The raw branch
 - Executor: ORC's facet formula on the estimated facets (B + N + L + T + fan + U, risk floor 70) → haiku-5-high < 30 · sonnet-5-med < 65 · opus-5-low < 90 · opus-5-med; the low tier is inline; a cheaper executor with clean runs at the tier wins when its Wilson lower bound is ≥ 0.55 (in practice 5 of 5). SKILL.md L3: ➡️ on `tier_engine.executor` unless L1 shows that it cannot do the work.
 - Run record: `files_changed` and `src_files` (files changed during the run; files dirty at the start do not count); `tier_by` = `jev` | `engine` | `table`.
 - New setting `tier_engine` (`auto` default | `off`). `lorc doctor` has a `tier-engine` row.
-- Measured on the eval sandboxes (dashboard repo, 12 lorc runs, requirement doc given): mean absolute error 0.92 source files (1.58 without the doc). Step 1 → high (same as the model), ~6 files against 5–6 real; step 2 → mid, ~5 against 5–7 real (the model picked high). Small sample.
+- Measured on the eval sandboxes (Vue 2 SPA eval repo, 12 lorc runs, requirement doc given): mean absolute error 0.92 source files (1.58 without the doc). Step 1 → high (same as the model), ~6 files against 5–6 real; step 2 → mid, ~5 against 5–7 real (the model picked high). Small sample.
 - Self-calibration: `lorc run end` copies `engine_tier`, `est_files`, `est_raw` (the estimate before calibration) and `jev_tier` (when jev decided) from `prep.json` into the run record. After 5 finished runs with `src_files` and `est_raw`, the engine multiplies its estimate by the median of real ÷ raw over the last 30 runs (clamped 0.5–2; used only when it differs from 1 by 0.1 or more). Evidence: `calibrated ×<f> from <n> runs`. It learns from the raw estimate only. `lorc tier eval` shows the factor (`calibration:`; `calibration` in `--json`).
-- Whole PRs: the git history is the units that landed on the main line (`git log --first-parent -m`): a squash or direct commit, or a whole merged PR (all its files). Commits inside a PR branch are not units. A merge's subject is the PR title plus the branch words. Similar past changes, co-change and the wiring ratio use these units. Dashboard repo: 1,003 units (242 merged PRs) instead of 2,921 commits, read in 0.26 s.
+- Whole PRs: the git history is the units that landed on the main line (`git log --first-parent -m`): a squash or direct commit, or a whole merged PR (all its files). Commits inside a PR branch are not units. A merge's subject is the PR title plus the branch words. Similar past changes, co-change and the wiring ratio use these units. Vue 2 SPA eval repo: 1,003 units (242 merged PRs) instead of 2,921 commits, read in 0.26 s.
 - Language: the skill gives the request to prep in English (L0). The parser also reads Indonesian: request verbs (tambah, buat, ubah, perbaiki, hapus …), nouns as their English kind (halaman → page, tombol → button …), plurals such as `halaman-halaman`, cues and risk words (migrasi, pembayaran, kata sandi …). "tambah halaman detail pesanan dengan tombol batal" → 1 new page + 1 element edit → mid (before: nothing found).
 - Cleanups: prep puts `tier_hint` in its JSON only when the table decides. `ask_judge` is `false` or `{ how }`: prep writes the exact `lorc jev ask --run <slug>` command with the JSON shape; SKILL.md L3 only says "`ask_judge.how` set → do it first". SKILL.md is 7,996 B of 8,192. The graph store already caches the import edges (11 ms): no change.
 

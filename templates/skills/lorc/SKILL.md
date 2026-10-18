@@ -3,7 +3,7 @@ name: lorc
 description: >
   Light ORC — the lean coding lane for one request (a fix, a feature, a refactor). Use for
   "/lorc <request>". One prep call loads the code graph, house rules, wiki, code pattern,
-  extra and usage. It digs only anchored code, picks a tier (jev or its own engine; low:
+  extra and usage. It digs only anchored code, picks a tier (low:
   inline · mid ≤1 · high ≤3 · complex ≤5 subagents), asks until nothing is assumed, builds
   with the cheapest capable executor, checks, reviews, and learns your choices.
 ---
@@ -31,6 +31,8 @@ It starts the run and returns `slug`, `usage`, `graph` (`focus[]` file:line rows
 (`path`: anchored ranges for the request/doc names, change targets, exemplars, test setup),
 `rules.card`, `wiki` (≤ 3 pages, build/test/lint commands), `pattern`, `extra.slots[]`,
 `settings`, `tier_engine`, `tier_judge`, `ask_judge`, `must_ask`, `resume` (+ `tier_hint` when `by = table`).
+`graph.suggest` set → no graph: Grep/Read; ONCE, own line at the end: "No code
+graph yet — run `lorc graph scan` (zero tokens) to make the next runs faster."
 `resume` set → ask in L3 whether to continue it (yes → read its RESUME.md and follow it).
 
 ## L1 DIG — at most 3 tool calls
@@ -81,7 +83,7 @@ A new unknown in the answer → one more round. Otherwise go to L4.
   EOF
   ```
   The slice adds the task's context items and the requirement doc by itself: refs = only extra
-  ranges you read in L1; facts = decisions, answers, shapes. Long JSON → Write it to a file,
+  ranges you read in L1; facts = decisions, answers, shapes. Long JSON → Write a file,
   then `lorc slice --run <slug> --task <n> - < <file>`.
   It prints the slice path. Dispatch the chosen `lorc-executor-*` with exactly:
   `Read <slice path>. Do exactly that task. Return the JSON at its end.`
@@ -97,7 +99,7 @@ A new unknown in the answer → one more round. Otherwise go to L4.
 ## L5 CHECK + REVIEW
 Executor returned `tests.passed: true` → `lorc check --run <slug> --lint-only --review --json`.
 Inline work, or a red or missing test result → `lorc check --run <slug> --review --json`.
-The tests are done: never run the tests or jest yourself after this call. Red → the same
+Then never run the tests or jest yourself. Red → the same
 executor fixes it (inline: you fix it), at most 2 rounds, then ask the user.
 Then review: `review.dispatch` true → `lorc-reviewer-opus-5-low` with
 `Read <review.path>. Review. Return the JSON at its end.` Else review inline from the packet
@@ -106,9 +108,9 @@ Findings: **P0** breakage · **P1** correctness or security (file:line, a quote,
 **P2** maintainability · **P3** cosmetic. A broken house rule: rule P0 → P1, rule P1 → P2,
 rule P2/P3 → P3. Fix P0/P1 now (same way as L4). List P2/P3; do not fix them.
 After the review: never run tests, jest, coverage or a build yourself. A P0/P1 finding → fix it
-(send it to the SAME executor with SendMessage (it keeps its context) — never
-dispatch a new executor for a fix; tiny fixes (≤ 10 lines) you make inline), then run
-`lorc check --run <slug> --review --json` ONCE. Coverage numbers come only from the executor's return (`coverage`, `coverage_bar_met`) or lorc check — never run coverage yourself, also not to prove a CLAUDE.md coverage rule.
+(SendMessage to the SAME executor, it keeps its context — never a new executor for a fix;
+≤ 10 lines: fix inline), then run
+`lorc check --run <slug> --review --json` ONCE. Coverage numbers come only from the executor's return (`coverage`, `coverage_bar_met`) or lorc check — never run coverage yourself, not even for a CLAUDE.md coverage rule.
 
 ## L6 FINISH
 ```
@@ -118,5 +120,5 @@ EOF
 ```
 It updates the graph, writes the run record, and may return one `habit` proposal.
 Reply in at most 12 lines — count them; one short line per item: **Changed** · **Verified** (only what ran) · **Findings** · **Not done** ·
-the habit line if there is one. No offers, no questions — the user types the next request.
-A later "fix it" → the L5 fix path, then `lorc check --run <slug> --review --json` once. No jest.
+the habit line, if any. No offers, no questions — the user types the next request.
+A later "fix it" → the L5 fix path (one `lorc check`, no jest).

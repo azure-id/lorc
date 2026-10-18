@@ -8,7 +8,7 @@
  *   PreToolUse   Grep|Glob   a pattern that names a symbol the graph knows →
  *                            one line saying where that name is defined
  *                            (ORC R12/R12b; one names bucket, no subprocess).
- *   SubagentStop             a lorc executor finished → `lorc graph update`,
+ *   SubagentStop             a lorc executor finished → `lorc graph update --if-exists`,
  *                            DETACHED; the hook never waits for it.
  *
  * SILENT UNLESS a lorc run is open: <project>/.claude/lorc/run/.current is
@@ -153,13 +153,14 @@ function run() {
 }
 
 // ── SubagentStop — a lorc executor finished → update, detached ────────────
+// --if-exists: no store → it builds nothing (the user runs `lorc graph scan`).
 function onExecutorStop(data, project) {
   const agent = String(data.agent_type || data.agentType || "");
   if (!agent || !EXECUTOR.test(agent)) return;
   const cli = lorcCli(project);
   if (!cli) return;
   try {
-    const child = spawn(process.execPath, [cli, "graph", "update", "--dir", project], {
+    const child = spawn(process.execPath, [cli, "graph", "update", "--if-exists", "--dir", project], {
       cwd: project, detached: true, stdio: "ignore", windowsHide: true,
     });
     child.on("error", () => {});

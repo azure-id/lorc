@@ -40,3 +40,16 @@ test("a broken ORC falls back to own mode with fallback set", () => {
   assert.strictEqual(out.store.mode, "own");
   assert.match(out.fallback, /not JSON/);
 });
+
+test("W30b: delegate update --if-exists with no ORC store skips and does not call ORC", () => {
+  const e = setup("require('fs').writeFileSync(LOG, JSON.stringify(process.argv.slice(2)));process.stdout.write('{\"ok\":true}');");
+  const r = run(e, "update", "--if-exists");
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(r.stdout.trim(), "graph: none — skipped (run: lorc graph scan)");
+  assert.ok(!fs.existsSync(e.log));
+  fs.mkdirSync(path.join(e.root, ".claude", "orc", "graph"), { recursive: true });
+  fs.writeFileSync(path.join(e.root, ".claude", "orc", "graph", "meta.json"), "{\"generation\":1}");
+  const s = run(e, "scan", "--if-exists");
+  assert.strictEqual(s.status, 0, s.stderr);
+  assert.deepStrictEqual(JSON.parse(fs.readFileSync(e.log, "utf8")), ["graph", "update", "--json"]);
+});

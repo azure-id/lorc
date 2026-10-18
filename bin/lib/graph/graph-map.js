@@ -45,6 +45,7 @@
 
 const path = require("path");
 const G = require("./graph.js");
+const { CONFIDENT } = require("./graph-states.js");
 
 const MAP_SCHEMA = 1;
 // Damping and iteration count are Aider's, and they are not worth tuning: the
@@ -247,8 +248,8 @@ function computeCallers(model) {
       s.file = rel;
       for (const c of s.calls || []) {
         const r = Q.resolveCall(model, rel, s, c);
-        if (r.target && (r.state === "LOCAL" || r.state === "IMPORT" || r.state === "UNIQUE" || r.state === "ROUTE")) {
-          (own(out, r.target) || (out[r.target] = [])).push([s.id]);
+        if (r.target && CONFIDENT.has(r.state)) {
+          for (const t of r.targets || [r.target]) (own(out, t) || (out[t] = [])).push([s.id]);
         }
       }
     }

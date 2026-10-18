@@ -79,16 +79,18 @@ test("low: a typo is inline, cap 0, no groups", () => {
   assert.strictEqual(r.detail.executor.inline, true);
 });
 
-test("executor: risk floor on a risky path", () => {
-  const r = run("fix the typo in the header title", { ok: true, risky: ["src/payments/charge.js"] });
+test("executor: risk floor on a risky path the work changes", () => {
+  const r = run("fix the typo in src/payments/charge.js", { ok: true, named: { "src/payments/charge.js": ["src/payments/charge.js"] }, risky: ["src/payments/charge.js"] });
   assert.ok(r.detail.executor.score >= 70);
   assert.strictEqual(r.executor, "opus-5-low");
 });
 
 test("executor: history picks a cheaper one with a clean record", () => {
-  const req = "add a new settings page with a profile form and a password modal";
+  // A mid request: a high one has the tier floor 30 (never haiku), see the T1b test.
+  const req = "add a recipient card component";
   const g = { ok: true, core: ["src/views/Settings.vue"], layers: ["ui"], projects: ["."] };
   const base = run(req, g);
+  assert.strictEqual(base.tier, "mid");
   assert.notStrictEqual(base.executor, "haiku-5-high");
   // 5 runs: the Wilson lower bound of 3 of 3 is 0.44, under the 0.55 bar.
   const runs = Array.from({ length: 5 }, (_, i) => ({ request: `unrelated words ${i}`, tier: base.tier, executor: "haiku-5-high", outcome: "done", findings: {} }));
@@ -203,13 +205,14 @@ const SHOP = {
 };
 const RENAME = "rename OrderSerializer to OrderReadSerializer everywhere";
 
-test("CLI heal: lorc tier builds the graph first", () => {
+test("CLI heal: lorc tier does not build the first graph (W33); the git part gives the tier", () => {
   const e = repo(SHOP);
   const r = e.lorc(["tier", RENAME, "--json", "--no-history"]);
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.ok(fs.existsSync(path.join(e.root, ".claude", "lorc", "orc", "graph", "meta.json")));
+  assert.ok(!fs.existsSync(path.join(e.root, ".claude", "lorc", "orc", "graph", "meta.json")));
   const o = JSON.parse(r.stdout);
-  assert.strictEqual(o.detail.graph.source, "graph");
+  assert.strictEqual(o.detail.graph.source, "git");
+  assert.ok(has(o, /no graph index/), JSON.stringify(o.why));
   assert.strictEqual(o.est_files, 2);
 });
 
@@ -264,6 +267,8 @@ test("a graph that reads none of the files (Swift) → the git part; a resolved 
     "App/Orders/OrderService.swift": "struct OrderService {\n  func fetchOrders() {}\n}\n",
     "App/Payments/PaymentService.swift": "struct PaymentService {}\n",
   });
+  const u = e.lorc(["graph", "update"]);
+  assert.strictEqual(u.status, 0, u.stderr);
   const a = JSON.parse(e.lorc(["tier", "add an order detail screen for orders", "--json", "--no-history"]).stdout);
   assert.strictEqual(a.detail.graph.source, "git");
   assert.ok(a.detail.graph.core.includes("App/Orders/OrderListView.swift"), JSON.stringify(a.detail.graph.core));
@@ -464,4 +469,114 @@ test("confidence: estimates that agree add 0.1, a wide spread takes 0.1", () => 
   const agree = run(req, { ok: true, analog: { file: "src/a/XFlow.vue", files: s } });
   const wide = run(req, { ok: true, analog: { file: "src/a/XFlow.vue", files: s * 4 } });
   assert.ok(agree.conf > wide.conf, `${agree.conf} ${wide.conf}`);
+});
+
+// W38b: a repo with no UI file reads UI nouns (such as "card") as logic.
+const CARD_REQ = "Implement card management: issue, activate, change PIN, block cards";
+const GO_BE = {
+  "go.mod": "module bank\n\ngo 1.22\n",
+  "internal/card/handler.go": "package card\n\nfunc Handle() {}\n",
+  "internal/card/service.go": "package card\n\nfunc Issue() {}\n",
+  "internal/card/repository.go": "package card\n\nfunc Save() {}\n",
+  "migrations/001_cards.sql": "create table cards (id int);\n",
+};
+
+test("no UI files: UI nouns count as logic (Go back-end, card management)", () => {
+  const e = repo(GO_BE);
+  const r = e.lorc(["tier", CARD_REQ, "--json", "--no-history"]);
+  assert.strictEqual(r.status, 0, r.stderr);
+  const o = JSON.parse(r.stdout);
+  assert.strictEqual(o.detail.ui_repo, false);
+  assert.ok(!o.detail.text.layers.includes("ui"), JSON.stringify(o.detail.text.layers));
+  assert.ok(!o.detail.text.creates.some((c) => c.layer === "ui"));
+  assert.ok(!o.detail.areas.layers.includes("ui"), JSON.stringify(o.detail.areas));
+  assert.ok(!o.why.some((w) => /independent areas \(ui/.test(w)), JSON.stringify(o.why));
+});
+
+test("UI files: the UI layer stays (5 .vue files, card management)", () => {
+  const vue = {};
+  for (const n of ["CardList", "CardItem", "CardForm", "CardPin", "CardBlock"]) vue[`client/src/components/${n}.vue`] = "<template><div></div></template>\n";
+  const e = repo(Object.assign({}, GO_BE, vue));
+  const r = e.lorc(["tier", CARD_REQ, "--json", "--no-history"]);
+  assert.strictEqual(r.status, 0, r.stderr);
+  const o = JSON.parse(r.stdout);
+  assert.strictEqual(o.detail.ui_repo, true);
+  assert.ok(o.detail.text.layers.includes("ui"), JSON.stringify(o.detail.text.layers));
+  assert.ok(!o.why.some((w) => /no UI files/.test(w)));
+});
+
+// ── 0.5.2: back-end rules ─────────────────────────────────────────────────────
+// A git repo with the given files (tracked), so `uiRepoOf` reads `git ls-files`.
+function gitRepo(files) {
+  const dir = tmp();
+  for (const [f, body] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true });
+    fs.writeFileSync(path.join(dir, f), body);
+  }
+  const git = (args) => require("child_process").spawnSync("git", args, { cwd: dir, windowsHide: true });
+  git(["init", "-q"]);
+  git(["add", "-A"]);
+  return dir;
+}
+
+test("T1: an existing migration the work only reads gives no risk floor; a changed risky file does", () => {
+  const a = run("add a stats endpoint on the server", { ok: true, core: ["migrations/001_x.sql"], risky: ["migrations/001_x.sql"] });
+  assert.ok(!/risk floor 70/.test(a.detail.executor.formula), a.detail.executor.formula);
+  assert.ok(!a.detail.executor.risk.includes("path"));
+  const b = run("fix the bug in src/auth/login.go", { ok: true, named: { "src/auth/login.go": ["src/auth/login.go"] }, risky: ["src/auth/login.go"] });
+  assert.match(b.detail.executor.formula, /risk floor 70/);
+  assert.strictEqual(b.executor, "opus-5-low");
+  assert.ok(has(b, /risk: .*\(src\/auth\/login\.go\)/), JSON.stringify(b.why));
+});
+
+test("T1b: high work that is not mechanical is never haiku", () => {
+  const r = run("update the stats query on the server and the database", { ok: true, core: ["server/db/stats.js"], layers: ["api", "data"] });
+  assert.strictEqual(r.tier, "high");
+  assert.strictEqual(r.executor, "sonnet-5-med");
+  assert.match(r.detail.executor.formula, /tier floor 30/);
+});
+
+test("T2: a back end with a doc: the named new files and wiring files are a size floor", () => {
+  const dir = gitRepo({
+    "go.mod": "module x\n",
+    "internal/routes/routes.go": "package routes\n",
+    "internal/app/wiring.go": "package app\n",
+    "TICKET.md": "# Foo\n\nNew files:\n- internal/core/foo/handlers/foo-handler.go\n- internal/core/foo/service/foo-service.go\n- internal/core/foo/repository/foo-repository.go\n\nRegister the routes in internal/routes/routes.go.\nNo DB migration.\n",
+  });
+  const r = T.compute(dir, "Implement the ticket in TICKET.md", { history: false, doc: "TICKET.md", graph: { ok: true, core: ["internal/routes/routes.go"], rels: ["go.mod", "internal/routes/routes.go", "internal/app/wiring.go", "TICKET.md"] } });
+  assert.strictEqual(r.detail.ui_repo, false);
+  assert.ok(r.est_files >= 4, String(r.est_files));
+  assert.ok(has(r, /^doc: 3 new file\(s\), 1 wiring/), JSON.stringify(r.why));
+  assert.strictEqual(r.detail.estimate.newPaths.length, 3);
+  assert.deepStrictEqual(r.detail.estimate.wirePaths, ["internal/routes/routes.go"]);
+  assert.strictEqual(r.detail.text.cues.includes("migration"), false);
+});
+
+test("T3/T4: a back-end worker is an area; the split is keyed api / logic / data / worker", () => {
+  const files = ["package.json", "src/controllers/a.ts", "src/services/a.ts", "src/workers/common/processor.ts", "src/repositories/a.ts", "src/init.ts", "src/app.ts"];
+  const map = Object.fromEntries(files.map((f) => [f, "export {};\n"]));
+  map["TICKET.md"] = "# VA\n\n1. src/controllers/va.ts - the controller.\n2. src/services/va.ts - the service.\n3. src/workers/common/processor.ts - add the job handlers.\n4. src/init.ts and src/app.ts - wire and mount.\n";
+  const dir = gitRepo(map);
+  const r = T.compute(dir, "Implement virtual accounts per TICKET.md: creation, callbacks, jobs", { history: false, doc: "TICKET.md", graph: { ok: true, core: ["src/repositories/a.ts"], layers: ["data"], rels: [...files, "TICKET.md"] } });
+  assert.strictEqual(r.tier, "high", JSON.stringify(r.why));
+  assert.ok(r.split.length >= 2, JSON.stringify(r.split));
+  assert.ok(r.split.some((x) => x.layer === "worker"), JSON.stringify(r.split));
+  assert.ok(!r.split.some((x) => x.layer === "ui"), JSON.stringify(r.split));
+  assert.ok(r.detail.areas.layers.includes("worker"));
+});
+
+test("T4: only wiring files named → no split advice", () => {
+  const dir = gitRepo({ "go.mod": "module x\n", "internal/routes/routes.go": "package routes\n", "internal/app/wiring.go": "package app\n", "TICKET.md": "Wire it in internal/app/wiring.go and internal/routes/routes.go.\n" });
+  const r = T.compute(dir, "add a preview endpoint on the server and store the run in the database", { history: false, doc: "TICKET.md", graph: { ok: true, layers: ["api", "data"], rels: ["go.mod", "internal/routes/routes.go", "internal/app/wiring.go"] } });
+  assert.strictEqual(r.tier, "high");
+  assert.ok(r.split.every((x) => x.layer !== "wiring"), JSON.stringify(r.split));
+});
+
+test("beKey", () => {
+  assert.strictEqual(T.beKey("src/workers/common/processor.ts"), "worker");
+  assert.strictEqual(T.beKey("internal/routes/routes.go"), "api");
+  assert.strictEqual(T.beKey("src/repositories/va.ts"), "data");
+  assert.strictEqual(T.beKey("src/schema/types.ts"), "logic");
+  assert.strictEqual(T.beKey("src/init.ts"), "wiring");
+  assert.strictEqual(T.beKey("src/services/va.ts"), "logic");
 });

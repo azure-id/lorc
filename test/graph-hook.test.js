@@ -66,3 +66,8 @@ test("0.1.3: PostToolUse Agent → silent (the changes card is gone)", () => {
   assert.strictEqual(r.status, 0);
   assert.strictEqual(r.stdout, "");
 });
+
+test("W33: SubagentStop runs `lorc graph update --if-exists` (never builds a store)", () => {
+  const src = fs.readFileSync(HOOK, "utf8");
+  assert.ok(/\[cli, "graph", "update", "--if-exists", "--dir", project\]/.test(src));
+});

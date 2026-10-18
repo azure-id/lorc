@@ -127,12 +127,13 @@ function checkpoint(root, slug, body, { resume, now } = {}) {
 }
 
 // The graph update runs DETACHED: the user does not wait for it. The next
-// `lorc prep` heals the graph anyway (`graph status --heal`).
+// `lorc prep` heals the graph anyway (`graph status --heal`). --if-exists:
+// no store → it builds nothing (the user runs `lorc graph scan`).
 function graphUpdate(root) {
   const t = Date.now();
   try {
     const { spawn } = require("child_process");
-    const child = spawn(process.execPath, [path.join(__dirname, "..", "lorc.js"), "graph", "update", "--json", "--dir", root], {
+    const child = spawn(process.execPath, [path.join(__dirname, "..", "lorc.js"), "graph", "update", "--if-exists", "--json", "--dir", root], {
       cwd: root, detached: true, stdio: "ignore", windowsHide: true,
     });
     child.on("error", () => {});

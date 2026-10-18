@@ -205,9 +205,16 @@ function clauses(text) {
   return String(text || "").split(/[.!?\n]+(?:\s|$)|;/).map((c) => c.trim()).filter(Boolean);
 }
 
+// A negated migration ("No DB migration.", "do not add a migration") is not a migration cue.
+const NEGATED = /\b(no|without|not|never|don'?t|do not|does not|tanpa|tidak|bukan)\b[^.\n]{0,40}?\b(migrat\w*|alter table|backfill\w*)\b/gi;
+function stripNegated(text) {
+  return String(text || "").replace(NEGATED, " ");
+}
+
 function cues(text) {
   const out = {};
-  for (const [k, re] of Object.entries(CUES)) out[k] = either(re, ID_CUES[k])(text);
+  const plain = stripNegated(text);
+  for (const [k, re] of Object.entries(CUES)) out[k] = either(re, ID_CUES[k])(k === "migration" ? plain : text);
   return out;
 }
 
@@ -262,6 +269,18 @@ function docNames(text, known) {
   for (const c of cand) {
     if (out.length >= 8) break;
     if (!out.includes(c) && known(c)) out.push(c);
+  }
+  return out;
+}
+
+// Repo paths in a doc (a "/" in the name), in order, unique, max 16. Not filtered by the
+// known names: a new file is unknown by design.
+function docPaths(text) {
+  const out = [];
+  for (const m of String(text || "").matchAll(FILE_RE)) {
+    const p = m[1].replace(/^\.\//, "");
+    if (p.includes("/") && !out.includes(p)) out.push(p);
+    if (out.length >= 16) break;
   }
   return out;
 }
@@ -390,16 +409,16 @@ function parse(request, { root, doc, known } = {}) {
     cues: cues(text),
     risk,
     ui_states: states.size + (d ? d.ui_states : 0),
-    doc: d ? { path: d.path, lines: d.lines, items: d.items, apis: d.apis, endpoints: endpointsOf(d.text), names: fromDoc, changes: fromDoc.filter((n) => docChanged(d.text, n)) } : null,
+    doc: d ? { path: d.path, lines: d.lines, items: d.items, apis: d.apis, endpoints: endpointsOf(d.text), names: fromDoc, paths: docPaths(d.text), changes: fromDoc.filter((n) => docChanged(d.text, n)) } : null,
   };
   // A doc can name a migration or API calls the short request left out.
   if (d) {
     const dc = cues(d.text);
-    out.cues.migration = out.cues.migration || /\b(migrations?|alter table|backfill)\b/i.test(d.text);
+    out.cues.migration = out.cues.migration || /\b(migrations?|alter table|backfill)\b/i.test(stripNegated(d.text));
     out.cues.state = out.cues.state || dc.state;
     out.cues.branch = out.cues.branch || dc.branch;
   }
   return out;
 }
 
-module.exports = { docChanged, parse, tokens, clauses, namesOf, docNames, endpointsOf, knownFromGit, leadCue, readDoc, docPath, FILE_NOUNS, ELEMENT_NOUNS };
+module.exports = { stripNegated, docPaths, docChanged, parse, tokens, clauses, namesOf, docNames, endpointsOf, knownFromGit, leadCue, readDoc, docPath, FILE_NOUNS, ELEMENT_NOUNS };

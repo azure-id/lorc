@@ -39,7 +39,7 @@ const { spawnSync } = require("child_process");
 const G = require("./graph.js");
 const N = require("./graph-notes.js");
 
-const CONFIDENT = new Set(["LOCAL", "IMPORT", "UNIQUE", "ROUTE"]);
+const { CONFIDENT, STATE_SHORT } = require("./graph-states.js");
 const MOUNT_DEPTH = 4;
 // W5 (G6) adds the five new languages' own conventions: RSpec and minitest
 // (`_spec.rb`, `_test.rb`), Rust (`*_test.rs`, and `mod tests` lives inside
@@ -530,6 +530,119 @@ function classSymbol(model, rel, name) {
   return null;
 }
 
+// lorc 0.5.0 (W34c): the interface named `name` as seen from `rel`: in this
+// file, through an import (barrels followed), or the only interface of that
+// name in the repository. Null when none of these finds one.
+function interfaceSymbol(model, rel, name) {
+  const isIf = (x) => x.kind === "interface" && x.name === name;
+  const local = ((model.byFile[rel] || {}).symbols || []).find(isIf);
+  if (local) return local;
+  const bd = fileBindings(model, rel).map.get(name);
+  if (bd && bd.files.length) {
+    for (const t of barrelTargets(model, bd.files, bd.orig === "default" || bd.orig === "*" ? name : bd.orig, 0, new Set())) {
+      const s = ((model.byFile[t.file] || {}).symbols || []).find((x) => x.kind === "interface" && x.name === t.name);
+      if (s) return s;
+    }
+  }
+  const all = (model.byName.get(name) || []).filter((x) => x.kind === "interface");
+  return all.length === 1 ? all[0] : null;
+}
+
+// lorc 0.5.0 (W34c): owner symbol id → the classes that implement or extend
+// it. Built once per model from the `bases` of each class (max 8 bases).
+const IMPL_MAX = 8;
+function implIndex(model) {
+  if (model._implIndex) return model._implIndex;
+  const idx = new Map();
+  for (const [rel, f] of Object.entries(model.byFile)) {
+    for (const c of f.symbols || []) {
+      if (c.kind !== "class" || !Array.isArray(c.bases) || !c.bases.length) continue;
+      for (const raw of c.bases.slice(0, IMPL_MAX)) {
+        const name = String(raw).replace(/<[\s\S]*$/, "").trim().split(".").pop();
+        if (!name) continue;
+        let o = interfaceSymbol(model, rel, name);
+        if (!o) {
+          const cs = classSymbol(model, rel, name);
+          o = cs ? cs.sym : null;
+        }
+        if (!o || o.id === c.id) continue;
+        const a = idx.get(o.id);
+        if (a) a.push(c);
+        else idx.set(o.id, [c]);
+      }
+    }
+  }
+  model._implIndex = idx;
+  return idx;
+}
+
+// lorc 0.5.0 (W34c): a confident result on an interface member, or on an
+// abstract (name-only) member, also reaches the same member of each class that
+// implements the owner (and of one more level of subclasses).
+function withImpl(model, r) {
+  if (!r || !r.target || r.targets || !CONFIDENT.has(r.state)) return r;
+  const T = model.symbols.get(r.target);
+  if (!T || T.kind === "module") return r;
+  const owner = classOf(T);
+  if (!owner) return r;
+  const O = ((model.byFile[T.file] || {}).symbols || []).find((x) => x.qname === owner && x.kind !== "module");
+  // The index does not store `nameOnly`. An abstract member is a one-line
+  // member with no calls in a class that has subclasses.
+  const abstractLike = T.nameOnly || (O && O.kind === "class" && T.lines && T.lines[0] === T.lines[1] && !(T.calls || []).length);
+  if (!O || (O.kind !== "interface" && !abstractLike)) return r;
+  const idx = implIndex(model);
+  const classes = [];
+  for (const c of (idx.get(O.id) || []).slice(0, IMPL_MAX)) {
+    classes.push(c);
+    for (const d of (idx.get(c.id) || []).slice(0, IMPL_MAX)) classes.push(d);
+  }
+  const ids = [];
+  for (const c of classes) {
+    const m = ((model.byFile[c.file] || {}).symbols || []).find((x) => x.kind !== "module" && x.qname === `${c.qname}.${T.name}`);
+    if (m && m.id !== T.id && !ids.includes(m.id)) ids.push(m.id);
+  }
+  return ids.length ? { ...r, targets: [T.id, ...ids], impl: O.name } : r;
+}
+
+// lorc 0.5.0 (W32d, C11): the type `name` (a `class` symbol: a class or a
+// struct) as seen from `rel`. The order: this file (LOCAL); then the files of
+// the Go package directory and the files this file imports (IMPORT, when
+// exactly one type has the name there); then the only type of that name in the
+// repository (UNIQUE). Null when none of these finds one type.
+function typeSymbol(model, rel, name) {
+  const isType = (s) => s.kind === "class" && s.name === name;
+  const f = model.byFile[rel] || {};
+  const local = (f.symbols || []).find(isType);
+  if (local) return { sym: local, state: "LOCAL" };
+  const files = new Set();
+  if (f.lang === "go") for (const x of filesInDir(model, posix.dirname(rel), ".go")) if (x !== rel) files.add(x);
+  for (const bd of fileBindings(model, rel).map.values()) for (const x of bd.files || []) files.add(x);
+  const near = [...files].flatMap((x) => ((model.byFile[x] || {}).symbols || []).filter(isType));
+  if (near.length === 1) return { sym: near[0], state: "IMPORT" };
+  if (near.length > 1) return null;
+  const all = (model.byName.get(name) || []).filter(isType);
+  if (all.length === 1) return { sym: all[0], state: "UNIQUE" };
+  return null;
+}
+
+// The member `m` of the type symbol `t`: a symbol `T.m` in the file of `t`,
+// for Go in any file of its package directory, then a member that `T`
+// inherits. Null when there is none.
+function memberOfType(model, t, m) {
+  const q = `${t.name}.${m}`;
+  const own = ((model.byFile[t.file] || {}).symbols || []).find((s) => s.kind !== "module" && s.qname === q);
+  if (own) return own;
+  if (/\.go$/.test(t.file)) {
+    const s = filesInDir(model, posix.dirname(t.file), ".go")
+      .filter((x) => !/_test\.go$/.test(x))
+      .flatMap((x) => ((model.byFile[x] || {}).symbols || []).filter((y) => y.kind !== "module" && y.qname === q));
+    if (s.length === 1) return s[0];
+    if (s.length > 1) return null;
+  }
+  const inh = inheritedMember(model, t.file, t.name, m, 0, new Set());
+  return inh ? inh.sym : null;
+}
+
 // `this.m()` in a class with no `m` of its own: walk the base chain (depth ≤
 // 4, ≤ 8 bases per class, cycle-safe) and return the base member with the
 // state the BASE CLASS resolved with from the subclass's file.
@@ -567,28 +680,134 @@ function routeNameIndex(model) {
   return idx;
 }
 
-function resolveRouteCall(model, rel, call) {
-  let rname = call.name;
-  if (call.via) {
-    const parts = String(call.name).split(".");
-    const id = parts[0];
-    const member = parts.slice(1).join(".");
-    const f = model.byFile[rel] || {};
-    let s = (f.symbols || []).find((x) => x.kind !== "module" && x.qname === id) || null;
-    if (!s) {
-      const bd = fileBindings(model, rel).map.get(id);
-      if (bd && bd.files.length) {
-        const wanted = bd.kind === "named" ? bd.orig : bd.local;
-        for (const pair of barrelTargets(model, bd.files, wanted, 0, new Set())) {
-          const tsyms = ((model.byFile[pair.file] || {}).symbols || []).filter((x) => x.kind !== "module");
-          s = tsyms.find((x) => x.qname === pair.name) || null;
-          if (s) break;
-        }
+// lorc 0.5.0 (W29a): the string value of a constant expression, as seen
+// from `rel`. Null when the expression has no known string value.
+//   `NAME`  → this file's `const` NAME, or the const that the import NAME
+//            names (barrels followed).
+//   `A.B`   → A is a namespace import: the const B of the target file.
+//            A is an object const (this file's own, or imported): `values[B]`.
+function constValue(model, rel, expr) {
+  if (typeof expr !== "string" || !expr) return null;
+  const str = (v) => (typeof v === "string" ? v : null);
+  const symIn = (file, q, pred) => ((model.byFile[file] || {}).symbols || []).find((x) => x.kind !== "module" && x.qname === q && (!pred || pred(x))) || null;
+  const isConst = (x) => x.kind === "const";
+  const parts = expr.split(".");
+  const id = parts[0];
+  const bd = fileBindings(model, rel).map.get(id);
+  if (parts.length === 1) {
+    const own = symIn(rel, id, isConst);
+    if (own) return str(own.value);
+    if (!bd || !bd.files.length || bd.kind !== "named") return null;
+    for (const pair of barrelTargets(model, bd.files, bd.orig, 0, new Set())) {
+      const t = symIn(pair.file, pair.name, isConst);
+      if (t) return str(t.value);
+    }
+    return null;
+  }
+  const member = parts.slice(1).join(".");
+  let s = symIn(rel, id);
+  if (!s && bd && bd.files.length) {
+    if (bd.kind === "namespace" && parts.length === 2) {
+      for (const pair of barrelTargets(model, bd.files, member, 0, new Set())) {
+        const t = symIn(pair.file, pair.name, isConst);
+        if (t && typeof t.value === "string") return t.value;
       }
     }
-    const values = s && s.values;
-    const v = values && Object.prototype.hasOwnProperty.call(values, member) ? values[member] : undefined;
-    if (typeof v !== "string") return { state: "UNRESOLVED" };
+    const wanted = bd.kind === "named" ? bd.orig : bd.local;
+    for (const pair of barrelTargets(model, bd.files, wanted, 0, new Set())) {
+      s = symIn(pair.file, pair.name);
+      if (s) break;
+    }
+  }
+  const values = s && s.values;
+  return values && Object.prototype.hasOwnProperty.call(values, member) ? str(values[member]) : null;
+}
+
+// lorc 0.5.0 (W29b): the route paths of the SPA router. A route symbol with
+// a name "VIEW <path>" gives one row. A `:param` segment matches any one
+// segment. A path without a leading "/" is a child route: it matches the end
+// of the call path.
+// The extractor writes a nested child route with a leading "/" ("VIEW
+// /webhooks" for `{ path: 'webhooks' }` under "/settings"). A route whose
+// lines are inside the lines of a different route of the same file is a child
+// of the smallest such route: its full path is the parent's full path and its
+// own path, unless its own path already starts with the parent's full path.
+function routePathIndex(model) {
+  if (model._routePaths) return model._routePaths;
+  const esc = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const toRe = (p) => p.split("/").map((seg) => (/^:/.test(seg) ? "[^/]+" : esc(seg))).join("/");
+  const routes = [];
+  for (const s of model.symbols.values()) {
+    if (s.kind !== "route" || typeof s.name !== "string" || !s.name.startsWith("VIEW ")) continue;
+    let p = s.name.slice(5).trim();
+    // lorc 0.5.0 (W28h): a file of child routes mounted by `children: xs` in
+    // another file gets that mount's prefix (one known prefix only).
+    const pre = prefixesOf(model, s.file, 0, new Set());
+    if (pre.length === 1 && pre[0]) p = joinPrefix(pre[0], p) || p;
+    if (p) routes.push({ sym: s, own: p });
+  }
+  const parentOf = (r) => {
+    let best = null;
+    const [a, b] = r.sym.lines || [0, 0];
+    for (const o of routes) {
+      if (o === r || o.sym.file !== r.sym.file || !o.sym.lines) continue;
+      const [oa, ob] = o.sym.lines;
+      if (oa > a || ob < b || (oa === a && ob === b)) continue;
+      if (!best || ob - oa < best.sym.lines[1] - best.sym.lines[0]) best = o;
+    }
+    return best;
+  };
+  const fullOf = (r, depth) => {
+    if (r.full !== undefined) return r.full;
+    const par = depth < 8 ? parentOf(r) : null;
+    let full = r.own;
+    if (par) {
+      const pf = fullOf(par, depth + 1);
+      const rest = r.own.replace(/^\/+/, "");
+      if (!(r.own.startsWith("/") && pf !== "/" && (r.own === pf || r.own.startsWith(pf + "/")))) full = rest ? `${pf.replace(/\/+$/, "")}/${rest}` : pf;
+    }
+    r.parent = par;
+    r.full = full;
+    return full;
+  };
+  const out = [];
+  for (const r of routes) {
+    const p = fullOf(r, 0);
+    const child = !p.startsWith("/");
+    const body = toRe(p);
+    const lit = p.split("/").some((seg) => seg && !/^:/.test(seg));
+    out.push({ sym: r.sym, path: p, re: new RegExp(child ? `(?:^|/)${body}$` : `^${body}$`), tail: lit ? new RegExp(`/${toRe(r.own.replace(/^\/+/, ""))}$`) : null, row: r });
+  }
+  model._routePaths = out;
+  return out;
+}
+
+function resolveRoutePath(model, call) {
+  const want = call.name;
+  let rows = routePathIndex(model).filter((row) => row.path === want || row.re.test(want));
+  // No full path matches: a route's own path (with one literal segment) that
+  // is the END of the call path is a hit.
+  if (!rows.length) rows = routePathIndex(model).filter((row) => row.tail && row.row.own.replace(/^\/+/, "").split("/").some((seg) => seg && !/^:/.test(seg)) && row.tail.test(want));
+  // A parent route and its own "" child have the same full path: the child
+  // (the page) wins. An exact path wins over a `:param` match.
+  if (rows.length > 1) {
+    const ancestors = new Set();
+    for (const row of rows) for (let p = row.row.parent; p; p = p.parent) ancestors.add(p.sym.id);
+    rows = rows.filter((row) => !ancestors.has(row.sym.id));
+  }
+  if (rows.length > 1 && rows.some((row) => row.path === want)) rows = rows.filter((row) => row.path === want);
+  const hits = [...new Set(rows.map((row) => row.sym.id))];
+  if (hits.length === 1) return { state: "ROUTE", target: hits[0] };
+  if (hits.length > 1) return { state: "AMBIGUOUS", candidates: hits };
+  return { state: "UNRESOLVED", missing_route: want };
+}
+
+function resolveRouteCall(model, rel, call) {
+  if (call.path) return resolveRoutePath(model, call);
+  let rname = call.name;
+  if (call.via) {
+    const v = constValue(model, rel, call.name);
+    if (v == null) return { state: "UNRESOLVED" };
     rname = v;
   }
   const hits = routeNameIndex(model).get(rname) || [];
@@ -597,21 +816,510 @@ function resolveRouteCall(model, rel, call) {
   return { state: "UNRESOLVED", missing_route: rname };
 }
 
+// ── lorc 0.5.0 (W29a): store links ──────────────────────────────────────────
+// The store index: role → full key → [member symbol id]. A registration
+// (`store_modules` on a symbol) names a module by its binding; the module
+// file holds the `store_module` class. A namespaced module adds
+// "<name>/" to the prefix of its members. A module that no registration names
+// has the prefix "" and its class name as its module name.
+const STORE_DEPTH = 4;
+function storeIndex(model) {
+  if (model._storeIndex) return model._storeIndex;
+  const idx = { mutation: new Map(), action: new Map(), getter: new Map(), state: new Map(), modules: new Map() };
+  // rel → [own prefix] of each namespaced module in that file.
+  const own = new Map();
+  const classes = [];
+  for (const [rel, f] of Object.entries(model.byFile)) for (const s of f.symbols || []) if (s.kind === "class" && s.store_module) classes.push(s);
+  const inClass = (c, s) => s.file === c.file && (s.qname === c.qname || s.qname.startsWith(c.qname + "."));
+  const ownerClass = (s) => classes.find((c) => inClass(c, s)) || null;
+  // The store_module class that `ref` names, as seen from `rel`.
+  function moduleClass(rel, ref) {
+    const local = classes.find((c) => c.file === rel && c.name === ref);
+    if (local) return local;
+    const bd = fileBindings(model, rel).map.get(ref);
+    if (!bd || !bd.files.length) return null;
+    const wanted = bd.kind === "named" ? bd.orig : null;
+    for (const pair of barrelTargets(model, bd.files, wanted || ref, 0, new Set())) {
+      const here = classes.filter((c) => c.file === pair.file);
+      if (!here.length) continue;
+      if (wanted) {
+        const hit = here.find((c) => c.name === pair.name);
+        if (hit) return hit;
+        continue;
+      }
+      if (here.length === 1) return here[0];
+      const ex = here.filter((c) => c.exported);
+      if (ex.length === 1) return ex[0];
+    }
+    return null;
+  }
+  const add = (map, key, id) => {
+    const a = map.get(key);
+    if (!a) map.set(key, [id]);
+    else if (!a.includes(id)) a.push(id);
+  };
+  const registered = new Set();
+  function addModule(cls, name, prefix, depth, seen) {
+    if (seen.has(cls.id)) return;
+    seen.add(cls.id);
+    registered.add(cls.id);
+    if (cls.namespaced) {
+      const a = own.get(cls.file) || [];
+      if (!a.includes(prefix)) a.push(prefix);
+      own.set(cls.file, a);
+    }
+    if (!idx.modules.has(name)) idx.modules.set(name, cls.id);
+    for (const s of (model.byFile[cls.file] || {}).symbols || []) {
+      if (!s.qname.startsWith(cls.qname + ".")) continue;
+      if (s.kind === "state") add(idx.state, `${name}.${s.name}`, s.id);
+      else if (s.store && idx[s.store] && s.store !== "state") {
+        const key = typeof s.key === "string" ? s.key : s.key_via ? constValue(model, cls.file, s.key_via) : null;
+        if (key != null) add(idx[s.store], prefix + key, s.id);
+      }
+    }
+    if (depth >= STORE_DEPTH) return;
+    for (const s of (model.byFile[cls.file] || {}).symbols || []) {
+      if (!inClass(cls, s)) continue;
+      for (const m of s.store_modules || []) {
+        const child = moduleClass(cls.file, m.ref);
+        if (child) addModule(child, m.name, prefix + (child.namespaced ? m.name + "/" : ""), depth + 1, new Set(seen));
+      }
+    }
+  }
+  for (const [rel, f] of Object.entries(model.byFile)) {
+    for (const s of f.symbols || []) {
+      if (!s.store_modules || ownerClass({ ...s, file: rel })) continue;
+      for (const m of s.store_modules) {
+        const cls = moduleClass(rel, m.ref);
+        if (cls) addModule(cls, m.name, cls.namespaced ? m.name + "/" : "", 1, new Set());
+      }
+    }
+  }
+  for (const c of classes) if (!registered.has(c.id)) addModule(c, c.name, "", 1, new Set());
+  idx.ownPrefix = own;
+  model._storeIndex = idx;
+  return idx;
+}
+
+// A store call → the store member. The key is a NAME; a key or namespace
+// that has no known value is UNRESOLVED (no guess).
+function resolveStoreCall(model, rel, call) {
+  const role = call.store;
+  let key = call.via ? constValue(model, rel, call.name) : call.name;
+  if (key == null) return { state: "UNRESOLVED" };
+  if (call.ns_via) {
+    const ns = constValue(model, rel, call.ns_via);
+    if (ns == null) return { state: "UNRESOLVED" };
+    key = role === "state" ? `${ns}.${key}` : `${ns}/${key}`;
+  }
+  const idx = storeIndex(model);
+  let ids = [];
+  if (role === "state") {
+    ids = idx.state.get(key) || [];
+    if (!ids.length && !key.includes(".") && idx.modules.has(key)) ids = [idx.modules.get(key)];
+  } else if (idx[role]) {
+    if (!key.includes("/")) for (const p of idx.ownPrefix.get(rel) || []) if (!ids.length) ids = idx[role].get(p + key) || [];
+    if (!ids.length) ids = idx[role].get(key) || [];
+  }
+  if (ids.length === 1) return { state: "STORE", target: ids[0] };
+  // W29b: Vuex runs EVERY non-namespaced mutation or action with the key.
+  if (ids.length > 1 && (role === "mutation" || role === "action")) return { state: "STORE", target: ids[0], targets: ids.slice() };
+  if (ids.length > 1) return { state: "AMBIGUOUS", candidates: ids.slice() };
+  return { state: "UNRESOLVED", missing_store: `${role} ${key}` };
+}
+
+// ── lorc 0.5.0 (W29b): listen, prop, i18n, global mixins ────────────────────
+// `Local.member` → the `emit` (listen) or `prop` (prop) symbol `member` of the
+// component that the binding `Local` names.
+function resolveContractCall(model, rel, call) {
+  const kind = call.listen ? "emit" : "prop";
+  const dot = call.name.indexOf(".");
+  if (dot <= 0) return { state: "UNRESOLVED" };
+  const local = call.name.slice(0, dot);
+  const member = call.name.slice(dot + 1);
+  const bd = fileBindings(model, rel).map.get(local);
+  if (!bd || !bd.files.length) return { state: "UNRESOLVED" };
+  const wanted = bd.kind === "named" ? bd.orig : bd.local;
+  for (const pair of barrelTargets(model, bd.files, wanted, 0, new Set())) {
+    const s = ((model.byFile[pair.file] || {}).symbols || []).find((x) => x.kind === kind && x.name === member);
+    if (s) return { state: pair.file === rel ? "LOCAL" : "IMPORT", target: s.id };
+  }
+  return { state: "UNRESOLVED" };
+}
+
+// The locale key index: key → [{file, line}]. The files are in this order: a
+// file whose basename starts with "en" first, then by path. `prefixes` holds
+// the same for each object key (a key that has child keys).
+function i18nIndex(model) {
+  if (model._i18nIndex) return model._i18nIndex;
+  const base = (p) => p.split("/").pop();
+  const files = Object.keys(model.byFile)
+    .filter((rel) => (model.byFile[rel] || {}).lang === "i18n")
+    .sort((a, b) => (base(a).startsWith("en") ? 0 : 1) - (base(b).startsWith("en") ? 0 : 1) || a.localeCompare(b));
+  const keys = new Map();
+  const prefixes = new Map();
+  const add = (map, k, hit) => {
+    const a = map.get(k);
+    if (!a) map.set(k, [hit]);
+    else if (!a.some((h) => h.file === hit.file)) a.push(hit);
+  };
+  for (const file of files) {
+    for (const kl of model.byFile[file].keys || []) {
+      if (!Array.isArray(kl) || typeof kl[0] !== "string") continue;
+      const hit = { file, line: kl[1] };
+      add(keys, kl[0], hit);
+      const parts = kl[0].split(".");
+      for (let i = 1; i < parts.length; i++) add(prefixes, parts.slice(0, i).join("."), hit);
+    }
+  }
+  model._i18nIndex = { files, keys, prefixes };
+  return model._i18nIndex;
+}
+
+// The key that an i18n call names, or null when it has no known value.
+function i18nKey(model, rel, call) {
+  return call.via ? constValue(model, rel, call.name) : call.name;
+}
+
+function resolveI18nCall(model, rel, call) {
+  const key = i18nKey(model, rel, call);
+  if (key == null) return { state: "UNRESOLVED" };
+  const idx = i18nIndex(model);
+  const hits = idx.keys.get(key) || (call.prefix ? idx.prefixes.get(key) : null) || [];
+  if (hits.length) return { state: "I18N", file: hits[0].file, line: hits[0].line, also: hits.length - 1 };
+  return idx.files.length ? { state: "UNRESOLVED", missing_i18n: key } : { state: "UNRESOLVED" };
+}
+
+// key → [{sym, line}] over every i18n call (keys resolved through `via`).
+function i18nUsers(model, key) {
+  if (!model._i18nUsers) {
+    const m = new Map();
+    for (const [rel, f] of Object.entries(model.byFile)) {
+      for (const s of f.symbols || []) {
+        for (const c of s.calls || []) {
+          if (!c.i18n) continue;
+          const k = i18nKey(model, rel, c);
+          if (k == null) continue;
+          if (!m.has(k)) m.set(k, []);
+          m.get(k).push({ sym: s, line: c.line });
+        }
+      }
+    }
+    model._i18nUsers = m;
+  }
+  return model._i18nUsers.get(key) || [];
+}
+
+// lorc 0.5.0 (W29c): the global event index. name → [{symId, line}] for each
+// side (`on`, `emit`). A `via` name is folded through constValue. `onSyms`
+// holds every symbol id that registers a listener.
+function eventIndex(model) {
+  if (model._eventIndex) return model._eventIndex;
+  const on = new Map();
+  const emit = new Map();
+  const onSyms = new Set();
+  const calls = [];
+  for (const [rel, f] of Object.entries(model.byFile)) {
+    for (const s of f.symbols || []) {
+      for (const c of s.calls || []) {
+        if (c.event !== "emit" && c.event !== "on") continue;
+        calls.push({ rel, sym: s, call: c });
+        const name = c.via ? constValue(model, rel, c.name) : c.name;
+        if (name == null) continue;
+        const map = c.event === "on" ? on : emit;
+        if (!map.has(name)) map.set(name, []);
+        map.get(name).push({ symId: s.id, line: c.line });
+        if (c.event === "on") onSyms.add(s.id);
+      }
+    }
+  }
+  model._eventIndex = { on, emit, onSyms, calls };
+  return model._eventIndex;
+}
+
+function eventName(model, rel, call) {
+  return call.via ? constValue(model, rel, call.name) : call.name;
+}
+
+function resolveEventCall(model, rel, call) {
+  const name = eventName(model, rel, call);
+  if (name == null) return { state: "UNRESOLVED" };
+  const idx = eventIndex(model);
+  if (call.event === "on") return { state: "UNRESOLVED", event_on: true, emitters: (idx.emit.get(name) || []).length };
+  const targets = [...new Set((idx.on.get(name) || []).map((h) => h.symId))];
+  if (!targets.length) return { state: "UNRESOLVED", missing_event: name };
+  return { state: "EVENT", target: targets[0], targets };
+}
+
+// lorc 0.5.0 (W29c): config key index from `env` files. key → [{file, line}].
+// A `.env.example` / `.env.sample` file comes first. KEYS ONLY: no value is
+// read or kept.
+function configIndex(model) {
+  if (model._configIndex) return model._configIndex;
+  const sample = (p) => (/(^|\/)\.env\.(example|sample)$/.test(p) ? 0 : 1);
+  const files = Object.keys(model.byFile)
+    .filter((rel) => (model.byFile[rel] || {}).lang === "env")
+    .sort((a, b) => sample(a) - sample(b) || a.localeCompare(b));
+  const keys = new Map();
+  for (const file of files) {
+    for (const kl of model.byFile[file].keys || []) {
+      if (!Array.isArray(kl) || typeof kl[0] !== "string") continue;
+      const a = keys.get(kl[0]);
+      const hit = { file, line: kl[1] };
+      if (!a) keys.set(kl[0], [hit]);
+      else if (!a.some((h) => h.file === file)) a.push(hit);
+    }
+  }
+  model._configIndex = { files, keys };
+  return model._configIndex;
+}
+
+// key → [{sym, line}] from `env` effects.
+function configUsers(model, key) {
+  if (!model._configUsers) {
+    const m = new Map();
+    for (const f of Object.values(model.byFile)) {
+      for (const s of f.symbols || []) {
+        for (const e of s.effects || []) {
+          if (!e || e.type !== "env" || typeof e.text !== "string") continue;
+          if (!m.has(e.text)) m.set(e.text, []);
+          m.get(e.text).push({ sym: s, line: e.line });
+        }
+      }
+    }
+    model._configUsers = m;
+  }
+  return model._configUsers.get(key) || [];
+}
+
+function resolveConfig(model, key) {
+  const idx = configIndex(model);
+  const hits = idx.keys.get(key) || [];
+  if (hits.length) return { state: "CONFIG", file: hits[0].file, line: hits[0].line, also: hits.length - 1 };
+  return idx.files.length ? { state: "UNRESOLVED", missing_config: key } : { state: "UNRESOLVED" };
+}
+
+// lorc 0.5.0 (W29c): table → {defs: [{file, line}] from `sql` files,
+// entities: [class symbol id] from classes with `table`}.
+function tableIndex(model) {
+  if (model._tableIndex) return model._tableIndex;
+  const m = new Map();
+  const get = (t) => {
+    if (!m.has(t)) m.set(t, { defs: [], entities: [] });
+    return m.get(t);
+  };
+  let any = false;
+  for (const rel of Object.keys(model.byFile).sort()) {
+    const f = model.byFile[rel] || {};
+    if (f.lang === "sql") {
+      for (const kl of f.keys || []) {
+        if (!Array.isArray(kl) || typeof kl[0] !== "string") continue;
+        get(kl[0]).defs.push({ file: rel, line: kl[1] });
+        any = true;
+      }
+    }
+    // lorc 0.5.0 (W34d): an effect with `def` (knex `createTable`) defines its tables.
+    for (const s of f.symbols || []) {
+      for (const e of s.effects || []) {
+        if (!e || !e.def || !Array.isArray(e.tables)) continue;
+        for (const t of e.tables) {
+          if (typeof t !== "string") continue;
+          get(t.toLowerCase()).defs.push({ file: rel, line: e.line });
+          any = true;
+        }
+      }
+    }
+    for (const s of f.symbols || []) {
+      if (s.kind !== "class" || typeof s.table !== "string") continue;
+      get(s.table.toLowerCase()).entities.push(s.id);
+      any = true;
+    }
+  }
+  model._tableIndex = { tables: m, any };
+  return model._tableIndex;
+}
+
+// table → [{sym, line, type}] from effects with `tables`.
+function tableUsers(model, table) {
+  if (!model._tableUsers) {
+    const m = new Map();
+    for (const f of Object.values(model.byFile)) {
+      for (const s of f.symbols || []) {
+        for (const e of s.effects || []) {
+          if (!e || !Array.isArray(e.tables)) continue;
+          for (const t of e.tables) {
+            if (!m.has(t)) m.set(t, []);
+            m.get(t).push({ sym: s, line: e.line, type: e.type });
+          }
+        }
+      }
+    }
+    model._tableUsers = m;
+  }
+  return model._tableUsers.get(table) || [];
+}
+
+function resolveTable(model, name) {
+  const idx = tableIndex(model);
+  const t = idx.tables.get(String(name).toLowerCase());
+  if (t && (t.defs.length || t.entities.length)) {
+    return { state: "TABLE", ...(t.defs.length ? { file: t.defs[0].file, line: t.defs[0].line } : {}), ...(t.entities.length ? { entity: t.entities[0] } : {}) };
+  }
+  return idx.any ? { state: "UNRESOLVED", missing_table: name } : { state: "UNRESOLVED" };
+}
+
+// lorc 0.5.0 (W28h): every name set by `Vue.prototype.X = …`.
+function globalProps(model) {
+  if (model._globalProps) return model._globalProps;
+  const out = new Set();
+  for (const f of Object.values(model.byFile)) for (const s of f.symbols || []) for (const n of s.global_props || []) if (typeof n === "string") out.add(n);
+  model._globalProps = out;
+  return out;
+}
+
+// name → member symbol of every global mixin (`Vue.mixin(X)`). The mixin
+// classes and their bases (depth ≤ 4). The first member of a name wins.
+function globalMembers(model) {
+  if (model._globalMembers) return model._globalMembers;
+  const out = new Map();
+  const seen = new Set();
+  const addClass = (cls, depth) => {
+    if (!cls || seen.has(cls.id)) return;
+    seen.add(cls.id);
+    for (const s of (model.byFile[cls.file] || {}).symbols || []) {
+      if (s.kind === "module" || s.kind === "class" || !s.qname.startsWith(cls.qname + ".")) continue;
+      if (!out.has(s.name)) out.set(s.name, s);
+    }
+    if (depth >= INHERIT_DEPTH) return;
+    for (const base of (cls.bases || []).slice(0, 8)) {
+      const b = classSymbol(model, cls.file, base);
+      if (b) addClass(b.sym, depth + 1);
+    }
+  };
+  for (const [rel, f] of Object.entries(model.byFile)) {
+    for (const s of f.symbols || []) {
+      for (const name of s.global_mixins || []) {
+        if (typeof name !== "string") continue;
+        const local = (f.symbols || []).find((x) => x.kind === "class" && x.name === name);
+        if (local) {
+          addClass(local, 0);
+          continue;
+        }
+        const bd = fileBindings(model, rel).map.get(name);
+        if (!bd || !bd.files.length) continue;
+        const wanted = bd.kind === "named" ? bd.orig : name;
+        for (const pair of barrelTargets(model, bd.files, wanted, 0, new Set())) {
+          const classes = ((model.byFile[pair.file] || {}).symbols || []).filter((x) => x.kind === "class");
+          const named = classes.filter((x) => x.name === pair.name);
+          const pick = named.length ? named : bd.kind === "named" ? [] : classes.filter((x) => x.exported).length === 1 ? classes.filter((x) => x.exported) : classes.length === 1 ? classes : [];
+          for (const c of pick) addClass(c, 0);
+          if (pick.length) break;
+        }
+      }
+    }
+  }
+  model._globalMembers = out;
+  return out;
+}
+
+// Every call with `store`, once per model (the walk for callers of a store
+// member when no derived cache is there).
+function storeCalls(model) {
+  if (model._storeCalls) return model._storeCalls;
+  const out = [];
+  for (const [rel, f] of Object.entries(model.byFile)) for (const s of f.symbols || []) for (const c of s.calls || []) if (c.store) out.push({ rel, sym: s, call: c });
+  model._storeCalls = out;
+  return out;
+}
+
+// lorc 0.5.0 (W34c): the qname of the smallest class of `rel` whose lines hold
+// `line`. Null when no class holds it.
+function enclosingClass(model, rel, line) {
+  let best = null;
+  for (const s of (model.byFile[rel] || {}).symbols || []) {
+    if (s.kind !== "class" || !s.lines || s.lines[0] > line || s.lines[1] < line) continue;
+    if (!best || s.lines[1] - s.lines[0] < best.lines[1] - best.lines[0]) best = s;
+  }
+  return best ? best.qname : null;
+}
+
+// W29b: every call with `listen` or `prop`, once per model.
+function contractCalls(model) {
+  if (model._contractCalls) return model._contractCalls;
+  const out = [];
+  for (const [rel, f] of Object.entries(model.byFile)) for (const s of f.symbols || []) for (const c of s.calls || []) if (c.listen || c.prop) out.push({ rel, sym: s, call: c });
+  model._contractCalls = out;
+  return out;
+}
+
 function resolveCall(model, rel, caller, call) {
-  const cls = caller ? classOf(caller) : null;
+  let cls = caller ? classOf(caller) : null;
+  // lorc 0.5.0 (W34c): a symbol with no class in its qname (a route in a
+  // constructor) that makes a self call uses the smallest class that holds it.
+  if (!cls && caller && caller.kind !== "module" && (call.self || call.sup) && caller.lines) cls = enclosingClass(model, rel, caller.lines[0]);
   // W19c: the memo is per file (`model.resolved`: rel → Map), so the key to
   // hash is short. The key parts are the same as before.
-  const key = `${cls || ""}\0${call.name}\0${call.self ? 1 : 0}${call.ref ? 1 : 0}${call.sup ? 1 : 0}${call.alias ? 1 : 0}${call.route ? (call.via ? 2 : 1) : 0}`;
+  const key = `${cls || ""}\0${call.name}\0${call.self ? 1 : 0}${call.ref ? 1 : 0}${call.sup ? 1 : 0}${call.alias ? 1 : 0}${call.route ? (call.via ? 2 : 1) : 0}${call.chain ? 1 : 0}${call.lv ? 1 : 0}${call.inst ? 1 : 0}\0${call.ext || ""}${call.store ? `\0${call.store}${call.via ? 1 : 0}\0${call.ns_via || ""}` : ""}${call.path ? "\0path" : ""}${call.listen ? "\0listen" : ""}${call.prop ? "\0prop" : ""}${call.i18n ? `\0i18n${call.via ? 1 : 0}${call.prefix ? 1 : 0}` : ""}`;
   let memo = model.resolved.get(rel);
   if (!memo) model.resolved.set(rel, (memo = new Map()));
+  if (call.listen || call.prop || call.i18n) {
+    const done = memo.get(key);
+    if (done !== undefined) return done;
+    const rl = call.i18n ? resolveI18nCall(model, rel, call) : resolveContractCall(model, rel, call);
+    memo.set(key, rl);
+    return rl;
+  }
+  if (call.event === "emit" || call.event === "on") {
+    // W29c: a global event by name. The index is per model, so no memo here.
+    return resolveEventCall(model, rel, call);
+  }
   if (call.route) {
     const rr = resolveRouteCall(model, rel, call);
     memo.set(key, rr);
     return rr;
   }
+  if (call.store) {
+    const done = memo.get(key);
+    if (done !== undefined) return done;
+    const rs = resolveStoreCall(model, rel, call);
+    memo.set(key, rs);
+    return rs;
+  }
   const known = memo.get(key);
   if (known !== undefined) return known;
+  // lorc 0.5.0 (W32a): a call on a call result (`f().m()`) has no known
+  // receiver type. It is not a guess over every `m` in the repository.
+  if (call.chain) {
+    const rc = { state: "UNRESOLVED" };
+    memo.set(key, rc);
+    return rc;
+  }
+  // lorc 0.5.0 (W28g, R1): the alias type comes from an import. When that
+  // import is not a file of this repository, the call is external. It never
+  // matches a repo type of the same name.
+  if (call.ext) {
+    const fe = model.byFile[rel] || {};
+    const imp = (fe.imports || []).find((i) => i.from === call.ext);
+    if (!imp || !importTargets(model, rel, fe.lang, imp).length) {
+      const rx = { state: "UNRESOLVED", external: call.ext };
+      memo.set(key, rx);
+      return rx;
+    }
+  }
   const parts = call.name.split(".");
+  // lorc 0.5.0 (W32d, C11): `T.f.m` — the head was typed at extraction
+  // (`h.Discovery.List`, `this.svc.repo.find`). The field `f` of the type
+  // `T` names the type `U`; the target is the member `U.m`. When one step
+  // does not resolve, the result is UNRESOLVED: the name never makes a guess.
+  if (call.alias && parts.length === 3) {
+    let r3 = { state: "UNRESOLVED" };
+    const t = typeSymbol(model, rel, parts[0]);
+    const u = t && t.sym.fields && Object.prototype.hasOwnProperty.call(t.sym.fields, parts[1]) ? typeSymbol(model, t.sym.file, t.sym.fields[parts[1]]) : null;
+    const s = u ? memberOfType(model, u.sym, parts[2]) : null;
+    if (s) r3 = withImpl(model, { state: s.file === rel ? "LOCAL" : "IMPORT", target: s.id, via_field: parts[1] });
+    memo.set(key, r3);
+    return r3;
+  }
   const last = parts[parts.length - 1];
   const head = parts.length > 1 ? parts[0] : null;
   const f = model.byFile[rel] || {};
@@ -621,6 +1329,25 @@ function resolveCall(model, rel, caller, call) {
   let r = null;
   const hit = (state, s) => ({ state, target: s.id });
 
+  // lorc 0.5.0 (W32c, C12): `wrapper.vm.m()` in a test. The component is one
+  // that this file imports: a `.vue .svelte .jsx .tsx` file, or a `.ts` / `.js`
+  // file with a class. Exactly one member `m` there → IMPORT. Otherwise the
+  // repository-wide name rung below runs.
+  if (call.inst) {
+    const seen = new Set();
+    const found = [];
+    for (const bd of binds.values()) {
+      for (const file of bd.files || []) {
+        if (seen.has(file)) continue;
+        seen.add(file);
+        const tsyms = (model.byFile[file] || {}).symbols || [];
+        if (!/\.(vue|svelte|jsx|tsx)$/.test(file) && !(/\.[cm]?[jt]s$/.test(file) && tsyms.some((s) => s.kind === "class"))) continue;
+        const classes = new Set(tsyms.filter((s) => s.kind === "class").map((s) => s.qname));
+        for (const s of tsyms) if (s.kind !== "module" && s.name === last && classOf(s) && classes.has(classOf(s))) found.push(s);
+      }
+    }
+    if (found.length === 1) r = hit("IMPORT", found[0]);
+  }
   // `super.m()` never resolves to the class's own member.
   if (!call.sup && !head && locals.length) {
     const same = call.self && cls ? locals.find((s) => classOf(s) === cls) : null;
@@ -637,6 +1364,12 @@ function resolveCall(model, rel, caller, call) {
   if (!r && call.self && !head && cls) {
     const inh = inheritedMember(model, rel, cls.split(".").pop(), last, 0, new Set());
     if (inh) r = { state: inh.state, target: inh.sym.id, inherited: true };
+  }
+  // lorc 0.5.0 (W29b): a member of a global mixin (`Vue.mixin(X)`) is in the
+  // scope of every component.
+  if (!r && call.self && !head && /\.(vue|svelte)$/.test(rel)) {
+    const g = globalMembers(model).get(last);
+    if (g) r = { state: "IMPORT", target: g.id, inherited: true };
   }
   if (!r) {
     const bd = binds.get(head || last);
@@ -678,6 +1411,26 @@ function resolveCall(model, rel, caller, call) {
       if (s) r = hit("IMPORT", s);
     }
   }
+  // lorc 0.5.0 (W32c, C9): `X.k` where no symbol `X.k` exists and `X` is a
+  // `const` or `enum` (this file's → LOCAL, imported → IMPORT) is a use of
+  // `X` itself; `member` names the key.
+  if (!r && !call.sup && !call.self && head && parts.length === 2) {
+    const own = (f.symbols || []).find((s) => (s.kind === "const" || s.kind === "enum") && s.qname === head);
+    if (own) r = { ...hit("LOCAL", own), member: last };
+    else {
+      const bd = binds.get(head);
+      if (bd && bd.files.length) {
+        const wanted = bd.kind === "named" ? bd.orig : bd.local;
+        for (const pair of barrelTargets(model, bd.files, wanted, 0, new Set())) {
+          const s = ((model.byFile[pair.file] || {}).symbols || []).find((x) => (x.kind === "const" || x.kind === "enum") && x.qname === pair.name);
+          if (s) {
+            r = { ...hit("IMPORT", s), member: last };
+            break;
+          }
+        }
+      }
+    }
+  }
   // A file this one INCLUDES by path names its symbols directly — a bare name
   // (PHP, C) and, since W5, a member of a class declared in that header.
   if (!r && includes.length) {
@@ -711,13 +1464,23 @@ function resolveCall(model, rel, caller, call) {
       if (inh) r = { state: inh.state, target: inh.sym.id, inherited: true };
     }
   }
-  if (!r) {
+  // lorc 0.5.0 (W32d, C11): `T.m` where the head was typed at extraction (a
+  // parameter `s *store.Store`). The type `T` from this file, its package or
+  // its imports, then its member `m`.
+  if (!r && call.alias && head && parts.length === 2) {
+    const t = typeSymbol(model, rel, head);
+    const s = t && t.state !== "UNIQUE" ? memberOfType(model, t.sym, last) : null;
+    if (s) r = hit(s.file === rel ? "LOCAL" : "IMPORT", s);
+  }
+  // lorc 0.5.0 (W32a): a method call on a local value (`err.Error()`) has no
+  // known type, so the repository-wide name rung does not run for it.
+  if (!r && !call.lv) {
     // W1: a bare `get(…)` is never a class METHOD — a method is reached through
     // a receiver, `this`, or inheritance. Before this, `request(app).get("/p")`
     // resolved UNIQUE to the only method named `get` in the repository.
     // v2.2.0 (D5): a source file never resolves into a test helper. A test
     // caller keeps every candidate.
-    const cands = candsNamed(model, last, TEST_FILE.test(rel), !!(head || call.self));
+    const cands = candsNamed(model, last, TEST_FILE.test(rel), !!(head || call.self || call.inst));
     if (head) {
       const hl = head.toLowerCase();
       const byClass = cands.filter((s) => {
@@ -739,6 +1502,10 @@ function resolveCall(model, rel, caller, call) {
   // A name passed as an argument is only an edge when this file defines it or
   // imports it. `res.json(order)` must never find a repo function named `order`.
   if (call.ref && r.state !== "LOCAL" && r.state !== "IMPORT") r = { state: "UNRESOLVED" };
+  // lorc 0.5.0 (W28h): a template / self ref named like a `Vue.prototype.X`
+  // global that found nothing else is external, not a miss.
+  if (r.state === "UNRESOLVED" && !r.external && (call.tpl || call.self) && !head && globalProps(model).has(last)) r = { state: "UNRESOLVED", external: "Vue.prototype" };
+  r = withImpl(model, r);
   memo.set(key, r);
   return r;
 }
@@ -794,6 +1561,37 @@ function mountTargets(model, rel, mt) {
   const lang = f.lang;
   const t = String(mt.target || "");
   if (!t) return [];
+  // lorc 0.5.0 (W28g): `this.r` is a router of the same class. `routeTable`
+  // gives its prefix to the routes registered on it.
+  if (t.startsWith("this.")) return [];
+  // lorc 0.5.0 (W28g): `x.getRouter` where `x = new X()` → the file of class `X`.
+  if (mt.cls) {
+    const cb = fileBindings(model, rel).map.get(mt.cls);
+    if (cb && cb.files.length) return cb.files;
+  }
+  // An instance from another file (`const { accountController } = await init()`):
+  // the class whose name is the head in any case (`AccountController`), in
+  // the files this file imports or the files they import. One file only.
+  const head0 = t.split(".")[0];
+  if (!mt.cls && /^[A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*$/.test(t) && !fileBindings(model, rel).map.get(head0)) {
+    const want = head0.toLowerCase();
+    const seen = new Set([rel]);
+    const hits = new Set();
+    let frontier = [rel];
+    for (let d = 0; d < 3 && !hits.size; d++) {
+      const next = [];
+      for (const f0 of frontier)
+        for (const bd of fileBindings(model, f0).map.values())
+          for (const file of bd.files || []) {
+            if (seen.has(file)) continue;
+            seen.add(file);
+            next.push(file);
+            if (((model.byFile[file] || {}).symbols || []).some((x) => x.kind === "class" && x.qname.toLowerCase() === want)) hits.add(file);
+          }
+      frontier = next;
+    }
+    if (hits.size === 1) return [...hits];
+  }
   if (mt.module) return lang === "py" ? resolvePy(model, rel, t) : resolveJs(model, rel, t);
   if (/^[./]/.test(t)) return lang === "py" ? resolvePy(model, rel, t) : resolveJs(model, rel, t);
   const head = t.split(".")[0];
@@ -818,9 +1616,24 @@ function mountsInto(model) {
   for (const [rel, f] of Object.entries(model.byFile)) {
     for (const s of f.symbols || []) {
       for (const mt of s.mounts || []) {
+        // lorc 0.5.0 (W34b): an autoload mount reaches every file under its
+        // folder. The prefix adds the sub-folders of the file (`_id` → `:id`),
+        // or nothing more when the mount is `flat`.
+        if (mt.dir) {
+          const base = String(mt.dir).replace(/\/+$/, "") + "/";
+          for (const f2 of model.fileSet || []) {
+            if (!f2.startsWith(base) || f2 === rel) continue;
+            const subs = f2.slice(base.length).split("/").slice(0, -1).map((d) => (d.startsWith("_") ? ":" + d.slice(1) : d));
+            const prefix = mt.flat || !subs.length ? mt.prefix || "" : joinPrefix(mt.prefix, "/" + subs.join("/"));
+            const a = into.get(f2) || [];
+            a.push({ prefix, from: rel });
+            into.set(f2, a);
+          }
+          continue;
+        }
         for (const target of mountTargets(model, rel, mt)) {
           const a = into.get(target) || [];
-          a.push({ prefix: mt.prefix || "", from: rel });
+          a.push({ prefix: mt.prefix || "", from: rel, ...(/\./.test(String(mt.target || "")) && !/^[./]/.test(String(mt.target)) ? { via: String(mt.target).split(".").pop() } : {}) });
           into.set(target, a);
         }
       }
@@ -833,8 +1646,22 @@ function mountsInto(model) {
 // Every full prefix under which `rel` is reachable, following mounts across
 // files. Exactly one is a KNOWN mount; none means unmounted (the route's own
 // path is the full path); several means the file is mounted more than once.
-function prefixesOf(model, rel, depth, seen) {
-  const ins = mountsInto(model).get(rel) || [];
+function prefixesOf(model, rel, depth, seen, on) {
+  let ins = mountsInto(model).get(rel) || [];
+  // lorc 0.5.0 (W28g): a mount through a getter that returns `this.r` reaches
+  // only the routes on `this.r` (`on`).
+  if (depth === 0 && on) {
+    const getter = (via) => {
+      const g = via ? ((model.byFile[rel] || {}).symbols || []).find((x) => x.kind === "method" && x.name === via && x.returns) : null;
+      return g ? g.returns : null;
+    };
+    ins = ins.filter((m) => {
+      const r = getter(m.via);
+      return !r || r === on;
+    });
+  }
+  // lorc 0.5.0 (W28g): a test that mounts a router is not where the app mounts it.
+  if (ins.some((m) => !TEST_FILE.test(m.from))) ins = ins.filter((m) => !TEST_FILE.test(m.from));
   if (!ins.length || depth >= MOUNT_DEPTH) return [""];
   const out = new Set();
   for (const m of ins) {
@@ -844,6 +1671,24 @@ function prefixesOf(model, rel, depth, seen) {
   return out.size ? [...out] : [""];
 }
 
+// lorc 0.5.0 (W28g): `on` (`this.r`) mounted in `rel` on another router
+// (`this.router.use("/p", this.r)`) → { prefix, on: the outer router }.
+// Followed up to MOUNT_DEPTH; one mount per step, else the walk stops.
+function innerPrefix(model, rel, on) {
+  let prefix = "";
+  const seen = new Set();
+  for (let d = 0; d < MOUNT_DEPTH && on && !seen.has(on); d++) {
+    seen.add(on);
+    const hits = [];
+    for (const sy of (model.byFile[rel] || {}).symbols || []) for (const mt of sy.mounts || []) if (mt.target === on) hits.push(mt);
+    const ps = new Set(hits.map((mt) => `${mt.prefix || ""}\0${mt.on || ""}`));
+    if (ps.size !== 1) break;
+    prefix = joinPrefix(hits[0].prefix, prefix);
+    on = hits[0].on || null;
+  }
+  return { prefix, on };
+}
+
 function routeTable(model) {
   if (model.routes) return model.routes;
   const rows = [];
@@ -851,8 +1696,11 @@ function routeTable(model) {
     if (s.kind !== "route") continue;
     const mm = /^([A-Z]+) (.+)$/.exec(s.name);
     if (!mm) continue;
-    const own = mm[2];
-    const prefixes = prefixesOf(model, s.file, 0, new Set());
+    // lorc 0.5.0 (W28g): a route on `this.r`, and `this.r` mounted in the
+    // same file → the mount prefix comes first.
+    const inner = s.on ? innerPrefix(model, s.file, s.on) : { prefix: "", on: null };
+    const own = inner.prefix ? joinPrefix(inner.prefix, mm[2]) || "/" : mm[2];
+    const prefixes = prefixesOf(model, s.file, 0, new Set(), inner.on);
     const full = prefixes.length === 1 ? joinPrefix(prefixes[0], own) || "/" : null;
     rows.push({
       sym: s,
@@ -933,6 +1781,11 @@ function callersOf(model, target) {
         ...(r[3] === 2 && r[4] ? { url: r[4] } : {}),
         ...(r[3] === 3 ? { inherited: true } : {}),
         ...(r[3] === 0 && r[4] ? { alias: r[4] } : {}),
+        ...(r[3] === 4 && r[4] ? { store: r[4] } : {}),
+        ...(r[3] === 5 ? { listen: true } : {}),
+        ...(r[3] === 6 ? { prop: true } : {}),
+        ...(r[3] === 7 && r[4] ? { event: r[4] } : {}),
+        ...(r[3] === 8 && r[4] ? { impl: r[4] } : {}),
       });
     }
   }
@@ -942,19 +1795,36 @@ function callersOf(model, target) {
     if (m && Object.prototype.hasOwnProperty.call(m, target.id)) for (const row of m[target.id]) maybe += row[1];
     return { confident, maybe };
   }
-  for (const row of callIndex(model).get(target.name) || []) {
+  // W29a: a store member is reached by its KEY, not by its name. Walk the
+  // store calls too, so that the answer is the same as the derived cache.
+  const rows = callIndex(model).get(target.name) || [];
+  let walk = target.store || target.kind === "state" || target.store_module ? rows.concat(storeCalls(model)) : rows;
+  // W29b: an event name may hold "." — walk every listen / prop call.
+  if (target.kind === "emit" || target.kind === "prop") walk = walk.concat(contractCalls(model));
+  // W29c: a symbol that registers a global listener is reached by event name.
+  if (eventIndex(model).onSyms.has(target.id)) walk = walk.concat(eventIndex(model).calls.filter((x) => x.call.event === "emit"));
+  for (const row of walk) {
     const r = resolveCall(model, row.rel, row.sym, row.call);
-    if (r.target === target.id && CONFIDENT.has(r.state)) {
+    if ((r.targets || [r.target]).includes(target.id) && CONFIDENT.has(r.state)) {
       const k = `${row.sym.id} ${row.call.line}`;
       if (seen.has(k)) continue;
       seen.add(k);
+      // lorc 0.5.0 (W34c): the same row as the cache gives for an impl target.
+      if (r.impl && target.id !== r.target) {
+        confident.push({ sym: row.sym, line: row.call.line, state: target.file === row.rel ? "LOCAL" : "IMPORT", impl: r.impl });
+        continue;
+      }
       confident.push({
         sym: row.sym,
         line: row.call.line,
         state: r.state,
-        ...(row.call.ref ? { ref: true } : {}),
-        ...(r.inherited ? { inherited: true } : {}),
-        ...(!row.call.ref && !r.inherited && row.call.alias ? { alias: row.call.alias } : {}),
+        ...(row.call.store ? { store: row.call.store } : {}),
+        ...(row.call.listen ? { listen: true } : {}),
+        ...(row.call.prop ? { prop: true } : {}),
+        ...(row.call.event ? { event: eventName(model, row.rel, row.call) } : {}),
+        ...(!row.call.store && row.call.ref ? { ref: true } : {}),
+        ...(!row.call.store && !row.call.ref && r.inherited ? { inherited: true } : {}),
+        ...(!row.call.store && !row.call.ref && !r.inherited && row.call.alias ? { alias: row.call.alias } : {}),
       });
     } else if (r.state === "AMBIGUOUS" && r.candidates.includes(target.id)) maybe++;
   }
@@ -1190,7 +2060,6 @@ function fit(items, budget, footer, tail, blocks) {
 // `--format prose` stays the default, because a shorter card that is read wrong
 // costs more than it saves.
 const KIND_SHORT = { prop: "p", emit: "e", inject: "i", template: "t", function: "fn", method: "me", class: "cl", route: "rt", module: "mo", const: "co", var: "va", type: "ty", interface: "in", enum: "en", struct: "st" };
-const STATE_SHORT = { LOCAL: "L", IMPORT: "I", UNIQUE: "U", ROUTE: "R", AMBIGUOUS: "A", UNRESOLVED: "-" };
 const shortKind = (k) => KIND_SHORT[k] || String(k).slice(0, 2);
 
 // The longest directory every path shares. A prefix line is only worth writing
@@ -1381,7 +2250,156 @@ function sourceNote(source) {
 // card has enough rows to pay for the legend. So both bodies are built and the
 // SMALLER one is printed, the same rule `--format tree` already follows, and
 // the answer says which one it used. It can never be worse than the long form.
-const STATE_LEGEND = "  states: L local · I import · U unique · R route · A ambiguous";
+const STATE_LEGEND = "  states: L local · I import · U unique · R route · S store · E event · A ambiguous";
+
+// lorc 0.5.0 (W30a): the text after an effect row. An env key gets its line in
+// an env file. An effect with tables gets the definition of each table (max 3).
+// KEYS ONLY: no env value is read or shown.
+function effectLinks(model, e) {
+  const out = { text: "", data: {} };
+  if (!e) return out;
+  if (e.type === "env" && typeof e.text === "string") {
+    const r = resolveConfig(model, e.text);
+    if (r.state === "CONFIG") {
+      out.text += ` → ${r.file}:${r.line}`;
+      out.data.config = { file: r.file, line: r.line };
+    } else if (r.missing_config) {
+      out.text += "  NO KEY in env files";
+      out.data.missing_config = r.missing_config;
+    }
+  }
+  if (Array.isArray(e.tables) && e.tables.length) {
+    if (e.def) out.text += " · defines";
+    const rows = e.tables.slice(0, 3).map((t) => {
+      const r = resolveTable(model, t);
+      const ent = r.entity ? model.symbols.get(r.entity) : null;
+      return { table: t, ...(r.file ? { file: r.file, line: r.line } : {}), ...(ent ? { entity: ent.qname } : {}) };
+    });
+    out.text += ` · tables: ${rows.map((x) => `${x.table}${x.file ? ` → ${x.file}:${x.line}` : ""}${x.entity ? ` | ${x.entity}` : ""}`).join(", ")}`;
+    out.data.table_links = rows;
+  }
+  return out;
+}
+
+// lorc 0.5.0 (W30a): the row of a link call (store, listen, prop, i18n, event)
+// at level 1. Returns null when the call is not a link call that has a row.
+// Returns {skip:true} when the row is not shown (i18n over the limit).
+const I18N_ROWS = 6;
+function linkRow(model, s, call, res, indent, seen) {
+  const name = String(call.name || "");
+  const tail = name.slice(name.indexOf(".") + 1);
+  if (call.store) {
+    const k = call.via ? constValue(model, s.file, call.name) : call.name;
+    const key = k == null ? call.name : k;
+    const data = { item: "store", role: call.store, key, line: call.line, state: res.state };
+    const t = res.state === "STORE" ? model.symbols.get(res.target) : null;
+    if (t) {
+      const row = (short) => `${indent}→ ${call.store} ${key}  ${t.qname}  ${where(t)}  ${stateWord(res.state, short)}`;
+      return { text: row(false), short: row(true), data: { ...data, target: brief(t) } };
+    }
+    if (res.missing_store) {
+      const row = `${indent}→ ${call.store} ${key}  NO STORE KEY — no module defines it`;
+      return { text: row, short: row, data: { ...data, missing_store: res.missing_store } };
+    }
+    return null;
+  }
+  if (call.listen || call.prop) {
+    const t = res.state === "IMPORT" ? model.symbols.get(res.target) : null;
+    if (!t) return null;
+    const verb = call.listen ? "listens" : "passes";
+    const row = (short) => `${indent}→ ${verb} ${tail}  ${t.qname}  ${where(t)}  ${stateWord(res.state, short)}`;
+    return { text: row(false), short: row(true), data: { item: call.listen ? "listen" : "prop", name: tail, line: call.line, state: res.state, target: brief(t) } };
+  }
+  if (call.i18n) {
+    const k = call.via ? constValue(model, s.file, call.name) : call.name;
+    const key = k == null ? call.name : k;
+    if (res.state === "I18N") {
+      seen.i18n++;
+      if (seen.i18n > I18N_ROWS) return { skip: true };
+      const row = (short) => `${indent}→ text ${key}  ${res.file}:${res.line}  ${stateWord("I18N", short)}`;
+      return { text: row(false), short: row(true), data: { item: "i18n", key, line: call.line, state: "I18N", file: res.file, def_line: res.line } };
+    }
+    if (res.missing_i18n) {
+      seen.i18nMissing++;
+      if (seen.i18nMissing > I18N_ROWS) return { skip: true };
+      const row = `${indent}→ text ${key}  NO KEY — no locale file has it`;
+      return { text: row, short: row, data: { item: "i18n", key, line: call.line, state: "UNRESOLVED", missing_i18n: res.missing_i18n } };
+    }
+    return null;
+  }
+  if (call.event === "emit" || call.event === "on") {
+    const ev = eventName(model, s.file, call);
+    if (ev == null) return null;
+    if (call.event === "on") {
+      const row = `${indent}→ listens to ${ev}  ${res.emitters || 0} emitter(s)`;
+      return { text: row, short: row, data: { item: "event", kind: "on", name: ev, line: call.line, state: res.state, emitters: res.emitters || 0 } };
+    }
+    if (res.state === "EVENT") {
+      const ts = (res.targets || [res.target]).map((id) => model.symbols.get(id)).filter(Boolean);
+      if (!ts.length) return null;
+      const row = (short) => `${indent}→ emits ${ev}  ${ts.length} listener(s): ${ts[0].qname} ${where(ts[0])}  ${stateWord("EVENT", short)}`;
+      return { text: row(false), short: row(true), data: { item: "event", kind: "emit", name: ev, line: call.line, state: "EVENT", targets: ts.map(brief) } };
+    }
+    if (res.missing_event) {
+      const row = `${indent}→ emits ${ev}  NO LISTENER — no on() site has it`;
+      return { text: row, short: row, data: { item: "event", kind: "emit", name: ev, line: call.line, state: "UNRESOLVED", missing_event: res.missing_event } };
+    }
+    return null;
+  }
+  return null;
+}
+
+// lorc 0.5.0 (W30a): the `links` rows of a file card. Each row is one line of
+// 160 chars or less. An empty row is not shown.
+const LINK_ROW_MAX = 160;
+function linkList(head, parts, sep) {
+  const uniq = [...new Set(parts)];
+  const join = sep || ", ";
+  let text = head;
+  let n = 0;
+  for (const p of uniq) {
+    const more = uniq.length - n - 1;
+    const next = `${text}${n ? join : ""}${p}`;
+    if (n && (next + (more ? ` (+${more})` : "")).length > LINK_ROW_MAX) break;
+    text = next;
+    n++;
+  }
+  if (n < uniq.length) text += ` (+${uniq.length - n})`;
+  return text.length > LINK_ROW_MAX ? `${text.slice(0, LINK_ROW_MAX - 1)}…` : text;
+}
+
+function linkRows(model, L) {
+  const rows = [];
+  const at = (f, l) => (l ? `${f}:${l}` : f);
+  if (L.store.length) {
+    const parts = L.store.map((x) => {
+      const t = x.target ? model.symbols.get(x.target) : null;
+      return t ? `${x.role} ${x.key} → ${where(t)}` : `${x.role} ${x.key} (missing)`;
+    });
+    rows.push(linkList("  links  store: ", parts));
+  }
+  if (L.emits.length) rows.push(linkList("  links  emits: ", L.emits.map((e) => `${e.name} ${e.line} (${e.listeners.length} listeners)`)));
+  if (L.parents.length) rows.push(linkList("  links  parents: ", L.parents.map((p) => at(p.file, p.line))));
+  if (L.i18n.count) {
+    const files = L.i18n.files.length ? ` → ${L.i18n.files.join(", ")}` : "";
+    const miss = L.i18n.missing.length ? ` · missing: ${L.i18n.missing.join(", ")}` : "";
+    rows.push(linkList(`  links  i18n: ${L.i18n.count} keys${files}${miss}`, []));
+  }
+  if (L.events.length) {
+    const parts = L.events.map((e) => (e.kind === "emit" ? `emits ${e.name} (${e.peers} listeners)` : `listens ${e.name} (${e.peers} emitters)`));
+    rows.push(linkList("  links  events: ", parts, " · "));
+  }
+  if (L.config.length) rows.push(linkList("  links  config: ", L.config.map((c) => (c.file ? `${c.key} → ${c.file}:${c.defLine}` : `${c.key} (no def)`))));
+  if (L.tables.length) {
+    const parts = L.tables.map((t) => {
+      const ent = t.entity ? model.symbols.get(t.entity) : null;
+      return `${t.table}${t.file ? ` → ${t.file}:${t.defLine}` : ""}${ent ? ` | ${ent.qname}` : ""}`;
+    });
+    rows.push(linkList("  links  tables: ", parts));
+  }
+  if (L.fields.length) rows.push(linkList("  links  fields: ", L.fields));
+  return rows.slice(0, 8);
+}
 const stateWord = (s, short) => (short ? STATE_SHORT[s] || s : s);
 
 // Rewrites `items` in place to the short body and inserts the legend, but only
@@ -1416,7 +2434,8 @@ function ctx(model, query, opts) {
   // `short` is the same row with the one-letter state word. Both bodies are
   // built; the smaller one is printed (§6).
   const push = (pri, section, text, data, short) => items.push({ pri, section, text, short: short == null ? text : short, data });
-  push(0, "header", `${sym.qname}  ${sym.file}:${sym.lines[0]}-${sym.lines[1]}  [blob ${String((model.byFile[sym.file] || {}).blob || "").slice(0, 7)} · ${BLOB_LABEL[fresh]}${coverageTag(model, sym.file)}]`);
+  const storeTag = sym.store ? ` [store ${sym.store} ${sym.key || (sym.key_via ? constValue(model, sym.file, sym.key_via) || sym.key_via : sym.name)}]` : "";
+  push(0, "header", `${sym.qname}  ${sym.file}:${sym.lines[0]}-${sym.lines[1]}  [blob ${String((model.byFile[sym.file] || {}).blob || "").slice(0, 7)} · ${BLOB_LABEL[fresh]}${coverageTag(model, sym.file)}]${storeTag}`);
   // A note is shown ONLY while the body still hashes the same. An old
   // sentence about code that has since changed is never printed.
   const note = N.noteFor(model.notes, sym);
@@ -1434,7 +2453,15 @@ function ctx(model, query, opts) {
     const row = (short) =>
       c.url
         ? `  ← reached via  ${c.url}  ${where(c.sym, c.line)}  ${stateWord("ROUTE", short)}`
-        : `  ← ${c.ref ? "used by  " : "called by"}  ${c.sym.qname}  ${where(c.sym, c.line)}  ${stateWord(c.state, short)}${c.inherited ? " (inherited)" : c.alias ? ` (via ${c.alias})` : ""}`;
+        : c.store
+        ? `  ← ${c.store} by  ${c.sym.qname}  ${where(c.sym, c.line)}  ${stateWord(c.state, short)}`
+        : c.listen
+        ? `  ← listened by  ${c.sym.qname}  ${where(c.sym, c.line)}  ${stateWord(c.state, short)}`
+        : c.prop
+        ? `  ← passed by  ${c.sym.qname}  ${where(c.sym, c.line)}  ${stateWord(c.state, short)}`
+        : c.event
+        ? `  ← emitted by  ${c.sym.qname}  ${where(c.sym, c.line)}  ${stateWord(c.state, short)}  (${c.event})`
+        : `  ← ${c.ref ? "used by  " : "called by"}  ${c.sym.qname}  ${where(c.sym, c.line)}  ${stateWord(c.state, short)}${c.impl ? ` (impl of ${c.impl})` : c.inherited ? " (inherited)" : c.alias ? ` (via ${c.alias})` : ""}`;
     push(
       2,
       "callers",
@@ -1450,6 +2477,11 @@ function ctx(model, query, opts) {
         ...(c.url ? { url: c.url } : {}),
         ...(c.inherited ? { inherited: true } : {}),
         ...(c.alias ? { alias: c.alias } : {}),
+        ...(c.store ? { store: c.store } : {}),
+        ...(c.listen ? { listen: true } : {}),
+        ...(c.prop ? { prop: true } : {}),
+        ...(c.event ? { event: c.event } : {}),
+        ...(c.impl ? { impl: c.impl } : {}),
       },
       row(true)
     );
@@ -1458,8 +2490,18 @@ function ctx(model, query, opts) {
 
   let unresolved = 0;
   const visited = new Set([sym.id]);
+  const linkSeen = { i18n: 0, i18nMissing: 0 };
   const walk = (s, level, indent) => {
     for (const { call, res } of calleesOf(model, s)) {
+      // lorc 0.5.0 (W30a): a link call at level 1 gets its own row.
+      if (level === 1 && (call.store || call.listen || call.prop || call.i18n || call.event)) {
+        const lr = linkRow(model, s, call, res, indent, linkSeen);
+        if (lr && lr.skip) continue;
+        if (lr) {
+          push(2, "calls", lr.text, { ...lr.data, level }, lr.short);
+          continue;
+        }
+      }
       if (res.state === "UNRESOLVED") {
         // v2.2.0: a route call whose name no route record carries is SAID,
         // one line, no guess — it is shown, so it is not counted as hidden.
@@ -1497,17 +2539,33 @@ function ctx(model, query, opts) {
         ...(res.inherited ? { inherited: true } : {}),
         ...(call.alias ? { alias: call.alias } : {}),
       }, row(true));
-      if (level < depth && !visited.has(target.id)) {
-        visited.add(target.id);
-        const cn = N.noteFor(model.notes, target);
-        if (cn && cn.current) push(2 + level, "notes", `${indent}    └ ${cn.source === "doc" ? "doc" : "note"} ${cn.text}`, { item: "callee_note", of: target.id, text: cn.text, source: cn.source });
-        for (const e of target.effects || []) push(2 + level, "effects", `${indent}    └ effect ${e.type}  "${e.text}"  ${target.file}:${e.line}`, { item: "effect", of: target.id, ...e });
-        walk(target, level + 1, indent + "    ");
+      // lorc 0.5.0 (W34c): one row per class that implements the target (max
+      // 3). With exactly one impl, the walk goes into the impl body.
+      let next = target;
+      if (res.impl && res.targets) {
+        const impls = res.targets.filter((id) => id !== target.id).map((id) => model.symbols.get(id)).filter(Boolean);
+        for (const m of impls.slice(0, 3)) push(level === 1 ? 2 : 3 + level, "calls", `${indent}  ⇒ impl  ${m.qname}  ${where(m)}`, { item: "impl", of: target.id, target: brief(m) });
+        if (impls.length > 3) push(level === 1 ? 2 : 3 + level, "calls", `${indent}  ⇒ impl  +${impls.length - 3} more`, { item: "impl", of: target.id, more: impls.length - 3 });
+        if (impls.length === 1) next = impls[0];
+      }
+      if (level < depth && !visited.has(next.id)) {
+        visited.add(next.id);
+        const cn = N.noteFor(model.notes, next);
+        if (cn && cn.current) push(2 + level, "notes", `${indent}    └ ${cn.source === "doc" ? "doc" : "note"} ${cn.text}`, { item: "callee_note", of: next.id, text: cn.text, source: cn.source });
+        for (const e of next.effects || []) {
+          const el = effectLinks(model, e);
+          push(2 + level, "effects", `${indent}    └ effect ${e.type}  "${e.text}"  ${next.file}:${e.line}${el.text}`, { item: "effect", of: next.id, ...e, ...el.data });
+        }
+        walk(next, level + 1, indent + "    ");
       }
     }
   };
   walk(sym, 1, "  ");
-  for (const e of sym.effects || []) push(1, "effects", `  effect ${e.type}  "${e.text}"  ${sym.file}:${e.line}`, { item: "effect", of: sym.id, ...e });
+  if (linkSeen.i18n > I18N_ROWS) push(3, "calls", `  → text +${linkSeen.i18n - I18N_ROWS} more keys`, { item: "i18n", more: linkSeen.i18n - I18N_ROWS });
+  for (const e of sym.effects || []) {
+    const el = effectLinks(model, e);
+    push(1, "effects", `  effect ${e.type}  "${e.text}"  ${sym.file}:${e.line}${el.text}`, { item: "effect", of: sym.id, ...e, ...el.data });
+  }
 
   const wiki = opts.wikiDocsFor ? opts.wikiDocsFor([sym.file]) : [];
   if (wiki.length) push(6, "wiki", `  wiki  ${wiki.join(", ")}`, { item: "wiki", docs: wiki });
@@ -1575,7 +2633,7 @@ function ctx(model, query, opts) {
     note: note || null,
     callers: kept.filter((d) => d.item ==="caller"),
     maybe_callers: callers.maybe,
-    calls: kept.filter((d) => d.item ==="call"),
+    calls: kept.filter((d) => d.item === "call" || d.item === "store" || d.item === "listen" || d.item === "prop" || d.item === "i18n" || d.item === "event"),
     effects: kept.filter((d) => d.item ==="effect"),
     wiki,
     tests,
@@ -1677,6 +2735,14 @@ function fileCard(model, rel, budget, opts) {
     ]),
   ].sort();
   if (fileTests.length) push(4, "tests", `  tests ${fileTests.join(useTree ? " " : ", ")}`, { item: "tests", files: fileTests });
+  // lorc 0.5.0 (W30a): the links of the file (store, emits, parents, i18n,
+  // events, config, tables, fields). One data object for all rows.
+  const links = linksOf(model, rel);
+  const lrows = linkRows(model, links);
+  // lorc 0.5.0 (W34d): the first 4 link rows get priority 1. Without this, the
+  // symbol rows of a big file fill the budget and cut all links. `fit` prints
+  // the kept rows in item order, so the links stay after the symbols.
+  lrows.forEach((text, i) => push(i < 4 ? 1 : 3, "links", text, i === 0 ? { item: "links", ...links } : null));
   const wiki = opts.wikiDocsFor ? opts.wikiDocsFor([rel]) : [];
   if (wiki.length) push(5, "wiki", `  wiki ${wiki.join(useTree ? " " : ", ")}`, { item: "wiki", docs: wiki });
   // R1: `--callers-source` is a SYMBOL card's option. A file card names who
@@ -1705,6 +2771,7 @@ function fileCard(model, rel, budget, opts) {
     tests: fileTests,
     imports,
     importers,
+    links: lrows.length ? links : null,
     wiki,
     source: tail && fitted.source && fitted.source.kept ? { file: tail.file, from: tail.from, to: tail.from + fitted.source.kept - 1, text: sourceText(tail, fitted.source.kept), cut: fitted.source.cut } : null,
     hidden: fitted.hidden,
@@ -2588,6 +3655,68 @@ function componentChildren(model, rel) {
   return out;
 }
 
+// lorc 0.5.0 (W29b): the framework links of one file.
+function linksOf(model, rel) {
+  const syms = (model.byFile[rel] || {}).symbols || [];
+  const store = [];
+  const i18n = { count: 0, files: [], missing: [] };
+  for (const s of syms) {
+    for (const c of s.calls || []) {
+      if (c.store) {
+        const r = resolveCall(model, rel, s, c);
+        const k = c.via ? constValue(model, rel, c.name) : c.name;
+        store.push({ role: c.store, key: k == null ? c.name : k, line: c.line, state: r.state, ...(r.target ? { target: r.target } : {}) });
+      } else if (c.i18n) {
+        const r = resolveCall(model, rel, s, c);
+        i18n.count++;
+        if (r.state === "I18N" && !i18n.files.includes(r.file)) i18n.files.push(r.file);
+        if (r.missing_i18n && !i18n.missing.includes(r.missing_i18n)) i18n.missing.push(r.missing_i18n);
+      }
+    }
+  }
+  const emits = syms
+    .filter((s) => s.kind === "emit")
+    .map((s) => ({
+      name: s.name,
+      line: s.lines ? s.lines[0] : null,
+      listeners: callersOf(model, s).confident.filter((c) => c.listen).map((c) => ({ file: c.sym.file, line: c.line })),
+    }));
+  const firstLine = new Map();
+  const cls = syms.find((x) => x.kind === "class" && !x.qname.includes("."));
+  if (cls) for (const c of callersOf(model, cls).confident) if (!firstLine.has(c.sym.file) || c.line < firstLine.get(c.sym.file)) firstLine.set(c.sym.file, c.line);
+  const parents = templateParents(model, rel).map((file) => ({ file, line: firstLine.has(file) ? firstLine.get(file) : null }));
+  const fields = syms.filter((s) => s.kind === "field").map((s) => s.name);
+  // W29c: global events, config keys and tables of the file's symbols.
+  const events = [];
+  const config = [];
+  const tables = [];
+  const eidx = eventIndex(model);
+  for (const s of syms) {
+    for (const c of s.calls || []) {
+      if (c.event !== "emit" && c.event !== "on") continue;
+      const name = eventName(model, rel, c);
+      if (name == null) continue;
+      const r = resolveCall(model, rel, s, c);
+      const peers = c.event === "emit" ? (r.targets || []).length : (eidx.emit.get(name) || []).length;
+      events.push({ name, kind: c.event, line: c.line, state: r.state, peers });
+    }
+    for (const e of s.effects || []) {
+      if (!e) continue;
+      if (e.type === "env" && typeof e.text === "string") {
+        const r = resolveConfig(model, e.text);
+        config.push({ key: e.text, line: e.line, ...(r.state === "CONFIG" ? { file: r.file, defLine: r.line } : {}) });
+      }
+      if (Array.isArray(e.tables)) {
+        for (const t of e.tables) {
+          const r = resolveTable(model, t);
+          tables.push({ table: t, line: e.line, type: e.type, ...(r.file ? { file: r.file, defLine: r.line } : {}), ...(r.entity ? { entity: r.entity } : {}) });
+        }
+      }
+    }
+  }
+  return { store, i18n, emits, parents, fields, events, config, tables };
+}
+
 function packExcerpt(model, ex, fresh) {
   const lines = fileLines(model, ex.file) || [];
   const to = Math.min(ex.b, ex.a + PACK_RANGE_LINES - 1);
@@ -3256,4 +4385,4 @@ function buildAnchors(claudeDir, model, opts) {
   };
 }
 
-module.exports = { buildPack, buildAnchors, loadModel, resolveCall, resolveUrl, routeTable, urlIndex, findTarget, callersOf, nameHits, warmBlobs, ctx, forSlice, impact, graphMap, pathBetween, importsOf, TEST_FILE, SOURCE_DEFAULT, SOURCE_CAP, CALLERS_SOURCE_MAX, CALLERS_SOURCE_LINES };
+module.exports = { constValue, storeIndex, i18nIndex, i18nUsers, eventIndex, configIndex, configUsers, tableIndex, tableUsers, resolveConfig, resolveTable, linksOf, buildPack, buildAnchors, loadModel, resolveCall, resolveUrl, routeTable, urlIndex, findTarget, callersOf, nameHits, warmBlobs, ctx, forSlice, impact, graphMap, pathBetween, importsOf, TEST_FILE, SOURCE_DEFAULT, SOURCE_CAP, CALLERS_SOURCE_MAX, CALLERS_SOURCE_LINES };

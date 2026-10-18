@@ -94,7 +94,7 @@ test("1. cold build writes format 2 buckets and no format-1 files", () => {
   assert.deepStrictEqual(Object.keys(model.byFile).sort(), Object.keys(FILES).sort());
   assert.strictEqual(model.byFile["src/i18n/en.json"].lang, "i18n");
   const files = readJson(path.join(g, "files.json"));
-  assert.strictEqual(files["src/api/client.js"].xv, 2);
+  assert.strictEqual(files["src/api/client.js"].xv, 3);
 });
 
 test("2. a 1-file edit changes one index bucket; a no-op update writes no file", () => {
@@ -259,11 +259,35 @@ test("6. the hook names hint works on a format-2 store", () => {
   assert.match(out.hookSpecificOutput.additionalContext, /"formatMoney" is defined at formatMoney \(function\) src\/util\/format\.js:1-3/);
 });
 
-test("heal() on a fresh repo builds the store and returns state fresh", () => {
+test("W33: heal() on a fresh repo builds nothing and suggests a scan", () => {
   const env = repo();
   const r = router.heal(env.root, { home: env.home });
-  assert.strictEqual(r.state, "fresh", JSON.stringify(r));
-  assert.strictEqual(r.healed.state, "built");
+  assert.strictEqual(r.state, "none", JSON.stringify(r));
+  assert.strictEqual(r.suggest, "lorc graph scan");
+  assert.ok(!r.healed);
   assert.strictEqual(r.store.mode, "own");
   assert.strictEqual(typeof r.line, "string");
+});
+
+// lorc 0.5.0 (W34e): `graph update --json` tells the bytes it wrote and the module count.
+test("W34e. graph update --json: written_bytes and modules", () => {
+  const env = repo();
+  // A top-level call gives the file a `<module>` record.
+  write(path.join(env.root, "src/boot.js"), "const { main } = require('./index');\nmain();\n");
+  spawnSync("git", ["add", "."], { cwd: env.root });
+  spawnSync("git", ["commit", "-q", "-m", "boot"], { cwd: env.root });
+  const run = () => {
+    const r = spawnSync(process.execPath, [CLI, "graph", "update", "--json", "--dir", env.root], { encoding: "utf8", env: { ...process.env, LORC_HOME: env.home } });
+    assert.strictEqual(r.status, 0, r.stderr + r.stdout);
+    return JSON.parse(r.stdout);
+  };
+  const first = run();
+  assert.ok(first.written_bytes > 0, JSON.stringify(first));
+  assert.ok(first.modules >= 1, JSON.stringify(first));
+  assert.strictEqual(typeof first.symbols, "number");
+  // A no-op update writes no file (not even meta.json), so it reports 0.
+  const again = run();
+  assert.strictEqual(again.state, "unchanged", JSON.stringify(again));
+  assert.strictEqual(again.written_bytes, 0);
+  assert.strictEqual(again.modules, first.modules);
 });
